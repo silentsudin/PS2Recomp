@@ -1624,6 +1624,15 @@ namespace
                (static_cast<uint64_t>(dh & 0x07FF) << 44);
     }
 
+    // DISPLAY as libgraph's sceGsSetDefDispEnv builds it: DW/DX are in video clocks (VCK), and
+    // MAGH scales a w-pixel buffer up to the ~2560-VCK NTSC line (640 px -> MAGH=3, DW=2559).
+    static uint64_t makeLibgraphDisplay(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h)
+    {
+        w = w == 0u ? 640u : w;
+        const uint32_t magh = std::min<uint32_t>((2560u + w - 1u) / w - 1u, 15u);
+        return makeDisplay(dx, dy, magh, 0u, (magh + 1u) * w - 1u, h - 1u);
+    }
+
     static uint64_t makeFrame(uint32_t fbp, uint32_t fbw, uint32_t psm, uint32_t fbmsk)
     {
         return (static_cast<uint64_t>(fbp & 0x1FFu) << 0) |

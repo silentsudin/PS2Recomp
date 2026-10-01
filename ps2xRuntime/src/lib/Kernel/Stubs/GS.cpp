@@ -805,7 +805,7 @@ namespace ps2_stubs
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);
-            uint64_t display = makeDisplay(0, 0, 0, 0, 639, 447);
+            uint64_t display = makeLibgraphDisplay(0, 0, 640, 448);
             uint64_t bgcolor = 0ULL;
 
             if (runtime)
@@ -891,7 +891,7 @@ namespace ps2_stubs
         const uint64_t smode2 =
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+        const uint64_t display = makeLibgraphDisplay(636u, 32u, w, h);
 
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
@@ -967,7 +967,7 @@ namespace ps2_stubs
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
         const uint64_t dispfb = makeDispFb(0u, fbw, psm, 0u, 0u);
-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+        const uint64_t display = makeLibgraphDisplay(636u, 32u, w, h);
 
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
@@ -1017,7 +1017,7 @@ namespace ps2_stubs
 
         uint32_t fbw = (w + 63) / 64;
         uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
-        uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
+        uint64_t display = makeLibgraphDisplay(dx, dy, w, h);
 
         writeGsDispEnv(rdram, envAddr, display, dispfb);
         setReturnS32(ctx, 0);
