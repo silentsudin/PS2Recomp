@@ -43,6 +43,7 @@ namespace ps2x::iop
 class PS2IopHostAdapter;
 class PS2IopTransport;
 class EeScheduler;
+class Vu1Capture;
 struct EeEvent;
 
 enum PS2Exception
@@ -501,6 +502,7 @@ private:
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;
     std::unique_ptr<EeScheduler> m_eeScheduler;
+    std::unique_ptr<Vu1Capture> m_vu1Capture; // RT_VU1_CAPTURE tooling
     mutable std::mutex m_eeKernelStateMutex;
     std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
     std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;

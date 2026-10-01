@@ -393,6 +393,7 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
+    src/lib/vu/ps2_vu1_capture.cpp
     src/lib/games_database.cpp
 )
 
@@ -634,3 +635,7 @@ endif()
 install(DIRECTORY include/
     DESTINATION include
 )
+
+# Offline checker for VU1 implementations against RT_VU1_CAPTURE recordings.
+add_executable(vu1_replay EXCLUDE_FROM_ALL tools/vu1_replay/vu1_replay.cpp)
+target_link_libraries(vu1_replay PRIVATE ps2_runtime)

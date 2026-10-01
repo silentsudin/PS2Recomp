@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "runtime/ps2_vu1_capture.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -665,6 +666,8 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    if (!m_vu1Capture)
+        m_vu1Capture = Vu1Capture::fromEnvironment();
     m_gifArbiter.setProcessPathPacketFn([this](const uint8_t *data, uint32_t size, GifPathId path)
                                     { m_gs.processGIFPacket(static_cast<uint32_t>(path) - 1u, data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
@@ -679,9 +682,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const bool capturing = m_vu1Capture &&
+                                         m_vu1Capture->begin(Vu1Capture::Kind::Execute, m_vu1, startPC, top, itop,
+                                                             m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                             m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                             [this](const uint8_t *p, uint32_t n)
+                                                             { m_memory.submitGifPacket(GifPathId::Path1, p, n); });
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     if (capturing)
+                                         m_vu1Capture->end(m_vu1, m_memory.getVU1Data(), PS2_VU1_DATA_SIZE);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -697,9 +708,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const bool capturing = m_vu1Capture &&
+                                         m_vu1Capture->begin(Vu1Capture::Kind::Resume, m_vu1, m_vu1.state().pc, top, itop,
+                                                             m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                             m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                             [this](const uint8_t *p, uint32_t n)
+                                                             { m_memory.submitGifPacket(GifPathId::Path1, p, n); });
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
+                                     if (capturing)
+                                         m_vu1Capture->end(m_vu1, m_memory.getVU1Data(), PS2_VU1_DATA_SIZE);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |

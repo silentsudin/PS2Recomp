@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 
 class GS;
 class PS2Memory;
@@ -61,6 +62,12 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
+
+    // When set, completed XGKICK packets go here instead of to the GIF (capture/replay tooling).
+    using XgkickSink = std::function<void(const uint8_t *data, uint32_t sizeBytes)>;
+    void setXgkickSink(XgkickSink sink) { m_xgkickSink = std::move(sink); }
+    // True if the last run ended the program (E-bit/halt) rather than running out of budget.
+    bool lastRunEnded() const { return m_lastRunEnded; }
 
 private:
     enum Pipeline : uint8_t
@@ -248,6 +255,8 @@ private:
     GS *m_activeGs = nullptr;
     PS2Memory *m_activeMemory = nullptr;
     bool m_stopRequested = false;
+    XgkickSink m_xgkickSink;
+    bool m_lastRunEnded = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
 
