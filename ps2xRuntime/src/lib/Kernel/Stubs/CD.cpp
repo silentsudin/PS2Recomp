@@ -169,6 +169,24 @@ namespace ps2_stubs
         }
     }
 
+    bool registerCdFileAtLbn(const std::string &ps2Path, const std::filesystem::path &hostPath,
+                             uint32_t lbn, uint32_t sizeBytes)
+    {
+        const std::string key = cdPathKey(ps2Path);
+        if (key.empty() || lbn >= kCdPseudoLbnStart)
+        {
+            return false;
+        }
+
+        CdFileEntry entry;
+        entry.hostPath = hostPath;
+        entry.sizeBytes = sizeBytes;
+        entry.baseLbn = lbn;
+        entry.sectors = sectorsForBytes(sizeBytes);
+        g_cdFilesByKey.insert_or_assign(key, entry);
+        return true;
+    }
+
     CdDebugSnapshot getCdDebugSnapshot()
     {
         CdDebugSnapshot snapshot{};

@@ -40,6 +40,12 @@ namespace ps2_stubs
     };
 
     CdDebugSnapshot getCdDebugSnapshot();
+
+    // Maps a host file onto its original disc location so games that read raw LBNs
+    // (hard-coded TOCs instead of sceCdSearchFile) work from an extracted disc tree.
+    // Real disc LBNs sit below kCdPseudoLbnStart, so they never collide with pseudo LBNs.
+    bool registerCdFileAtLbn(const std::string &ps2Path, const std::filesystem::path &hostPath,
+                             uint32_t lbn, uint32_t sizeBytes);
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
