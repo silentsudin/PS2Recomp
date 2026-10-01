@@ -24,11 +24,14 @@ class GifArbiter
 {
 public:
     using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
+    // Same, plus the GIF path the packet arrived on (takes precedence when set).
+    using ProcessPathPacketFn = std::function<void(const uint8_t *, uint32_t, GifPathId)>;
 
     GifArbiter() = default;
     explicit GifArbiter(ProcessPacketFn processFn);
 
     void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
+    void setProcessPathPacketFn(ProcessPathPacketFn fn) { m_processPathFn = std::move(fn); }
 
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
@@ -37,6 +40,7 @@ public:
 
 private:
     ProcessPacketFn m_processFn;
+    ProcessPathPacketFn m_processPathFn;
     std::vector<GifArbiterPacket> m_queue;
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);

@@ -5,10 +5,24 @@
 #include <cstdint>
 #include <vector>
 
+// Implemented by backends that consume the raw GS command stream (e.g. a GPU GS that parses
+// GIF packets itself) instead of the frontend's decoded primitives.
+class GSPacketMirror
+{
+public:
+    virtual ~GSPacketMirror() = default;
+    // pathIndex: 0 = PATH1, 1 = PATH2, 2 = PATH3.
+    virtual void MirrorGifPacket(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes) = 0;
+    virtual void MirrorRegisterWrite(uint8_t regAddr, uint64_t value) = 0;
+};
+
 class GSRasterBackend
 {
 public:
     virtual ~GSRasterBackend() = default;
+
+    // False if the backend renders from a GSPacketMirror stream and does not need Submit().
+    virtual bool WantsPrimitives() const { return true; }
 
     virtual void Initialize(uint8_t *vram, uint32_t vramSize) = 0;
     virtual void Reset() = 0;

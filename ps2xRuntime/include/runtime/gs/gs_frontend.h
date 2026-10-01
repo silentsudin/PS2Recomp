@@ -106,7 +106,9 @@ public:
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
-    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes); // PATH3
+    // pathIndex: 0 = PATH1, 1 = PATH2, 2 = PATH3 (forwarded to a GSPacketMirror backend).
+    void processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
@@ -242,6 +244,8 @@ private:
     bool m_debugHistoryPaused = true;
 
     std::unique_ptr<GSRasterBackend> m_backend;
+    GSPacketMirror *m_packetMirror = nullptr; // m_backend, if it renders from the raw stream
+    bool m_backendWantsPrimitives = true;
 };
 
 #endif

@@ -640,9 +640,17 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    processGIFPacket(2u, data, sizeBytes);
+}
+
+void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes)
+{
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+
+    if (m_packetMirror)
+        m_packetMirror->MirrorGifPacket(pathIndex, data, sizeBytes & ~15u);
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -784,6 +792,20 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_packetMirror && data && sizeBytes != 0u)
+    {
+        // Replay as the equivalent GIF stream: four A+D setup registers, then an IMAGE packet.
+        m_packetMirror->MirrorRegisterWrite(GS_REG_BITBLTBUF, bitbltbuf);
+        m_packetMirror->MirrorRegisterWrite(GS_REG_TRXPOS, trxpos);
+        m_packetMirror->MirrorRegisterWrite(GS_REG_TRXREG, trxreg);
+        m_packetMirror->MirrorRegisterWrite(GS_REG_TRXDIR, trxdir);
+        const uint32_t qwords = (sizeBytes + 15u) / 16u;
+        std::vector<uint8_t> packet(16u + static_cast<size_t>(qwords) * 16u, 0u);
+        const uint64_t tag = (static_cast<uint64_t>(qwords) & 0x7FFFu) | (1ull << 15) | (2ull << 58); // NLOOP, EOP, FLG=IMAGE
+        std::memcpy(packet.data(), &tag, sizeof(tag));
+        std::memcpy(packet.data() + 16u, data, sizeBytes);
+        m_packetMirror->MirrorGifPacket(2u, packet.data(), static_cast<uint32_t>(packet.size()));
+    }
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
 
@@ -1062,6 +1084,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_packetMirror)
+        m_packetMirror->MirrorRegisterWrite(regAddr, value);
     writeRegisterUnlocked(regAddr, value);
 }
 
@@ -1572,7 +1596,7 @@ void GS::vertexKick(bool drawing)
     if (m_vtxCount < needed)
         return;
 
-    if (drawing && m_backend)
+    if (drawing && m_backend && m_backendWantsPrimitives)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
@@ -1658,6 +1682,8 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
     }
 
     m_backend = std::move(backend);
+    m_packetMirror = dynamic_cast<GSPacketMirror *>(m_backend.get());
+    m_backendWantsPrimitives = m_backend->WantsPrimitives();
     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
 }
 

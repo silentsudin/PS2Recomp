@@ -507,6 +507,32 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+
+# GPU GS: paraLLEl-GS (Vulkan compute). On macOS it runs on MoltenVK.
+if(APPLE)
+    set(PS2X_ENABLE_PGS_DEFAULT ON)
+else()
+    set(PS2X_ENABLE_PGS_DEFAULT OFF)
+endif()
+option(PS2X_ENABLE_PGS "Build the paraLLEl-GS Vulkan GS backend" ${PS2X_ENABLE_PGS_DEFAULT})
+target_sources(ps2_runtime PRIVATE src/lib/gs/gs_pgs_backend.cpp)
+if(PS2X_ENABLE_PGS)
+    set(PS2X_PGS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/parallel-gs")
+    if(NOT EXISTS "${PS2X_PGS_DIR}/Granite/CMakeLists.txt")
+        message(FATAL_ERROR "paraLLEl-GS submodules missing. Run: git -C ${PS2X_PGS_DIR} submodule update --init Granite && "
+                            "git -C ${PS2X_PGS_DIR}/Granite submodule update --init third_party/volk third_party/khronos/vulkan-headers")
+    endif()
+    set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
+    add_subdirectory("${PS2X_PGS_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
+    if(APPLE)
+        # Darwin lacks clock_nanosleep/TIMER_ABSTIME, used by Granite's util/timer.cpp.
+        target_compile_options(granite-util PRIVATE
+            -include "${CMAKE_CURRENT_SOURCE_DIR}/cmake/pgs/granite_macos_shim.h")
+    endif()
+    target_link_libraries(ps2_runtime PRIVATE parallel-gs)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_PGS=1)
+    message(STATUS "paraLLEl-GS Vulkan GS backend: enabled")
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
