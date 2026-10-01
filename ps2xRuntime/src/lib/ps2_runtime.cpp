@@ -1,5 +1,6 @@
 #include "ps2_runtime.h"
 #include "runtime/ps2_vu1_capture.h"
+#include "runtime/vu/ps2_vu1_native.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -688,9 +689,25 @@ bool PS2Runtime::syncCoreSubsystems()
                                                              m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                              [this](const uint8_t *p, uint32_t n)
                                                              { m_memory.submitGifPacket(GifPathId::Path1, p, n); });
-                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                     bool ranNative = false;
+                                     if (m_vu1Native && !capturing)
+                                     {
+                                         const uint64_t generation = m_memory.getVU1CodeGeneration();
+                                         if (generation != m_vu1NativeCheckedGeneration)
+                                         {
+                                             m_vu1NativeUsable = Vu1Native::imageHash(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE) ==
+                                                                 m_vu1NativeImageHash;
+                                             m_vu1NativeCheckedGeneration = generation;
+                                         }
+                                         if (m_vu1NativeUsable)
+                                             ranNative = m_vu1Native(m_vu1, m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                                     m_memory.getVU1Data(), PS2_VU1_DATA_SIZE, m_gs,
+                                                                     &m_memory, startPC, top, itop, 65536) != 0;
+                                     }
+                                     if (!ranNative)
+                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                       m_gs, &m_memory, startPC, top, itop, 65536);
                                      if (capturing)
                                          m_vu1Capture->end(m_vu1, m_memory.getVU1Data(), PS2_VU1_DATA_SIZE);
                                      cpuContext->vu0_vpu_stat =
@@ -1030,6 +1047,14 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
 
     RUNTIME_LOG("ELF file loaded successfully. Entry point: 0x" << std::hex << m_cpuContext.pc << std::dec);
     return true;
+}
+
+void PS2Runtime::setVu1Native(Vu1NativeEntry entry, uint64_t imageHash)
+{
+    m_vu1Native = entry;
+    m_vu1NativeImageHash = imageHash;
+    m_vu1NativeCheckedGeneration = ~0ull;
+    m_vu1NativeUsable = false;
 }
 
 const PS2Runtime::IoPaths &PS2Runtime::getIoPaths()

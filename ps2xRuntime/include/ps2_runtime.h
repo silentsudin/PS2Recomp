@@ -289,6 +289,13 @@ public:
     bool initialize(const char *title = "PS2 Game");
     bool syncCoreSubsystems();
     bool loadELF(const std::string &elfPath);
+
+    // VU1 microcode recompiled by ps2_vu1_recomp (see runtime/vu/ps2_vu1_native.h). Used for MSCAL
+    // whenever VU1 code memory hashes to `imageHash`; otherwise the interpreter runs.
+    using Vu1NativeEntry = int (*)(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
+                                   uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t startPC, uint32_t top,
+                                   uint32_t itop, uint32_t maxCycles);
+    void setVu1Native(Vu1NativeEntry entry, uint64_t imageHash);
     void run();
 
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
@@ -503,6 +510,10 @@ private:
     R5900Context m_cpuContext;
     std::unique_ptr<EeScheduler> m_eeScheduler;
     std::unique_ptr<Vu1Capture> m_vu1Capture; // RT_VU1_CAPTURE tooling
+    Vu1NativeEntry m_vu1Native = nullptr;
+    uint64_t m_vu1NativeImageHash = 0;
+    uint64_t m_vu1NativeCheckedGeneration = ~0ull;
+    bool m_vu1NativeUsable = false;
     mutable std::mutex m_eeKernelStateMutex;
     std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
     std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;

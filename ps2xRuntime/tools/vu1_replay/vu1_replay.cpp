@@ -6,7 +6,10 @@
 // under test; its final state, data memory and XGKICK packets must equal the recorded ones.
 
 #include "runtime/gs/gs_frontend.h"
-#include "runtime/ps2_vu1.h"
+#include "runtime/vu/ps2_vu1_native.h"
+
+#include <chrono>
+#include <map>
 
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +18,11 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+// Provided when a recompiled VU1 module is linked in (vu1_replay_native).
+extern "C" int rt_vu1_native_execute(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                                     GS &gs, PS2Memory *memory, uint32_t startPC, uint32_t top, uint32_t itop,
+                                     uint32_t maxCycles) __attribute__((weak));
 
 namespace
 {
@@ -103,7 +111,13 @@ int main(int argc, char **argv)
 
     GS gs; // never touched: XGKICK packets go to the sink
     VU1Interpreter vu;
-    uint32_t total = 0, failed = 0, skipped = 0;
+    uint32_t total = 0, failed = 0, skipped = 0, handled = 0, deopts = 0;
+    std::map<std::pair<int, uint32_t>, uint32_t> deoptWhy;
+    int bench = 0;
+    for (int a = 2; a < argc; ++a)
+        if (std::string(argv[a]) == "--bench" && a + 1 < argc)
+            bench = std::atoi(argv[a + 1]);
+    double benchSeconds = 0.0;
 
     while (!r.atEnd() && r.ok)
     {
@@ -156,8 +170,23 @@ int main(int argc, char **argv)
         vu.state().dBitEnabled = rec.dBit;
         vu.state().tBitEnabled = rec.tBit;
         vu.setXgkickSink([&](const uint8_t *p, uint32_t n) { packets.emplace_back(p, p + n); });
-        vu.execute(code.data(), static_cast<uint32_t>(code.size()), data.data(), static_cast<uint32_t>(data.size()),
-                   gs, nullptr, rec.startPC, rec.top, rec.itop, 65536);
+        int native = 0; // 0 = interpreter only
+        if (rt_vu1_native_execute)
+        {
+            native = rt_vu1_native_execute(vu, code.data(), static_cast<uint32_t>(code.size()), data.data(),
+                                           static_cast<uint32_t>(data.size()), gs, nullptr, rec.startPC, rec.top,
+                                           rec.itop, 65536);
+            if (native == 2) // finished in the interpreter after a bail-out
+            {
+                ++deopts;
+                ++deoptWhy[{Vu1Native::lastDeoptReason(), Vu1Native::lastDeoptPc()}];
+            }
+            else if (native == 1)
+                ++handled;
+        }
+        if (native == 0)
+            vu.execute(code.data(), static_cast<uint32_t>(code.size()), data.data(), static_cast<uint32_t>(data.size()),
+                       gs, nullptr, rec.startPC, rec.top, rec.itop, 65536);
 
         std::string problems = diffState(rec.out, vu.state());
         if (data != rec.dataOut)
@@ -172,6 +201,33 @@ int main(int argc, char **argv)
         if (vu.lastRunEnded() != rec.ended)
             problems += "ended ";
 
+        if (bench > 0)
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            for (int b = 0; b < bench; ++b)
+            {
+                std::vector<uint8_t> d2 = rec.dataIn;
+                vu.state() = rec.in; // execute() resets the pipeline scheduler itself
+                vu.state().dBitEnabled = rec.dBit;
+                vu.state().tBitEnabled = rec.tBit;
+                vu.setXgkickSink([](const uint8_t *, uint32_t) {});
+                int r = rt_vu1_native_execute
+                            ? rt_vu1_native_execute(vu, code.data(), static_cast<uint32_t>(code.size()), d2.data(),
+                                                    static_cast<uint32_t>(d2.size()), gs, nullptr, rec.startPC,
+                                                    rec.top, rec.itop, 65536)
+                            : 0;
+                if (r == 0)
+                {
+                    vu.reset();
+                    vu.state() = rec.in;
+                    d2 = rec.dataIn;
+                    vu.execute(code.data(), static_cast<uint32_t>(code.size()), d2.data(),
+                               static_cast<uint32_t>(d2.size()), gs, nullptr, rec.startPC, rec.top, rec.itop, 65536);
+                }
+            }
+            benchSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
+
         if (!problems.empty())
         {
             ++failed;
@@ -182,6 +238,13 @@ int main(int argc, char **argv)
     }
 
     std::cout << "replayed " << (total - skipped) << " of " << total << " records (" << skipped
-              << " MSCNT resumes skipped), " << failed << " mismatched\n";
+              << " MSCNT resumes skipped), " << failed << " mismatched";
+    if (rt_vu1_native_execute)
+        std::cout << "; native handled " << handled << ", deopted " << deopts;
+    std::cout << "\n";
+    for (auto &[why, n] : deoptWhy)
+        std::cout << "  deopt reason " << why.first << " at pc 0x" << std::hex << why.second << std::dec << ": " << n << "\n";
+    if (bench > 0)
+        std::cout << "bench: " << (benchSeconds * 1e6 / (double(total - skipped) * bench)) << " us per run\n";
     return failed == 0 && r.ok ? 0 : 1;
 }
