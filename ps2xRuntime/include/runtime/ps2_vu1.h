@@ -225,6 +225,17 @@ private:
     std::array<uint64_t, 4> m_accLatestWrite{};
 
     uint64_t m_cycle = 0;
+    // Earliest readyCycle of any queued pipeline entry; commitReadyPipelines() is a no-op
+    // before it. Every queued entry goes through notePipelineReady().
+    uint64_t m_nextCommitCycle = 0;
+    // Live entries per pipeline, so commitReadyPipelines() skips empty arrays.
+    uint32_t m_liveFlag = 0, m_liveEfu = 0, m_liveStore = 0, m_liveVf = 0, m_liveVi = 0, m_liveAcc = 0;
+    uint64_t notePipelineReady(uint64_t readyCycle)
+    {
+        if (readyCycle < m_nextCommitCycle)
+            m_nextCommitCycle = readyCycle;
+        return readyCycle;
+    }
     uint64_t m_nextWriteSequence = 0;
     uint64_t m_efuResourceReady = 0;
     uint32_t m_workingClip = 0;
