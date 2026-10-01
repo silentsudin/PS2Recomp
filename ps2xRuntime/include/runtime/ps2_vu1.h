@@ -216,7 +216,14 @@ private:
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
 
+    // MAC/status/clip writes. Every producer has latency kFmacLatency, so issue order is ready
+    // order: a FIFO ring (oldest at m_flagHead) commits exactly like the old slot scan did.
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
+    uint32_t m_flagHead = 0;
+    FlagPipelineEntry *allocFlagEntry();
+    void commitDueFlags();
+    uint64_t flagReadyCycle();
+    bool m_lazyFlags = false; // set only while recompiled code runs
     ScalarPipelineEntry m_fdiv{};
     std::array<ScalarPipelineEntry, 2> m_efu{};
     std::array<PendingStore, kMaxPendingStores> m_storePipeline{};
@@ -236,7 +243,7 @@ private:
     // before it. Every queued entry goes through notePipelineReady().
     uint64_t m_nextCommitCycle = 0;
     // Live entries per pipeline, so commitReadyPipelines() skips empty arrays.
-    uint32_t m_liveFlag = 0, m_liveEfu = 0, m_liveStore = 0, m_liveVf = 0, m_liveVi = 0, m_liveAcc = 0;
+    uint32_t m_liveFlag = 0 /* entries in the flag ring */, m_liveEfu = 0, m_liveStore = 0, m_liveVf = 0, m_liveVi = 0, m_liveAcc = 0;
     uint64_t notePipelineReady(uint64_t readyCycle)
     {
         if (readyCycle < m_nextCommitCycle)
@@ -303,6 +310,10 @@ private:
     void flushPipelines();
     void progressXgkick();
     void finishXgkick();
+    template <bool Immediate = false>
+    bool executePair(const DecodedInstructionPair &decoded, uint8_t *vuData, uint32_t dataSize,
+                     GS &gs, PS2Memory *memory, uint32_t codeSize);
+    friend struct Vu1Native; // recompiled microcode + recompiler tooling (runtime/vu/ps2_vu1_native.h)
     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;
     void markPairWrites(const DecodedInstructionPair &decoded);
     bool pipelinesPending() const;
