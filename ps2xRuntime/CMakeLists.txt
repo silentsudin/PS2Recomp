@@ -394,6 +394,7 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_capture.cpp
     src/lib/games_database.cpp
+    src/lib/test/ps2_test_harness.cpp
 )
 
 if(PS2X_ENABLE_RUNTIME_LOGS)

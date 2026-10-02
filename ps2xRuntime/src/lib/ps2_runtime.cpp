@@ -806,7 +806,9 @@ bool PS2Runtime::syncCoreSubsystems()
     {
         m_memory.setGifVif1BlockedTimeFn([this](uint64_t nanos)
                                          {
-                                             if (!m_eeScheduler || !m_eeScheduler->onExecutorThread())
+                                             // Virtual time must not depend on how long the host took.
+                                             if (!m_eeScheduler || !m_eeScheduler->onExecutorThread() ||
+                                                 m_eeScheduler->virtualTime())
                                                  return;
                                              // 294.912 MHz EE clock.
                                              uint64_t cycles = nanos * 294912u / 1000000u;

@@ -1,10 +1,13 @@
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_guest_clock.h"
+#include "runtime/ps2_test_harness.h"
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -75,6 +78,21 @@ namespace
 EeScheduler::EeScheduler(PS2Runtime &runtime)
     : m_runtime(runtime)
 {
+    if (const char *mode = std::getenv("RT_TIME"); mode && std::strcmp(mode, "virtual") == 0)
+    {
+        m_virtualTime = true;
+        if (const char *speed = std::getenv("RT_SPEED"))
+            m_virtualSpeed = std::strcmp(speed, "max") == 0 ? 0.0 : std::max(0.01, std::atof(speed));
+    }
+}
+
+std::chrono::steady_clock::time_point EeScheduler::virtualPacingTime(uint64_t cycle) const
+{
+    if (m_virtualSpeed <= 0.0)
+        return std::chrono::steady_clock::time_point::min();
+    const auto guest = eeCyclesToHostDuration(cycle);
+    return m_virtualEpoch + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double, std::nano>(static_cast<double>(guest.count()) / m_virtualSpeed));
 }
 
 EeScheduler::~EeScheduler()
@@ -112,6 +130,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
     m_eeCycle = 0u;
+    m_virtualEpoch = std::chrono::steady_clock::now();
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
@@ -1779,20 +1798,22 @@ void EeScheduler::processDueDeadlines()
     {
         std::vector<ScheduledEvent> due;
         std::chrono::steady_clock::time_point pacingDeadline{};
+        bool haveDue = false;
         {
             std::unique_lock lock(m_eventMutex);
             const auto now = std::chrono::steady_clock::now();
             for (const ScheduledEvent &item : m_deadlines)
             {
+                const auto itemPacing = m_virtualTime ? virtualPacingTime(item.deadlineCycle) : item.hostDeadline;
                 if (item.deadlineCycle <= m_eeCycle &&
-                    (pacingDeadline == std::chrono::steady_clock::time_point{} ||
-                     item.hostDeadline < pacingDeadline))
+                    (!haveDue || itemPacing < pacingDeadline))
                 {
-                    pacingDeadline = item.hostDeadline;
+                    pacingDeadline = itemPacing;
+                    haveDue = true;
                 }
             }
 
-            if (pacingDeadline == std::chrono::steady_clock::time_point{})
+            if (!haveDue)
             {
                 updateNextDeadline();
                 return;
@@ -1814,7 +1835,8 @@ void EeScheduler::processDueDeadlines()
             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
                                               [this, pacedNow](const ScheduledEvent &item)
                                               { return item.deadlineCycle <= m_eeCycle &&
-                                                       item.hostDeadline <= pacedNow; });
+                                                       (m_virtualTime ? virtualPacingTime(item.deadlineCycle) <= pacedNow
+                                                                      : item.hostDeadline <= pacedNow); });
             due.insert(due.end(),
                        std::make_move_iterator(m_deadlines.begin()),
                        std::make_move_iterator(firstFuture));
@@ -1868,6 +1890,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        ps2_guest_clock::g_vblanks.store(m_vsyncTick, std::memory_order_relaxed);
+        ps2_test::onVblank(m_runtime, m_vsyncTick);
         m_runtime.memory().sampleDisplayAtVblank();
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
@@ -2030,12 +2054,15 @@ void EeScheduler::waitForEvent()
     if (hasTimerDeadline)
     {
         const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
-        if (timerHostDeadline < hostDeadline)
+        if (m_virtualTime ? (m_deadlines.empty() || m_eeCycle + timerCycles < deadlineCycle)
+                          : timerHostDeadline < hostDeadline)
         {
             deadlineCycle = m_eeCycle + timerCycles;
             hostDeadline = timerHostDeadline;
         }
     }
+    if (m_virtualTime)
+        hostDeadline = virtualPacingTime(deadlineCycle); // idle: skip straight to the next guest event
 
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||

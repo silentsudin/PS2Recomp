@@ -372,6 +372,10 @@ private:
     void assertExecutor() const;
 public:
     [[nodiscard]] bool onExecutorThread() const noexcept { return m_executorThread == std::this_thread::get_id(); }
+    // RT_TIME=virtual: guest time comes only from EE cycles, so a run is reproducible whatever the
+    // host does. RT_SPEED=<x> paces it at x times real time (default 1), RT_SPEED=max runs it as
+    // fast as the host allows.
+    [[nodiscard]] bool virtualTime() const noexcept { return m_virtualTime; }
 private:
     [[nodiscard]] int allocateThreadId();
     GuestThread &acquireInvocationThread();
@@ -429,6 +433,12 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
+    bool m_virtualTime = false;
+    double m_virtualSpeed = 1.0; // 0 = unthrottled
+    std::chrono::steady_clock::time_point m_virtualEpoch{};
+    // Virtual time: the host time before which guest cycle `cycle` must not be reached (the pacing
+    // target for RT_SPEED); time_point::min() when unthrottled.
+    [[nodiscard]] std::chrono::steady_clock::time_point virtualPacingTime(uint64_t cycle) const;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};
