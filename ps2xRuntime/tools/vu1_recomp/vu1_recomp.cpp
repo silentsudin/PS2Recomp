@@ -1,6 +1,6 @@
 // ps2_vu1_recomp: statically recompiles VU1 microcode to C++.
 //
-//   ps2_vu1_recomp --elf GAME.ELF --out vu1_native.cpp [--entries 0x0,0x10,...]
+//   ps2_vu1_recomp --elf GAME.ELF --out vu1_native.cpp [--entries 0x0,0x10,...] [--exact]
 //   ps2_vu1_recomp --image code.bin --out vu1_native.cpp [--entries ...]
 //
 // The VU1 code image is assembled from the ELF's .DVP.ovlytab overlays (or read raw). Starting
@@ -152,6 +152,7 @@ int main(int argc, char **argv)
 {
     std::string elfPath, imagePath, outPath;
     std::vector<uint32_t> entries;
+    bool exact = false; // --exact: bit-exact float model (for vu1_replay); default is the fast SIMD path
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -159,6 +160,7 @@ int main(int argc, char **argv)
         if (a == "--elf") elfPath = next();
         else if (a == "--image") imagePath = next();
         else if (a == "--out") outPath = next();
+        else if (a == "--exact") exact = true;
         else if (a == "--entries")
         {
             std::stringstream list(next());
@@ -173,7 +175,7 @@ int main(int argc, char **argv)
     }
     if (outPath.empty() || (elfPath.empty() == imagePath.empty()))
     {
-        std::cerr << "usage: ps2_vu1_recomp (--elf ELF | --image BIN) --out FILE.cpp [--entries a,b,...]\n";
+        std::cerr << "usage: ps2_vu1_recomp (--elf ELF | --image BIN) --out FILE.cpp [--entries a,b,...] [--exact]\n";
         return 2;
     }
 
@@ -388,6 +390,34 @@ int main(int argc, char **argv)
     }
     std::cerr << flagsLive.size() << " of " << pcsUsed.size() << " pairs need exact MAC/status flags\n";
 
+    // Fast mode checks the cycle budget only where a loop can come back to (a node reached
+    // from an equal or higher pc), so runaway programs still hand over to the interpreter.
+    std::vector<bool> loopHead(nodes.size(), false);
+    std::vector<bool> delaySlot(nodes.size(), false); // entered with a branch pending
+    for (const Node &n : nodes)
+        for (const Edge &e : n.succ)
+        {
+            if (nodes[e.node].pc <= n.pc)
+                loopHead[e.node] = true;
+            if (e.pending)
+                delaySlot[e.node] = true;
+        }
+
+    auto isPlain = [&](size_t id)
+    {
+        const Node &n = nodes[id];
+        if (exact || n.unsupported || n.ended || delaySlot[id] || n.succ.size() != 1u || n.succ[0].pending)
+            return false;
+        const auto pair = Vu1Native::decode(base, image.data(), n.pc);
+        return !pair.iBit && !pair.eBit && !pair.dBit && !pair.tBit &&
+               pair.lowerUsage.pipeline != Vu1Native::Pipeline(6 /* PipelineBranch */) &&
+               n.succ[0].pc == ((n.pc + 8u) & (kCodeSize - 1u));
+    };
+    std::set<uint32_t> plainPcs;
+    for (size_t id = 0; id < nodes.size(); ++id)
+        if (isPlain(id))
+            plainPcs.insert(nodes[id].pc);
+
     // One specialized step per instruction pair: flatten inlines executePair/execUpper/execLower
     // with the constant pair, folding the decode away; nodes call these with their stall.
     for (auto &[pc, used] : pcsUsed)
@@ -395,7 +425,13 @@ int main(int argc, char **argv)
         (void)used;
         out << "    __attribute__((flatten, noinline)) Vu1Native::StepResult S" << std::hex << pc << std::dec
             << "(VU1Interpreter &vu, const Vu1Native::Frame &f, uint32_t stall)\n    {\n        return Vu1Native::step<"
-            << (flagsLive.count(pc) ? "true" : "false") << ">(vu, f, kP" << std::hex << pc << std::dec << ", stall);\n    }\n";
+            << (flagsLive.count(pc) ? "true" : "false") << ", " << (exact ? "false" : "true") << ", false>(vu, f, kP" << std::hex << pc
+            << ", stall, 0x" << pc << std::dec << "u);\n    }\n";
+        if (plainPcs.count(pc))
+            out << "    __attribute__((flatten, noinline)) Vu1Native::StepResult P" << std::hex << pc << std::dec
+                << "(VU1Interpreter &vu, const Vu1Native::Frame &f, uint32_t stall)\n    {\n        return Vu1Native::step<"
+                << (flagsLive.count(pc) ? "true" : "false") << ", true, true>(vu, f, kP" << std::hex << pc << ", stall, 0x" << pc
+                << std::dec << "u);\n    }\n";
     }
     out << "}\n\n"
         << "extern \"C\" __attribute__((visibility(\"default\"))) int rt_vu1_native_execute(\n"
@@ -405,7 +441,8 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < entries.size(); ++i)
         out << "    case " << hex(entries[i]) << "u:\n        break;\n";
     out << "    default:\n        return Vu1Native::NotHandled;\n    }\n"
-        << "    Vu1Native::Frame f = Vu1Native::beginExecute(vu, codeSize, vuData, dataSize, gs, memory, startPC, top, itop, maxCycles);\n"
+        << "    Vu1Native::Frame f = Vu1Native::beginExecute(vu, codeSize, vuData, dataSize, gs, memory, startPC, top, itop, maxCycles, "
+        << (exact ? "false" : "true") << ");\n"
         << "    switch (startPC)\n    {\n";
     for (size_t i = 0; i < entries.size(); ++i)
         out << "    case " << hex(entries[i]) << "u:\n        goto N" << entryNodes[i] << ";\n";
@@ -415,6 +452,12 @@ int main(int argc, char **argv)
     {
         const Node &n = nodes[id];
         out << "N" << id << ":\n";
+        const bool plain = isPlain(id);
+        // Fast mode: a preceding plain pair leaves m_state.pc at its own pc, so deopts before this
+        // pair set the right one first.
+        const std::string setPc = exact ? std::string() : "        Vu1Native::setPc(vu, " + hex(n.pc) + "u);\n";
+        if (!exact && loopHead[id] && !n.unsupported)
+            out << "    if (Vu1Native::overBudget(vu, f))\n    {\n" << setPc << "        Vu1Native::noteDeopt(vu, Vu1Native::DeoptStep);\n        goto deopt;\n    }\n";
         if (n.unsupported)
         {
             out << "    goto deopt;\n";
@@ -424,23 +467,31 @@ int main(int argc, char **argv)
         if (!pair.iBit && pair.lowerUsage.pipeline == Vu1Native::Pipeline(7 /* PipelineXgkick */))
         {
             out << "    if (Vu1Native::xgkickActive(vu))\n    {\n        Vu1Native::waitXgkick(vu);\n"
-                << "        if (!Vu1Native::timingDrained(vu))\n        {\n"
+                << "        if (!Vu1Native::timingDrained(vu))\n        {\n" << setPc
                 << "            Vu1Native::noteDeopt(vu, Vu1Native::DeoptXgkickBusy);\n            goto deopt;\n        }\n";
             if (n.drainedVariant != SIZE_MAX && n.drainedVariant != id)
                 out << "        goto N" << n.drainedVariant << ";\n";
             out << "    }\n";
         }
         if (pair.dBit)
-            out << "    if (Vu1Native::dBitEnabled(vu))\n    {\n        Vu1Native::noteDeopt(vu, Vu1Native::DeoptHaltBit);\n        goto deopt;\n    }\n";
+            out << "    if (Vu1Native::dBitEnabled(vu))\n    {\n" << setPc << "        Vu1Native::noteDeopt(vu, Vu1Native::DeoptHaltBit);\n        goto deopt;\n    }\n";
         if (pair.tBit)
-            out << "    if (Vu1Native::tBitEnabled(vu))\n    {\n        Vu1Native::noteDeopt(vu, Vu1Native::DeoptHaltBit);\n        goto deopt;\n    }\n";
-        out << "    switch (S" << std::hex << n.pc << std::dec << "(vu, f, " << n.stall << "u))\n    {\n"
+            out << "    if (Vu1Native::tBitEnabled(vu))\n    {\n" << setPc << "        Vu1Native::noteDeopt(vu, Vu1Native::DeoptHaltBit);\n        goto deopt;\n    }\n";
+        out << "    switch (" << (plain ? "P" : "S") << std::hex << n.pc << std::dec << "(vu, f, " << n.stall << "u))\n    {\n"
             << "    case Vu1Native::Continue:\n        break;\n"
             << "    case Vu1Native::Ended:\n        " << (n.ended ? "goto done;" : "Vu1Native::noteDeopt(vu, Vu1Native::DeoptExit);\n        goto deopt;") << "\n"
             << "    default:\n        Vu1Native::noteDeopt(vu, Vu1Native::DeoptStep);\n        goto deopt;\n    }\n";
         if (n.ended)
         {
             out << "    Vu1Native::noteDeopt(vu, Vu1Native::DeoptExit);\n    goto deopt;\n";
+            continue;
+        }
+        // A plain pair (no branch, not in a delay slot, one successor) always continues at pc+8.
+        if (!exact && n.succ.size() == 1u && !delaySlot[id] && !pair.iBit &&
+            pair.lowerUsage.pipeline != Vu1Native::Pipeline(6 /* PipelineBranch */) && !n.succ[0].pending &&
+            n.succ[0].pc == ((n.pc + 8u) & (kCodeSize - 1u)))
+        {
+            out << "    goto N" << n.succ[0].node << ";\n";
             continue;
         }
         out << "    {\n        const uint32_t pc = Vu1Native::pc(vu);\n        const bool pending = Vu1Native::branchPending(vu);\n";

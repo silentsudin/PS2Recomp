@@ -212,29 +212,26 @@ int main(int argc, char **argv)
 
         if (bench > 0)
         {
-            auto t0 = std::chrono::steady_clock::now();
+            // Time only the VU1 call; resetting the inputs (a 16 KiB copy) is not part of it.
+            std::vector<uint8_t> d2(rec.dataIn.size());
+            vu.setXgkickSink([](const uint8_t *, uint32_t) {});
             for (int b = 0; b < bench; ++b)
             {
-                std::vector<uint8_t> d2 = rec.dataIn;
+                std::memcpy(d2.data(), rec.dataIn.data(), d2.size());
                 vu.state() = rec.in; // execute() resets the pipeline scheduler itself
                 vu.state().dBitEnabled = rec.dBit;
                 vu.state().tBitEnabled = rec.tBit;
-                vu.setXgkickSink([](const uint8_t *, uint32_t) {});
+                const auto t0 = std::chrono::steady_clock::now();
                 int r = rt_vu1_native_execute
                             ? rt_vu1_native_execute(vu, code.data(), static_cast<uint32_t>(code.size()), d2.data(),
                                                     static_cast<uint32_t>(d2.size()), gs, nullptr, rec.startPC,
                                                     rec.top, rec.itop, 65536)
                             : 0;
                 if (r == 0)
-                {
-                    vu.reset();
-                    vu.state() = rec.in;
-                    d2 = rec.dataIn;
                     vu.execute(code.data(), static_cast<uint32_t>(code.size()), d2.data(),
                                static_cast<uint32_t>(d2.size()), gs, nullptr, rec.startPC, rec.top, rec.itop, 65536);
-                }
+                benchSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             }
-            benchSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         }
 
         if (!problems.empty())

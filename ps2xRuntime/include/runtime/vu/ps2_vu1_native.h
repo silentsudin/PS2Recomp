@@ -41,14 +41,19 @@ struct Vu1Native
         GS *gs = nullptr;
         PS2Memory *memory = nullptr;
         uint32_t codeSize = 0;
+        uint64_t previousFpcr = 0;
+        bool restoreFpcr = false;
     };
 
     // VU1Interpreter::execute() + the prologue of run().
     static inline Frame beginExecute(VU1Interpreter &vu, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
                                      GS &gs, PS2Memory *memory, uint32_t startPC, uint32_t top, uint32_t itop,
-                                     uint32_t maxCycles)
+                                     uint32_t maxCycles, bool fast = false)
     {
-        vu.resetScheduler();
+        if (fast)
+            vu.resetSchedulerLight();
+        else
+            vu.resetScheduler();
         auto &s = vu.m_state;
         s.pc = startPC & vu.microAddressMask();
         s.ebit = false;
@@ -74,6 +79,19 @@ struct Vu1Native
         Frame f;
         f.previousRoundingMode = std::fegetround();
         f.useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+#if defined(__aarch64__)
+        if (fast)
+        {
+            // Fast mode: flush denormals to zero in hardware (FPCR.FZ), like the VU.
+            uint64_t fpcr;
+            __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+            f.previousFpcr = fpcr;
+            f.restoreFpcr = true;
+            __asm__ volatile("msr fpcr, %0" : : "r"(fpcr | (1ull << 24)));
+        }
+#else
+        (void)fast;
+#endif
         f.budgetEnd = vu.m_cycle + maxCycles;
         f.vuData = vuData;
         f.dataSize = dataSize;
@@ -106,6 +124,15 @@ struct Vu1Native
 
     static inline void restoreRounding(const Frame &f)
     {
+#if defined(__aarch64__)
+        if (f.restoreFpcr)
+        {
+            uint64_t fpcr;
+            __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+            fpcr = (fpcr & ~(1ull << 24)) | (f.previousFpcr & (1ull << 24));
+            __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+        }
+#endif
         if (f.useVuRounding && f.previousRoundingMode != -1)
             std::fesetround(f.previousRoundingMode);
     }
@@ -119,18 +146,34 @@ struct Vu1Native
 
     // One loop iteration of run(): stall `stall` cycles, then execute the pair.
     // Flags = false when no MAC/status reader is reachable from this pair (see ps2_vu1_recomp).
-    template <bool Flags = true>
-    __attribute__((always_inline)) static inline StepResult step(VU1Interpreter &vu, const Frame &f, const Pair &pair, uint32_t stall)
+    template <bool Flags = true, bool Fast = false, bool Plain = false>
+    __attribute__((always_inline)) static inline StepResult step(VU1Interpreter &vu, const Frame &f, const Pair &pair, uint32_t stall,
+                                                                 uint32_t pairPc = 0)
     {
+        if constexpr (Fast)
+            vu.m_state.pc = pairPc; // plain pairs don't advance it, so set it for every fast pair
         if (stall != 0u)
             vu.advanceTo(vu.m_cycle + stall);
-        if (vu.m_cycle >= f.budgetEnd || vu.m_stopRequested)
-            return Bail;
+        if constexpr (!Fast)
+        {
+            if (vu.m_cycle >= f.budgetEnd || vu.m_stopRequested)
+                return Bail;
+        }
         bool ended;
-        [[clang::always_inline]] ended = vu.template executePair<true, Flags>(pair, f.vuData, f.dataSize, *f.gs, f.memory, f.codeSize);
+        [[clang::always_inline]] ended = vu.template executePair<true, Flags, Fast, Plain>(pair, f.vuData, f.dataSize, *f.gs, f.memory, f.codeSize);
         if (vu.m_stopRequested)
+        {
+            if constexpr (Plain)
+                vu.m_state.pc = (pairPc + 8u) & (f.codeSize - 1u);
             return Bail;
+        }
         return ended ? Ended : Continue;
+    }
+
+    // Fast mode checks the cycle budget only at loop heads (see ps2_vu1_recomp).
+    static inline bool overBudget(const VU1Interpreter &vu, const Frame &f)
+    {
+        return vu.m_cycle >= f.budgetEnd || vu.m_stopRequested;
     }
 
     // FNV-1a over VU1 code memory: identifies the image a native module was compiled from.
@@ -230,6 +273,7 @@ struct Vu1Native
 
     // Control state that selects the next statically known node.
     static inline uint32_t pc(const VU1Interpreter &vu) { return vu.m_state.pc; }
+    static inline void setPc(VU1Interpreter &vu, uint32_t pc) { vu.m_state.pc = pc; }
     static inline bool branchPending(const VU1Interpreter &vu) { return vu.m_state.branchPending; }
     static inline uint32_t branchTarget(const VU1Interpreter &vu) { return vu.m_state.branchTarget; }
 

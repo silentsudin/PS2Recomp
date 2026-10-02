@@ -1586,6 +1586,168 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
     }
 }
 
+
+// ============================================================================
+// Fast upper path (recompiled code, "fast" mode): the FMAC ops as 4-lane SIMD with the host's
+// round-toward-zero and flush-to-zero modes plus clamping to +-FLT_MAX, like PCSX2's microVU.
+// Not bit-exact with the interpreter's exact float model, but the same values to within the
+// last bit or so; only used where no MAC/status reader can see the flags.
+// ============================================================================
+namespace ps2x_vu1_fast
+{
+    typedef float f4 __attribute__((ext_vector_type(4)));
+    typedef int32_t i4 __attribute__((ext_vector_type(4)));
+
+    __attribute__((always_inline)) inline f4 clampv(f4 v)
+    {
+        return __builtin_elementwise_min(__builtin_elementwise_max(v, (f4)(-3.402823466e+38f)), (f4)(3.402823466e+38f));
+    }
+    __attribute__((always_inline)) inline f4 load(const float *p)
+    {
+        f4 v;
+        std::memcpy(&v, p, sizeof(v));
+        return clampv(v);
+    }
+    __attribute__((always_inline)) inline f4 loadRaw(const float *p)
+    {
+        f4 v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    }
+    __attribute__((always_inline)) inline void store(float *dst, f4 value, uint8_t dest)
+    {
+        if (dest == 0xFu)
+        {
+            std::memcpy(dst, &value, sizeof(value));
+            return;
+        }
+        const i4 mask = {(dest & 8u) ? -1 : 0, (dest & 4u) ? -1 : 0, (dest & 2u) ? -1 : 0, (dest & 1u) ? -1 : 0};
+        i4 oldBits, newBits;
+        std::memcpy(&oldBits, dst, sizeof(oldBits));
+        std::memcpy(&newBits, &value, sizeof(newBits));
+        const i4 out = (newBits & mask) | (oldBits & ~mask);
+        std::memcpy(dst, &out, sizeof(out));
+    }
+    __attribute__((always_inline)) inline f4 splat(float v) { return (f4)(v); }
+}
+
+template <bool Flags>
+__attribute__((always_inline)) inline bool VU1Interpreter::execUpperFast(uint32_t instr)
+{
+    using namespace ps2x_vu1_fast;
+    if constexpr (Flags)
+        return false;
+    const uint8_t dest = DEST(instr);
+    const uint8_t ft = FT(instr), fs = FS(instr), fd = FD(instr);
+    const uint8_t op = instr & 0x3Fu;
+    auto vs = [&] { return load(m_state.vf[fs]); };
+    auto vt = [&] { return load(m_state.vf[ft]); };
+    auto acc = [&] { return load(m_state.acc); };
+    auto bc = [&](uint32_t c) { return splat(std::clamp(m_state.vf[ft][c & 3u], -3.402823466e+38f, 3.402823466e+38f)); };
+    const f4 q = splat(std::clamp(m_state.q, -3.402823466e+38f, 3.402823466e+38f));
+    const f4 i = splat(std::clamp(m_state.i, -3.402823466e+38f, 3.402823466e+38f));
+    auto toFd = [&](f4 r) { store(m_state.vf[fd], clampv(r), dest); };
+    auto toAcc = [&](f4 r) { store(m_state.acc, clampv(r), dest); };
+    auto opRotate = [&](f4 a, f4 b) { return (f4){a.y, a.z, a.x, 0.0f} * (f4){b.z, b.x, b.y, 0.0f}; };
+
+    if (op < 0x3Cu)
+    {
+        if (fd == 0u && op != 0x2Eu)
+            return false; // writes to VF0 are discarded; let the exact path handle the oddity
+        switch (op)
+        {
+        case 0x00: case 0x01: case 0x02: case 0x03: toFd(vs() + bc(op)); return true;
+        case 0x04: case 0x05: case 0x06: case 0x07: toFd(vs() - bc(op)); return true;
+        case 0x08: case 0x09: case 0x0A: case 0x0B: toFd(acc() + vs() * bc(op)); return true;
+        case 0x0C: case 0x0D: case 0x0E: case 0x0F: toFd(acc() - vs() * bc(op)); return true;
+        case 0x10: case 0x11: case 0x12: case 0x13: store(m_state.vf[fd], __builtin_elementwise_max(vs(), bc(op)), dest); return true;
+        case 0x14: case 0x15: case 0x16: case 0x17: store(m_state.vf[fd], __builtin_elementwise_min(vs(), bc(op)), dest); return true;
+        case 0x18: case 0x19: case 0x1A: case 0x1B: toFd(vs() * bc(op)); return true;
+        case 0x1C: toFd(vs() * q); return true;
+        case 0x1D: store(m_state.vf[fd], __builtin_elementwise_max(vs(), i), dest); return true;
+        case 0x1E: toFd(vs() * i); return true;
+        case 0x1F: store(m_state.vf[fd], __builtin_elementwise_min(vs(), i), dest); return true;
+        case 0x20: toFd(vs() + q); return true;
+        case 0x21: toFd(acc() + vs() * q); return true;
+        case 0x22: toFd(vs() + i); return true;
+        case 0x23: toFd(acc() + vs() * i); return true;
+        case 0x24: toFd(vs() - q); return true;
+        case 0x25: toFd(acc() - vs() * q); return true;
+        case 0x26: toFd(vs() - i); return true;
+        case 0x27: toFd(acc() - vs() * i); return true;
+        case 0x28: toFd(vs() + vt()); return true;
+        case 0x29: toFd(acc() + vs() * vt()); return true;
+        case 0x2A: toFd(vs() * vt()); return true;
+        case 0x2B: store(m_state.vf[fd], __builtin_elementwise_max(vs(), vt()), dest); return true;
+        case 0x2C: toFd(vs() - vt()); return true;
+        case 0x2D: toFd(acc() - vs() * vt()); return true;
+        case 0x2E: // OPMSUB
+            if (fd == 0u)
+                return false;
+            toFd((f4){acc().x, acc().y, acc().z, 0.0f} - opRotate(vs(), vt()));
+            return true;
+        case 0x2F: store(m_state.vf[fd], __builtin_elementwise_min(vs(), vt()), dest); return true;
+        default: return false;
+        }
+    }
+
+    const uint8_t sop = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+    const bool toFt = (sop >= 0x10u && sop <= 0x17u) || sop == 0x1Du;
+    if (toFt && ft == 0u)
+        return false;
+    switch (sop)
+    {
+    case 0x00: case 0x01: case 0x02: case 0x03: toAcc(vs() + bc(sop)); return true;
+    case 0x04: case 0x05: case 0x06: case 0x07: toAcc(vs() - bc(sop)); return true;
+    case 0x08: case 0x09: case 0x0A: case 0x0B: toAcc(acc() + vs() * bc(sop)); return true;
+    case 0x0C: case 0x0D: case 0x0E: case 0x0F: toAcc(acc() - vs() * bc(sop)); return true;
+    case 0x10: case 0x11: case 0x12: case 0x13: // ITOF0/4/12/15
+    {
+        static constexpr float kScale[4] = {1.0f, 1.0f / 16.0f, 1.0f / 4096.0f, 1.0f / 32768.0f};
+        i4 iv;
+        std::memcpy(&iv, m_state.vf[fs], sizeof(iv));
+        store(m_state.vf[ft], __builtin_convertvector(iv, f4) * splat(kScale[sop & 3u]), dest);
+        return true;
+    }
+    case 0x14: case 0x15: case 0x16: case 0x17: // FTOI0/4/12/15 (truncate, saturate)
+    {
+        static constexpr float kScale[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+        const f4 scaled = vs() * splat(kScale[sop & 3u]);
+        const i4 iv = __builtin_convertvector(scaled, i4);
+        f4 bits;
+        std::memcpy(&bits, &iv, sizeof(bits));
+        i4 sat = iv;
+        // Saturate like the VU (C conversion of out-of-range floats is undefined).
+        for (int c = 0; c < 4; ++c)
+            if (!(scaled[c] < 2147483648.0f && scaled[c] >= -2147483648.0f))
+                sat[c] = scaled[c] < 0.0f ? INT32_MIN : INT32_MAX;
+        std::memcpy(&bits, &sat, sizeof(bits));
+        store(m_state.vf[ft], bits, dest);
+        return true;
+    }
+    case 0x18: case 0x19: case 0x1A: case 0x1B: toAcc(vs() * bc(sop)); return true;
+    case 0x1C: toAcc(vs() * q); return true;
+    case 0x1D: store(m_state.vf[ft], __builtin_elementwise_abs(loadRaw(m_state.vf[fs])), dest); return true;
+    case 0x1E: toAcc(vs() * i); return true;
+    case 0x20: toAcc(vs() + q); return true;
+    case 0x21: toAcc(acc() + vs() * q); return true;
+    case 0x22: toAcc(vs() + i); return true;
+    case 0x23: toAcc(acc() + vs() * i); return true;
+    case 0x24: toAcc(vs() - q); return true;
+    case 0x25: toAcc(acc() - vs() * q); return true;
+    case 0x26: toAcc(vs() - i); return true;
+    case 0x27: toAcc(acc() - vs() * i); return true;
+    case 0x28: toAcc(vs() + vt()); return true;
+    case 0x29: toAcc(acc() + vs() * vt()); return true;
+    case 0x2A: toAcc(vs() * vt()); return true;
+    case 0x2C: toAcc(vs() - vt()); return true;
+    case 0x2D: toAcc(acc() - vs() * vt()); return true;
+    case 0x2E: toAcc(opRotate(vs(), vt())); return true; // OPMULA
+    case 0x2F: case 0x30: return true;                   // NOP
+    default: return false;                               // CLIP etc.: exact path
+    }
+}
+
 inline void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
 {
     (void)upperInstr;
@@ -2349,7 +2511,7 @@ inline void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded
     }
 }
 
-template <bool Immediate, bool Flags>
+template <bool Immediate, bool Flags, bool Fast, bool Plain>
 inline bool VU1Interpreter::executePair(const DecodedInstructionPair &decoded, uint8_t *vuData, uint32_t dataSize,
                                         GS &gs, PS2Memory *memory, uint32_t codeSize)
 {
@@ -2420,7 +2582,11 @@ inline bool VU1Interpreter::executePair(const DecodedInstructionPair &decoded, u
     }
     else
     {
-        [[clang::always_inline]] execUpper<Flags>(decoded.upper);
+        bool done = false;
+        if constexpr (Fast)
+            done = execUpperFast<Flags>(decoded.upper);
+        if (!done)
+            [[clang::always_inline]] execUpper<Flags>(decoded.upper);
         [[clang::always_inline]] execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
     }
 
@@ -2432,7 +2598,8 @@ inline bool VU1Interpreter::executePair(const DecodedInstructionPair &decoded, u
     // stalls and an interpreter continuation after a deopt behave the same.
     if (Immediate)
     {
-        [[clang::always_inline]] markPairWrites(decoded);
+        if constexpr (!Fast) // fast mode: ready cycles only matter to a deopt, which may stall less
+            [[clang::always_inline]] markPairWrites(decoded);
         if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
             recordViWriteForBranch(writtenVi, oldVi);
     }
@@ -2488,6 +2655,18 @@ inline bool VU1Interpreter::executePair(const DecodedInstructionPair &decoded, u
     m_state.vf[0][3] = 1.0f;
     m_state.vi[0] = 0;
 
+    if constexpr (Plain)
+    {
+        // Recompiled straight-line pair (no branch, delay slot, E/D/T bit): the generated code
+        // continues at the next node itself and keeps m_state.pc for deopts.
+        ++m_cycle;
+        if (m_cycle >= m_nextCommitCycle)
+            commitReadyPipelines();
+        if (m_xgkick.active)
+            progressXgkick();
+        return false;
+    }
+
     uint32_t nextPc = m_state.pc + 8u;
     if (nextPc >= codeSize)
         nextPc = 0u;
@@ -2535,6 +2714,15 @@ inline bool VU1Interpreter::executePair(const DecodedInstructionPair &decoded, u
     }
 
 
-    advanceOneCycle();
+    if constexpr (Fast)
+    {
+        ++m_cycle; // m_state.cycles is written back by endRun()
+        if (m_cycle >= m_nextCommitCycle)
+            commitReadyPipelines();
+        if (m_xgkick.active)
+            progressXgkick();
+    }
+    else
+        advanceOneCycle();
     return programEnded;
 }

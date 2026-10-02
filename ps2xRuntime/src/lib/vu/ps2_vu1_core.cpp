@@ -91,6 +91,26 @@ void VU1Interpreter::resetScheduler()
     m_pendingHaltT = false;
 }
 
+void VU1Interpreter::resetSchedulerLight()
+{
+    // After a run, flushPipelines() leaves every pipeline empty and every ready cycle in the
+    // past, so only the per-run fields need resetting. Fall back if anything is still live.
+    if (m_liveFlag || m_liveEfu || m_liveStore || m_liveVf || m_liveVi || m_liveAcc || m_fdiv.valid || m_xgkick.active)
+    {
+        resetScheduler();
+        return;
+    }
+    m_flagHead = 0;
+    m_lazyFlags = false;
+    m_nextCommitCycle = 0;
+    m_xgkick.clear();
+    m_workingClip = m_state.clip;
+    m_viBranchBackupValid = false;
+    m_stopRequested = false;
+    m_pendingHaltD = false;
+    m_pendingHaltT = false;
+}
+
 void VU1Interpreter::reset()
 {
     std::memset(&m_state, 0, sizeof(m_state));

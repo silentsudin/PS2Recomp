@@ -292,6 +292,8 @@ private:
 
     template <bool Flags = true>
     void execUpper(uint32_t instr);
+    template <bool Flags>
+    bool execUpperFast(uint32_t instr);
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
 
     void applyDest(float *dst, const float *result, uint8_t dest);
@@ -318,6 +320,7 @@ private:
     void startXgkick(uint32_t qwordAddress);
 
     void resetScheduler();
+    void resetSchedulerLight();
     void commitReadyPipelines();
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
@@ -327,7 +330,7 @@ private:
     uint64_t cyclesUntilXgkickEvent() const;
     void finishXgkick();
     // Flags = false (recompiled code where no flag reader is reachable): skip MAC/status work.
-    template <bool Immediate = false, bool Flags = true>
+    template <bool Immediate = false, bool Flags = true, bool Fast = false, bool Plain = false>
     bool executePair(const DecodedInstructionPair &decoded, uint8_t *vuData, uint32_t dataSize,
                      GS &gs, PS2Memory *memory, uint32_t codeSize);
     friend struct Vu1Native; // recompiled microcode + recompiler tooling (runtime/vu/ps2_vu1_native.h)
