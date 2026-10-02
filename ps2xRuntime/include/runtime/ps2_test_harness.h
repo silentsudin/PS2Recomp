@@ -40,6 +40,9 @@ namespace ps2_test
     // without it the last state holds). Called on exit.
     void finishRecording();
 
+    // Sound output (48 kHz stereo), for the test server's "audio" command.
+    void onAudio(const int16_t *interleavedStereo, size_t frames);
+
     // Called on the EE thread at the start of every guest vblank.
     void onVblank(PS2Runtime &runtime, uint64_t vblank);
 
@@ -54,6 +57,7 @@ namespace ps2_test
     //   {"cmd":"write","space":...,"addr":A,"data":"<hex>"}
     //   {"cmd":"frame","path":P}             the presented picture as raw RGBA -> {"width":W,"height":H}
     //   {"cmd":"stats"}                      vblank, presented frames, thread load
+    //   {"cmd":"audio"}                      sound since the last query: frames, rms, peak, hash
     //   {"cmd":"quit"}
     void startServerIfRequested(PS2Runtime &runtime);
 

@@ -1,4 +1,5 @@
 #include "ps2_audio_out.h"
+#include "runtime/ps2_test_harness.h"
 
 #include "raylib.h"
 
@@ -73,6 +74,7 @@ void ps2AudioOutSubmit(const int16_t *interleavedStereo, size_t frames)
         std::fwrite(interleavedStereo, sizeof(int16_t) * 2, frames, dump);
         std::fflush(dump);
     }
+    ps2_test::onAudio(interleavedStereo, frames);
     if (!g_started.load(std::memory_order_relaxed))
         return;
     std::lock_guard<std::mutex> lock(g_mutex);

@@ -3,6 +3,7 @@
 #include "ps2_runtime.h"
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <condition_variable>
 #include <thread>
@@ -74,6 +75,11 @@ namespace ps2_test
         uint64_t g_parkedAt = UINT64_MAX;   // vblank the game is parked at, or UINT64_MAX
         bool g_serverPadActive = false;
         PadState g_serverPad;
+        // Sound since the last "audio" query.
+        uint64_t g_audioFrames = 0;
+        double g_audioSquares = 0.0;
+        int g_audioPeak = 0;
+        uint64_t g_audioHash = 0xcbf29ce484222325ull;
         // Frame capture hand-off with the render thread.
         bool g_captureRequested = false;
         bool g_captureDone = false;
@@ -469,6 +475,20 @@ namespace ps2_test
                        ",\"vif1_busy_ns\":" + std::to_string(memory.gifVif1BusyNanos()) +
                        ",\"gs_busy_ns\":" + std::to_string(memory.gsThreadBusyNanos()) + "}";
             }
+            if (cmd == "audio")
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                const double rms = g_audioFrames ? std::sqrt(g_audioSquares / (2.0 * static_cast<double>(g_audioFrames))) : 0.0;
+                char reply[256];
+                std::snprintf(reply, sizeof(reply), "{\"ok\":true,\"frames\":%llu,\"rms\":%.2f,\"peak\":%d,\"hash\":\"%016llx\"}",
+                              static_cast<unsigned long long>(g_audioFrames), rms, g_audioPeak,
+                              static_cast<unsigned long long>(g_audioHash));
+                g_audioFrames = 0;
+                g_audioSquares = 0.0;
+                g_audioPeak = 0;
+                g_audioHash = 0xcbf29ce484222325ull;
+                return reply;
+            }
             if (cmd == "quit")
             {
                 runtime.requestStop();
@@ -548,6 +568,21 @@ namespace ps2_test
                         if (fd >= 0)
                             serveClient(runtime, fd); })
             .detach();
+    }
+
+    void onAudio(const int16_t *interleavedStereo, size_t frames)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_serverEnabled && !g_attached)
+            return;
+        for (size_t i = 0; i < frames * 2; ++i)
+        {
+            const int v = interleavedStereo[i];
+            g_audioSquares += static_cast<double>(v) * v;
+            g_audioPeak = std::max(g_audioPeak, v < 0 ? -v : v);
+            g_audioHash = (g_audioHash ^ static_cast<uint16_t>(v)) * 0x100000001b3ull;
+        }
+        g_audioFrames += frames;
     }
 
     bool frameCaptureRequested()
