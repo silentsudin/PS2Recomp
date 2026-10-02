@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -324,14 +325,77 @@ int main(int argc, char **argv)
         out << "    constexpr Vu1Native::Pair kP" << std::hex << pc << std::dec << " = "
             << emitPair(Vu1Native::decode(base, image.data(), pc)) << ";\n";
     }
+    // Flag liveness. MAC/status results matter only where a reader (FSxx, FMxx) can see them.
+    // Flags become visible 4 cycles after issue, so a reader sees the newest FMAC issued at least
+    // 4 cycles earlier: a pair's flags are dead if, on every path to a reader, another FMAC issues
+    // 4 or more pairs (each pair >= 1 cycle) before that reader. Backward pass over (pc, distance
+    // to reader capped at 4). Unsupported nodes continue in the interpreter, so they count as
+    // readers. Clip flags are always kept.
+    std::map<uint32_t, std::set<uint32_t>> pcSucc;
+    std::set<uint32_t> readers, fmac;
+    for (auto &n : nodes)
+    {
+        for (const Edge &e : n.succ)
+            pcSucc[n.pc].insert(nodes[e.node].pc);
+        if (n.drainedVariant != SIZE_MAX)
+            pcSucc[n.pc].insert(nodes[n.drainedVariant].pc);
+        if (n.unsupported)
+        {
+            readers.insert(n.pc);
+            continue;
+        }
+        const auto pair = Vu1Native::decode(base, image.data(), n.pc);
+        const uint32_t op = (pair.lower >> 25) & 0x7Fu;
+        if (!pair.iBit && (op == 0x14u || op == 0x15u || op == 0x16u || op == 0x17u || op == 0x18u || op == 0x1Au || op == 0x1Bu))
+            readers.insert(n.pc);
+        // Upper ops that write MAC/status (the ones execUpper routes through applyFmacDest*).
+        const uint32_t upperOp = pair.upper & 0x3Fu;
+        const uint32_t flagOp = upperOp < 0x3Cu ? upperOp : ((pair.upper & 0x3u) | ((pair.upper >> 4) & 0x7Cu));
+        if (flagOp <= 0x0Fu || (flagOp >= 0x18u && flagOp <= 0x1Cu) || flagOp == 0x1Eu ||
+            (flagOp >= 0x20u && flagOp <= 0x2Au) || (flagOp >= 0x2Cu && flagOp <= 0x2Eu))
+            fmac.insert(n.pc);
+    }
+    std::map<uint32_t, std::set<uint32_t>> pcPred;
+    for (auto &[from, tos] : pcSucc)
+        for (uint32_t to : tos)
+            pcPred[to].insert(from);
+    // open[pc] bit t: an unblocked path from pc reaches a reader in t pairs (t capped at 4).
+    std::map<uint32_t, uint32_t> open;
+    std::set<uint32_t> flagsLive;
+    std::vector<std::pair<uint32_t, uint32_t>> liveWork;
+    for (uint32_t r : readers)
+    {
+        open[r] |= 1u;
+        liveWork.push_back({r, 0u});
+        flagsLive.insert(r);
+    }
+    while (!liveWork.empty())
+    {
+        const auto [pc, t] = liveWork.back();
+        liveWork.pop_back();
+        const uint32_t t2 = std::min(t + 1u, 4u);
+        for (uint32_t p : pcPred[pc])
+        {
+            flagsLive.insert(p); // p's own flags can reach the reader
+            if (fmac.count(p) && t2 >= 4u)
+                continue; // p's flags shadow everything issued before it on this path
+            if ((open[p] & (1u << t2)) == 0u)
+            {
+                open[p] |= 1u << t2;
+                liveWork.push_back({p, t2});
+            }
+        }
+    }
+    std::cerr << flagsLive.size() << " of " << pcsUsed.size() << " pairs need exact MAC/status flags\n";
+
     // One specialized step per instruction pair: flatten inlines executePair/execUpper/execLower
     // with the constant pair, folding the decode away; nodes call these with their stall.
     for (auto &[pc, used] : pcsUsed)
     {
         (void)used;
         out << "    __attribute__((flatten, noinline)) Vu1Native::StepResult S" << std::hex << pc << std::dec
-            << "(VU1Interpreter &vu, const Vu1Native::Frame &f, uint32_t stall)\n    {\n        return Vu1Native::step(vu, f, kP"
-            << std::hex << pc << std::dec << ", stall);\n    }\n";
+            << "(VU1Interpreter &vu, const Vu1Native::Frame &f, uint32_t stall)\n    {\n        return Vu1Native::step<"
+            << (flagsLive.count(pc) ? "true" : "false") << ">(vu, f, kP" << std::hex << pc << std::dec << ", stall);\n    }\n";
     }
     out << "}\n\n"
         << "extern \"C\" __attribute__((visibility(\"default\"))) int rt_vu1_native_execute(\n"
@@ -389,6 +453,9 @@ int main(int argc, char **argv)
     }
     out << "done:\n    Vu1Native::endRun(vu, f);\n    return Vu1Native::Handled;\n"
         << "deopt:\n    return Vu1Native::continueInInterpreter(vu, f, vuCode);\n}\n\n"
+        << "// Final MAC/status may differ from the interpreter where no instruction can read them.\n"
+        << "extern \"C\" __attribute__((visibility(\"default\"))) int rt_vu1_native_flags_exact()\n{\n    return "
+        << (flagsLive.size() == pcsUsed.size() ? 1 : 0) << ";\n}\n\n"
         << "extern \"C\" __attribute__((visibility(\"default\"))) uint64_t rt_vu1_native_image_hash()\n{\n    return "
         << hex(Vu1Native::imageHash(image.data(), kCodeSize)) << "ull;\n}\n";
     std::cerr << "wrote " << outPath << "\n";

@@ -118,6 +118,8 @@ struct Vu1Native
     };
 
     // One loop iteration of run(): stall `stall` cycles, then execute the pair.
+    // Flags = false when no MAC/status reader is reachable from this pair (see ps2_vu1_recomp).
+    template <bool Flags = true>
     __attribute__((always_inline)) static inline StepResult step(VU1Interpreter &vu, const Frame &f, const Pair &pair, uint32_t stall)
     {
         if (stall != 0u)
@@ -125,7 +127,7 @@ struct Vu1Native
         if (vu.m_cycle >= f.budgetEnd || vu.m_stopRequested)
             return Bail;
         bool ended;
-        [[clang::always_inline]] ended = vu.executePair<true>(pair, f.vuData, f.dataSize, *f.gs, f.memory, f.codeSize);
+        [[clang::always_inline]] ended = vu.template executePair<true, Flags>(pair, f.vuData, f.dataSize, *f.gs, f.memory, f.codeSize);
         if (vu.m_stopRequested)
             return Bail;
         return ended ? Ended : Continue;

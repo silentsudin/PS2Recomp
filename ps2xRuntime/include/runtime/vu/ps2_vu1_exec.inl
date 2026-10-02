@@ -40,6 +40,23 @@ static inline int16_t IMM15(uint32_t i)
 
 namespace ps2x_vu1_exec_detail
 {
+    // normalizeOperand on four lanes at once (same results): denormals -> signed zero,
+    // Inf/NaN -> signed max.
+    __attribute__((always_inline)) inline void normalizeOperand4(const float *src, float *dst)
+    {
+        typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+        typedef int32_t i32x4 __attribute__((ext_vector_type(4)));
+        u32x4 bits;
+        std::memcpy(&bits, src, sizeof(bits));
+        const u32x4 exponent = bits & 0x7F800000u;
+        const u32x4 sign = bits & 0x80000000u;
+        const u32x4 isZero = (u32x4)(i32x4)(exponent == 0u);
+        const u32x4 isSpecial = isZero | (u32x4)(i32x4)(exponent == 0x7F800000u);
+        const u32x4 special = (isZero & sign) | (~isZero & (sign | 0x7F7FFFFFu));
+        const u32x4 out = (isSpecial & special) | (~isSpecial & bits);
+        std::memcpy(dst, &out, sizeof(out));
+    }
+
     constexpr uint8_t laneForComponent(uint32_t component)
     {
         return static_cast<uint8_t>(1u << (3u - component));
@@ -204,20 +221,57 @@ inline __attribute__((always_inline)) void VU1Interpreter::applyDestAcc(const fl
     applyDest(m_state.acc, result, dest);
 }
 
+template <bool Flags>
 inline __attribute__((always_inline)) void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest, uint32_t upper)
 {
-    uint8_t laneFlags[4]{};
-    normalizeFmacResult(result, dest, laneFlags, upper);
-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest, upper));
+    if constexpr (Flags)
+    {
+        uint8_t laneFlags[4]{};
+        normalizeFmacResult(result, dest, laneFlags, upper);
+        updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest, upper));
+    }
+    else
+        normalizeFmacValue(result, dest, upper);
     applyDest(dst, result, dest);
 }
 
+template <bool Flags>
 inline __attribute__((always_inline)) void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest, uint32_t upper)
 {
-    uint8_t laneFlags[4]{};
-    normalizeFmacResult(result, dest, laneFlags, upper);
-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest, upper));
+    if constexpr (Flags)
+    {
+        uint8_t laneFlags[4]{};
+        normalizeFmacResult(result, dest, laneFlags, upper);
+        updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest, upper));
+    }
+    else
+        normalizeFmacValue(result, dest, upper);
     applyDestAcc(result, dest);
+}
+
+// Value-only variant of normalizeFmacResult for code whose flags are never observed. The host
+// result is the exact value rounded toward zero once, so a lane whose exponent is in 1..0xFD
+// needs no clamping; only zero/denormal and near-overflow lanes take the exact path.
+inline __attribute__((always_inline)) void VU1Interpreter::normalizeFmacValue(float *result, uint8_t dest, uint32_t upper)
+{
+    for (uint32_t component = 0; component < 4u; ++component)
+    {
+        if ((dest & laneForComponent(component)) == 0u)
+            continue;
+        uint32_t bits;
+        std::memcpy(&bits, &result[component], sizeof(bits));
+        const uint32_t exponent = (bits >> 23) & 0xFFu;
+        if (__builtin_expect(exponent != 0u && exponent < 0xFEu, 1))
+            continue;
+        long double exactResult = 0.0L;
+        if (calculateFmacExactResult(component, exactResult, upper))
+            (void)normalizeFmacExactResult(result[component], exactResult);
+        else
+        {
+            uint32_t flags = 0u;
+            result[component] = normalizeResult(result[component], flags);
+        }
+    }
 }
 
 inline __attribute__((always_inline)) float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
@@ -1050,6 +1104,7 @@ inline void VU1Interpreter::finishXgkick()
 // ============================================================================
 // Upper instructions (FMAC pipeline)
 // ============================================================================
+template <bool Flags>
 inline void VU1Interpreter::execUpper(uint32_t instr)
 {
     m_currentUpperInstruction = instr;
@@ -1063,12 +1118,9 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
     float normalizedVs[4];
     float normalizedVt[4];
     float normalizedAcc[4];
-    for (uint32_t component = 0; component < 4u; ++component)
-    {
-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
-    }
+    ps2x_vu1_exec_detail::normalizeOperand4(m_state.vf[fs], normalizedVs);
+    ps2x_vu1_exec_detail::normalizeOperand4(m_state.vf[ft], normalizedVt);
+    ps2x_vu1_exec_detail::normalizeOperand4(m_state.acc, normalizedAcc);
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
@@ -1087,7 +1139,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         float bc = broadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] + bc;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     }
     case 0x04:
@@ -1098,7 +1150,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         float bc = broadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] - bc;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     }
     case 0x08:
@@ -1109,7 +1161,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         float bc = broadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] + vs[c] * bc;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     }
     case 0x0C:
@@ -1120,7 +1172,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         float bc = broadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] - vs[c] * bc;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     }
     case 0x10:
@@ -1153,13 +1205,13 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         float bc = broadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * bc;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     }
     case 0x1C: // MULq
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * q;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x1D: // MAXi
         for (int c = 0; c < 4; c++)
@@ -1169,7 +1221,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
     case 0x1E: // MULi
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * i;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x1F: // MINIi
         for (int c = 0; c < 4; c++)
@@ -1179,57 +1231,57 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
     case 0x20: // ADDq
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] + q;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x21: // MADDq
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] + vs[c] * q;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x22: // ADDi
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] + i;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x23: // MADDi
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] + vs[c] * i;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x24: // SUBq
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] - q;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x25: // MSUBq
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] - vs[c] * q;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x26: // SUBi
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] - i;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x27: // MSUBi
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] - vs[c] * i;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x28: // ADD
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] + vt[c];
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x29: // MADD
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] + vs[c] * vt[c];
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x2A: // MUL
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * vt[c];
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x2B: // MAX
         for (int c = 0; c < 4; c++)
@@ -1239,19 +1291,19 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
     case 0x2C: // SUB
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] - vt[c];
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x2D: // MSUB
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] - vs[c] * vt[c];
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x2E: // OPMSUB
         result[0] = acc[0] - vs[1] * vt[2];
         result[1] = acc[1] - vs[2] * vt[0];
         result[2] = acc[2] - vs[0] * vt[1];
         result[3] = 0.0f;
-        applyFmacDest(vd, result, dest, instr);
+        applyFmacDest<Flags>(vd, result, dest, instr);
         return;
     case 0x2F: // MINI
         for (int c = 0; c < 4; c++)
@@ -1281,7 +1333,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
             float bc = broadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] + bc;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         }
         case 0x04:
@@ -1292,7 +1344,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
             float bc = broadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] - bc;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         }
         case 0x08:
@@ -1303,7 +1355,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
             float bc = broadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] + vs[c] * bc;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         }
         case 0x0C:
@@ -1314,7 +1366,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
             float bc = broadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] - vs[c] * bc;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         }
         case 0x10: // ITOF0
@@ -1393,13 +1445,13 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
             float bc = broadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * bc;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         }
         case 0x1C: // MULAq
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * q;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x1D: // ABS
             for (int c = 0; c < 4; c++)
@@ -1409,7 +1461,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         case 0x1E: // MULAi
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * i;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x1F: // CLIP
         {
@@ -1446,74 +1498,74 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         case 0x20: // ADDAq
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] + q;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x21: // MADDAq
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] + vs[c] * q;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x22: // ADDAi
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] + i;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x23: // MADDAi
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] + vs[c] * i;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x24: // SUBAq
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] - q;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x25: // MSUBAq
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] - vs[c] * q;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x26: // SUBAi
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] - i;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x27: // MSUBAi
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] - vs[c] * i;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x28: // ADDA
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] + vt[c];
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x29: // MADDA
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] + vs[c] * vt[c];
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x2A: // MULA
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * vt[c];
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x2C: // SUBA
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] - vt[c];
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x2D: // MSUBA
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] - vs[c] * vt[c];
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x2E: // OPMULA
             result[0] = vs[1] * vt[2];
             result[1] = vs[2] * vt[0];
             result[2] = vs[0] * vt[1];
             result[3] = 0.0f;
-            applyFmacDestAcc(result, dest, instr);
+            applyFmacDestAcc<Flags>(result, dest, instr);
             return;
         case 0x2F:
         case 0x30: // NOP
@@ -2297,7 +2349,7 @@ inline void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded
     }
 }
 
-template <bool Immediate>
+template <bool Immediate, bool Flags>
 inline bool VU1Interpreter::executePair(const DecodedInstructionPair &decoded, uint8_t *vuData, uint32_t dataSize,
                                         GS &gs, PS2Memory *memory, uint32_t codeSize)
 {
@@ -2342,7 +2394,7 @@ inline bool VU1Interpreter::executePair(const DecodedInstructionPair &decoded, u
 
     if (decoded.iBit)
     {
-        [[clang::always_inline]] execUpper(decoded.upper);
+        [[clang::always_inline]] execUpper<Flags>(decoded.upper);
         float immediate = 0.0f;
         std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
         m_state.i = normalizeOperand(immediate);
@@ -2354,7 +2406,7 @@ inline bool VU1Interpreter::executePair(const DecodedInstructionPair &decoded, u
         std::memcpy(oldVf,
                     m_state.vf[decoded.upperVfShadowReg],
                     sizeof(oldVf));
-        [[clang::always_inline]] execUpper(decoded.upper);
+        [[clang::always_inline]] execUpper<Flags>(decoded.upper);
         std::memcpy(upperVf,
                     m_state.vf[decoded.upperVfShadowReg],
                     sizeof(upperVf));
@@ -2368,7 +2420,7 @@ inline bool VU1Interpreter::executePair(const DecodedInstructionPair &decoded, u
     }
     else
     {
-        [[clang::always_inline]] execUpper(decoded.upper);
+        [[clang::always_inline]] execUpper<Flags>(decoded.upper);
         [[clang::always_inline]] execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
     }
 

@@ -637,7 +637,7 @@ install(DIRECTORY include/
 # Offline checker for VU1 implementations against RT_VU1_CAPTURE recordings.
 add_executable(vu1_replay EXCLUDE_FROM_ALL tools/vu1_replay/vu1_replay.cpp)
 target_link_libraries(vu1_replay PRIVATE ps2_runtime)
-target_link_options(vu1_replay PRIVATE "LINKER:-U,_rt_vu1_native_execute") # weak, optional
+target_link_options(vu1_replay PRIVATE "LINKER:-U,_rt_vu1_native_execute" "LINKER:-U,_rt_vu1_native_flags_exact") # weak, optional
 
 # Same checker with a recompiled VU1 module linked in: -DPS2X_VU1_NATIVE_SOURCE=/path/vu1_native.cpp
 set(PS2X_VU1_NATIVE_SOURCE "" CACHE FILEPATH "Generated VU1 C++ for vu1_replay_native")

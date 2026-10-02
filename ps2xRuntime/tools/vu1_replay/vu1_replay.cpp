@@ -23,6 +23,8 @@
 extern "C" int rt_vu1_native_execute(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
                                      GS &gs, PS2Memory *memory, uint32_t startPC, uint32_t top, uint32_t itop,
                                      uint32_t maxCycles) __attribute__((weak));
+// 0 when the module skips MAC/status flags nothing can read; those final values aren't compared.
+extern "C" int rt_vu1_native_flags_exact() __attribute__((weak));
 
 namespace
 {
@@ -59,6 +61,8 @@ namespace
     bool sameBits(const void *a, const void *b, size_t n) { return std::memcmp(a, b, n) == 0; }
 
     // Field-wise compare (the raw struct has padding and an absolute cycle counter).
+    bool g_compareFlags = true;
+
     std::string diffState(const VU1State &want, const VU1State &got)
     {
         std::string out;
@@ -78,9 +82,9 @@ namespace
         if (!sameBits(&want.i, &got.i, 4)) note("i");
         if (want.r != got.r) note("r");
         if (want.pc != got.pc) note("pc");
-        if (want.mac != got.mac) note("mac");
+        if (g_compareFlags && want.mac != got.mac) note("mac");
         if (want.clip != got.clip) note("clip");
-        if (want.status != got.status) note("status");
+        if (g_compareFlags && want.status != got.status) note("status");
         if (want.stoppedByD != got.stoppedByD || want.stoppedByT != got.stoppedByT) note("stop");
         return out;
     }
@@ -109,6 +113,9 @@ int main(int argc, char **argv)
     std::vector<uint8_t> code(r.u32());
     r.read(code.data(), code.size());
 
+    g_compareFlags = !(rt_vu1_native_flags_exact && rt_vu1_native_flags_exact() == 0);
+    if (!g_compareFlags)
+        std::cout << "(final MAC/status not compared: module skips unobservable flags)\n";
     GS gs; // never touched: XGKICK packets go to the sink
     VU1Interpreter vu;
     uint32_t total = 0, failed = 0, skipped = 0, handled = 0, deopts = 0;

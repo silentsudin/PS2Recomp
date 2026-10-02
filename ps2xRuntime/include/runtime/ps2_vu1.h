@@ -290,13 +290,17 @@ private:
     DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
 
+    template <bool Flags = true>
     void execUpper(uint32_t instr);
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
 
     void applyDest(float *dst, const float *result, uint8_t dest);
     void applyDestAcc(const float *result, uint8_t dest);
+    template <bool Flags = true>
     void applyFmacDest(float *dst, float *result, uint8_t dest, uint32_t upper);
+    template <bool Flags = true>
     void applyFmacDestAcc(float *result, uint8_t dest, uint32_t upper);
+    void normalizeFmacValue(float *result, uint8_t dest, uint32_t upper);
     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4], uint32_t upper);
     bool calculateFmacExactResult(uint32_t component, long double &result, uint32_t upper) const;
     uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
@@ -322,7 +326,8 @@ private:
     void applyStore(uint32_t address, const uint32_t words[4], uint8_t laneMask);
     uint64_t cyclesUntilXgkickEvent() const;
     void finishXgkick();
-    template <bool Immediate = false>
+    // Flags = false (recompiled code where no flag reader is reachable): skip MAC/status work.
+    template <bool Immediate = false, bool Flags = true>
     bool executePair(const DecodedInstructionPair &decoded, uint8_t *vuData, uint32_t dataSize,
                      GS &gs, PS2Memory *memory, uint32_t codeSize);
     friend struct Vu1Native; // recompiled microcode + recompiler tooling (runtime/vu/ps2_vu1_native.h)
