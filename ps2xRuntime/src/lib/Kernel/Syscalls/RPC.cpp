@@ -20,6 +20,30 @@ namespace ps2_syscalls
         {
             event.seq = ++g_sif_rpc_debug_next_seq;
             g_sif_rpc_debug_history[event.seq % kSifRpcDebugHistoryCount] = event;
+
+            // RT_RPC_TRACE=1: also print every event (diagnostics).
+            static const bool trace = [] { const char *e = std::getenv("RT_RPC_TRACE"); return e && *e == '1'; }();
+            if (trace)
+            {
+                auto hex = [](const uint8_t *b, uint32_t n)
+                {
+                    std::string out;
+                    char item[4];
+                    for (uint32_t i = 0; i < n; ++i)
+                    {
+                        std::snprintf(item, sizeof(item), "%02X", b[i]);
+                        out += item;
+                        if ((i & 3u) == 3u && i + 1u < n)
+                            out += ' ';
+                    }
+                    return out;
+                };
+                std::fprintf(stderr, "[rpc] %s sid=0x%x fn=%u pc=0x%x ra=0x%x send=%u recv=%u mode=%u flags=0x%x res=%d send[%s] recv[%s]\n",
+                             event.op ? event.op : "", event.sid, event.rpcNum, event.pc, event.ra, event.sendSize,
+                             event.recvSize, event.mode, event.flags, event.result,
+                             hex(event.sendPreview, event.sendPreviewSize).c_str(),
+                             hex(event.recvPreview, event.recvPreviewSize).c_str());
+            }
         }
 
         void pushSifRpcDebugEvent(SifRpcDebugEvent event)

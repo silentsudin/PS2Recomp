@@ -1,7 +1,10 @@
 #ifndef PS2_RUNTIME_H
 #define PS2_RUNTIME_H
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -250,13 +253,33 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
+#ifdef PS2X_WRITE_WATCH
+    // Debug builds of the game (-DPS2X_WRITE_WATCH): RT_WRITE_WATCH=<hexaddr>:<hexlen> logs the
+    // first 200 guest writes that touch that range, with the writing PC and return address.
+    static const auto range = []
+    {
+        uint32_t base = 0, len = 0;
+        if (const char *env = std::getenv("RT_WRITE_WATCH"))
+            std::sscanf(env, "%x:%x", &base, &len);
+        return std::pair<uint32_t, uint32_t>(base & 0x1FFFFFFFu, len);
+    }();
+    static int logged = 0;
+    const uint32_t a = guestAddr & 0x1FFFFFFFu;
+    if (range.second != 0u && a < range.first + range.second && a + size > range.first && logged < 200)
+    {
+        ++logged;
+        std::fprintf(stderr, "[watch] %s addr=0x%x pc=0x%x ra=0x%x value=%016llx%016llx\n", op, guestAddr,
+                     ctx ? ctx->pc : 0u, ctx ? static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])) : 0u,
+                     static_cast<unsigned long long>(valueHi), static_cast<unsigned long long>(valueLo));
+    }
+#else
     (void)guestAddr;
     (void)size;
     (void)valueLo;
     (void)valueHi;
     (void)op;
     (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+#endif
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
