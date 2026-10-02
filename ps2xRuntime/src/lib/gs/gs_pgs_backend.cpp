@@ -170,39 +170,54 @@ namespace ps2x::gs
 
             PresentationFrame Present(const GSPresentationRequest &request) override
             {
-                std::lock_guard<std::mutex> lock(m_mutex);
+                // Record and submit under the lock, but wait for the GPU outside it: the game
+                // thread keeps streaming GIF packets while this frame finishes rendering.
+                Vulkan::Fence fence;
+                uint32_t w = 0, h = 0;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
 
-                auto &priv = m_iface.get_priv_register_state();
-                setPrivReg(priv.pmode, request.pmode);
-                setPrivReg(priv.smode2, request.smode2);
-                setPrivReg(priv.dispfb1, request.dispfb1);
-                setPrivReg(priv.display1, displayToHardware(request.display1, request.smode2));
-                setPrivReg(priv.dispfb2, request.dispfb2);
-                setPrivReg(priv.display2, displayToHardware(request.display2, request.smode2));
-                setPrivReg(priv.bgcolor, request.bgcolor);
-                priv.smode1.CMOD = 2; // NTSC
-                priv.smode1.LC = 32;
+                    auto &priv = m_iface.get_priv_register_state();
+                    setPrivReg(priv.pmode, request.pmode);
+                    setPrivReg(priv.smode2, request.smode2);
+                    setPrivReg(priv.dispfb1, request.dispfb1);
+                    setPrivReg(priv.display1, displayToHardware(request.display1, request.smode2));
+                    setPrivReg(priv.dispfb2, request.dispfb2);
+                    setPrivReg(priv.display2, displayToHardware(request.display2, request.smode2));
+                    setPrivReg(priv.bgcolor, request.bgcolor);
+                    priv.smode1.CMOD = 2; // NTSC
+                    priv.smode1.LC = 32;
 
-                ParallelGS::VSyncInfo vsync = {};
-                vsync.phase = static_cast<uint32_t>(request.vsyncTick & 1u);
-                vsync.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                vsync.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
-                vsync.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
-                vsync.adapt_to_internal_horizontal_resolution = true;
-                // Road Trip renders 640x224 fields (INT=1, FFMD=1); paraLLEl-GS's default
-                // deinterlacer reconstructs the 448-line picture from them.
+                    ParallelGS::VSyncInfo vsync = {};
+                    vsync.phase = static_cast<uint32_t>(request.vsyncTick & 1u);
+                    vsync.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    vsync.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
+                    vsync.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
+                    vsync.adapt_to_internal_horizontal_resolution = true;
+                    // Road Trip renders 640x224 fields (INT=1, FFMD=1); paraLLEl-GS's default
+                    // deinterlacer reconstructs the 448-line picture from them.
 
-                m_iface.flush();
-                ParallelGS::ScanoutResult scanout = m_iface.vsync(vsync);
+                    m_iface.flush();
+                    ParallelGS::ScanoutResult scanout = m_iface.vsync(vsync);
+                    if (scanout.image)
+                    {
+                        w = scanout.image->get_width();
+                        h = scanout.image->get_height();
+                        fence = submitReadbackLocked(*scanout.image);
+                    }
+                    m_device.next_frame_context();
+                }
+
                 PresentationFrame frame{};
-                if (scanout.image)
-                    frame = readbackLocked(*scanout.image);
-                m_device.next_frame_context();
-                return frame;
+                if (!fence)
+                    return frame;
+                fence->wait();
+                std::lock_guard<std::mutex> lock(m_mutex);
+                return copyReadbackLocked(w, h);
             }
 
         private:
-            PresentationFrame readbackLocked(const Vulkan::Image &image)
+            Vulkan::Fence submitReadbackLocked(const Vulkan::Image &image)
             {
                 const uint32_t w = image.get_width();
                 const uint32_t h = image.get_height();
@@ -221,8 +236,11 @@ namespace ps2x::gs
                              VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
                 Vulkan::Fence fence;
                 m_device.submit(cmd, &fence);
-                fence->wait();
+                return fence;
+            }
 
+            PresentationFrame copyReadbackLocked(uint32_t w, uint32_t h)
+            {
                 const auto *src = static_cast<const uint8_t *>(
                     m_device.map_host_buffer(*m_readback, Vulkan::MEMORY_ACCESS_READ_BIT));
 

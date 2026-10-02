@@ -295,12 +295,12 @@ private:
 
     void applyDest(float *dst, const float *result, uint8_t dest);
     void applyDestAcc(const float *result, uint8_t dest);
-    void applyFmacDest(float *dst, float *result, uint8_t dest);
-    void applyFmacDestAcc(float *result, uint8_t dest);
-    void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
-    bool calculateFmacExactResult(uint32_t component, long double &result) const;
+    void applyFmacDest(float *dst, float *result, uint8_t dest, uint32_t upper);
+    void applyFmacDestAcc(float *result, uint8_t dest, uint32_t upper);
+    void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4], uint32_t upper);
+    bool calculateFmacExactResult(uint32_t component, long double &result, uint32_t upper) const;
     uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
-    uint32_t calculateFmacProductSticky(uint8_t dest) const;
+    uint32_t calculateFmacProductSticky(uint8_t dest, uint32_t upper) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);
