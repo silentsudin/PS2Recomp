@@ -2,8 +2,8 @@
 
 // Register-level SPU2 (the PS2's sound processor) for the IOP emulator: two cores with 24 ADPCM
 // voices each, 2 MiB of sound RAM, PIO and DMA transfers (IOP DMA channels 4 and 7), AutoDMA
-// streaming input, the IRQA interrupt (IOP IRQ 9), and 48 kHz stereo output. Reverb, noise and
-// pitch modulation are not emulated yet.
+// streaming input, the IRQA interrupt (IOP IRQ 9), MMIX dry/wet routing, the reverb (effect) unit,
+// and 48 kHz stereo output. Noise and pitch modulation are not emulated yet.
 
 #include <cstddef>
 #include <cstdint>
@@ -72,6 +72,11 @@ namespace ps2x::iop::detail
             uint16_t mvolL = 0, mvolR = 0, avolL = 0, avolR = 0, bvolL = 0, bvolR = 0;
             std::deque<int16_t> admaL, admaR;
             bool irqFired = false;
+            // Reverb: runs at 24 kHz on the wet bus, in sound RAM between ESA and EEA.
+            uint32_t reverbX = 0;      // position in the effect area
+            bool reverbPhase = false;  // second 48 kHz sample of the pair
+            int32_t wetInL = 0, wetInR = 0;
+            int32_t revPrevL = 0, revPrevR = 0, revCurL = 0, revCurR = 0;
         };
 
         static int32_t fixedVolume(uint16_t reg);
@@ -83,6 +88,10 @@ namespace ps2x::iop::detail
         void stepEnvelope(Voice &voice);
         void checkIrq(int coreIndex, uint32_t address, uint32_t halfwords);
         void mixOneSample(int16_t &outL, int16_t &outR);
+        // Mixes one core: dry and wet sends gated by MMIX, plus the reverb return (EVOL).
+        void mixCore(int c, int32_t voiceDry[2], int32_t voiceWet[2], int32_t input[2], int32_t ext[2], int32_t out[2]);
+        void reverb(int c, int32_t wetL, int32_t wetR, int32_t &outL, int32_t &outR);
+        void reverbStep(int c, int32_t inL, int32_t inR, int32_t &outL, int32_t &outR);
 
         std::vector<uint16_t> m_ram;
         uint16_t m_regs[0x400]{};
