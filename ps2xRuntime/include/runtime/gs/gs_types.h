@@ -295,6 +295,7 @@ struct PresentationFrame
     std::vector<uint8_t> pixels;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t stride = 0; // pixels per row of `pixels`; 0 = the legacy 640-pixel host frame
     uint32_t displayFbp = 0;
     uint32_t sourceFbp = 0;
     bool usedPreferred = false;

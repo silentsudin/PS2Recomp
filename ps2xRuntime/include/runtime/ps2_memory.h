@@ -371,6 +371,11 @@ public:
     void stopGifVif1Worker();
     void syncGifVif1();
     [[nodiscard]] bool gifVif1WorkerActive() const { return m_gifVif1Worker.joinable(); }
+    // Called with the nanoseconds syncGifVif1() blocked. On hardware the EE keeps running (usually
+    // polling) while the VIF1/VU1/GS side works, so the runtime counts that time as EE cycles;
+    // otherwise vblanks, timers and the IOP would fall behind whenever the EE waits.
+    using BlockedTimeFn = std::function<void(uint64_t nanos)>;
+    void setGifVif1BlockedTimeFn(BlockedTimeFn fn) { m_gifVif1BlockedFn = std::move(fn); }
     // Times syncGifVif1() had to wait (diagnostics).
     [[nodiscard]] uint64_t gifVif1Stalls() const { return m_gifVif1Stalls.load(std::memory_order_relaxed); }
     // Nanoseconds the worker / GS thread spent working (diagnostics: headroom at a capped frame rate).
@@ -471,6 +476,7 @@ public:
     std::atomic<uint64_t> m_gifVif1Completed{0};
     std::atomic<uint64_t> m_gifVif1Stalls{0};
     std::atomic<uint64_t> m_gifVif1BusyNs{0};
+    BlockedTimeFn m_gifVif1BlockedFn;
     std::atomic<uint64_t> m_gsBusyNs{0};
     bool m_gifVif1Stop = false;
     void gifVif1WorkerLoop();

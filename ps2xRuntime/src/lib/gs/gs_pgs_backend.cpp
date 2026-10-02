@@ -18,8 +18,9 @@ namespace ps2x::gs
 {
     namespace
     {
-        constexpr uint32_t kHostFrameWidth = 640u;  // matches GS::copyLatchedHostPresentationFrame
-        constexpr uint32_t kHostFrameHeight = 512u;
+        // Largest picture handed to the host; bigger scanouts (high SSAA rates) are box-filtered down.
+        constexpr uint32_t kMaxHostFrameWidth = 2048u;
+        constexpr uint32_t kMaxHostFrameHeight = 2048u;
         constexpr uint32_t kTrxDirLocalToHost = 1u;
 
         // The runtime's libgraph stubs express DISPLAY.DH as the frame-buffer height (what the
@@ -278,18 +279,19 @@ namespace ps2x::gs
                 const auto *src = static_cast<const uint8_t *>(
                     m_device.map_host_buffer(*m_readback, Vulkan::MEMORY_ACCESS_READ_BIT));
 
-                // A high-resolution scanout can exceed the host frame; box-filter it down by an
-                // integer factor per axis.
-                const uint32_t fx = (w + kHostFrameWidth - 1u) / kHostFrameWidth;
-                const uint32_t fy = (h + kHostFrameHeight - 1u) / kHostFrameHeight;
+                // The picture goes to the host at its native size (the high-resolution scanout is
+                // 1280x896 at 4x SSAA); only very large ones are box-filtered down.
+                const uint32_t fx = (w + kMaxHostFrameWidth - 1u) / kMaxHostFrameWidth;
+                const uint32_t fy = (h + kMaxHostFrameHeight - 1u) / kMaxHostFrameHeight;
                 PresentationFrame frame{};
-                frame.width = std::min(w / fx, kHostFrameWidth);
-                frame.height = std::min(h / fy, kHostFrameHeight);
-                frame.pixels.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
+                frame.width = w / fx;
+                frame.height = h / fy;
+                frame.stride = frame.width;
+                frame.pixels.resize(static_cast<size_t>(frame.width) * frame.height * 4u);
                 const uint32_t area = fx * fy;
                 for (uint32_t y = 0; y < frame.height; ++y)
                 {
-                    uint8_t *dst = frame.pixels.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u;
+                    uint8_t *dst = frame.pixels.data() + static_cast<size_t>(y) * frame.width * 4u;
                     if (area == 1u)
                     {
                         std::memcpy(dst, src + static_cast<size_t>(y) * w * 4u, static_cast<size_t>(frame.width) * 4u);

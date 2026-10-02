@@ -389,6 +389,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    // The texture starts at 640x512 and grows to fit larger pictures (e.g. the GPU GS's
+    // high-resolution progressive scanout).
+    static int s_texWidth = FB_WIDTH;
+    static int s_texHeight = FB_HEIGHT;
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
@@ -418,7 +422,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(s_texWidth, s_texHeight, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
@@ -454,13 +458,25 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
+    if (static_cast<int>(width) > s_texWidth || static_cast<int>(height) > s_texHeight)
+    {
+        s_texWidth = std::max<int>(s_texWidth, static_cast<int>(width));
+        s_texHeight = std::max<int>(s_texHeight, static_cast<int>(height));
+        UnloadTexture(tex);
+        Image blank = GenImageColor(s_texWidth, s_texHeight, BLANK);
+        tex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+        s_uploadBuffer.assign(static_cast<size_t>(s_texWidth) * s_texHeight * 4u, 0u);
+    }
+
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+        const uint32_t copyWidth = std::min<uint32_t>(width, s_texWidth);
+        const uint32_t copyHeight = std::min<uint32_t>(height, s_texHeight);
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const size_t dstRowBytes = static_cast<size_t>(s_texWidth) * 4u;
         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
         for (uint32_t y = 0; y < copyHeight; ++y)
         {
@@ -787,7 +803,22 @@ bool PS2Runtime::syncCoreSubsystems()
 
     // RT_GIF_THREAD=0 keeps GIF/VIF1/VU1 processing on the EE thread.
     if (const char *e = std::getenv("RT_GIF_THREAD"); !(e && *e == '0'))
+    {
+        m_memory.setGifVif1BlockedTimeFn([this](uint64_t nanos)
+                                         {
+                                             if (!m_eeScheduler || !m_eeScheduler->onExecutorThread())
+                                                 return;
+                                             // 294.912 MHz EE clock.
+                                             uint64_t cycles = nanos * 294912u / 1000000u;
+                                             while (cycles > 0u)
+                                             {
+                                                 const uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(cycles, 1u << 30));
+                                                 m_eeScheduler->accountCycles(chunk);
+                                                 cycles -= chunk;
+                                             }
+                                         });
         m_memory.startGifVif1Worker();
+    }
 
     m_boundRdram = rdram;
     m_boundGSVram = gsVram;
@@ -2466,6 +2497,7 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    SetTextureFilter(frameTex, TEXTURE_FILTER_BILINEAR);
 
     std::atomic<bool> gameThreadFinished{false};
 

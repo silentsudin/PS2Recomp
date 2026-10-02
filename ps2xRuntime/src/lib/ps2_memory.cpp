@@ -2076,6 +2076,19 @@ void PS2Memory::syncGifVif1()
     if (m_gifVif1Completed.load(std::memory_order_acquire) >= target)
         return;
     m_gifVif1Stalls.fetch_add(1, std::memory_order_relaxed);
+    const auto waitStart = std::chrono::steady_clock::now();
+    struct ReportBlocked
+    {
+        PS2Memory &memory;
+        std::chrono::steady_clock::time_point start;
+        ~ReportBlocked()
+        {
+            if (memory.m_gifVif1BlockedFn)
+                memory.m_gifVif1BlockedFn(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                    std::chrono::steady_clock::now() - start)
+                                                                    .count()));
+        }
+    } reportBlocked{*this, waitStart};
     std::unique_lock<std::mutex> lock(m_gifVif1Mutex);
     m_gifVif1IdleCv.wait(lock, [&]
                          { return m_gifVif1Completed.load(std::memory_order_acquire) >= target; });
