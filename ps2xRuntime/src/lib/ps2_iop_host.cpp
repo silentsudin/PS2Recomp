@@ -1,5 +1,6 @@
 #include "ps2_iop_host.h"
 #include "ps2_audio_out.h"
+#include "Kernel/Stubs/CD.h"
 
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
@@ -535,4 +536,9 @@ void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
 void PS2IopHostAdapter::submitAudio(const int16_t *interleavedStereo, size_t frames)
 {
     ps2AudioOutSubmit(interleavedStereo, frames);
+}
+
+bool PS2IopHostAdapter::readCdSectors(uint32_t lbn, uint32_t sectors, void *destination)
+{
+    return ps2_stubs::readCdSectorsForHost(lbn, sectors, static_cast<uint8_t *>(destination));
 }

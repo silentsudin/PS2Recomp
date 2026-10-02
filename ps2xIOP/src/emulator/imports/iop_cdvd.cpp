@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include "iop_cdvd.h"
 
 #include "../core/iop_cpu.h"
@@ -228,7 +230,12 @@ namespace ps2x::iop::detail
                 return true;
 
             case 6: // sceCdRead
-                if (readSectors(a0, a1, a2))
+            {
+                const bool ok = readSectors(a0, a1, a2);
+                static const bool trace = [] { const char *e = std::getenv("RT_SPU2_TRACE"); return e && *e == '2'; }();
+                if (trace)
+                    std::fprintf(stderr, "[iop-cd] read lsn=0x%x sectors=%u dst=0x%x ok=%d\n", a0, a1, a2, ok ? 1 : 0);
+                if (ok)
                 {
                     signalCommandComplete();
                     if (callback.address != 0u)
@@ -244,6 +251,7 @@ namespace ps2x::iop::detail
                 else
                     cpu.gpr[2] = 0u;
                 return true;
+            }
 
             case 7: // sceCdSeek
                 currentLsn = a0;
@@ -667,8 +675,8 @@ namespace ps2x::iop::detail
             const size_t byteCount = static_cast<size_t>(byteCount64);
             std::vector<uint8_t> bytes(byteCount, 0u);
 
-            bool read = false;
-            const std::string imagePath = host.hostPath(HostPathKind::CdImage);
+            bool read = host.readCdSectors(lsn, sectors, bytes.data());
+            const std::string imagePath = read ? std::string() : host.hostPath(HostPathKind::CdImage);
             if (!imagePath.empty())
             {
                 if (imageHandle == 0u)

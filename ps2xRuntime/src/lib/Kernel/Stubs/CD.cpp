@@ -341,6 +341,11 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    bool readCdSectorsForHost(uint32_t lbn, uint32_t sectors, uint8_t *dst)
+    {
+        return readCdSectors(lbn, sectors, dst, static_cast<size_t>(sectors) * kCdSectorSize);
+    }
+
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0); // 0 = completed/not busy

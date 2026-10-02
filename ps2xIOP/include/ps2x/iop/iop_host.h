@@ -90,6 +90,16 @@ namespace ps2x::iop
             normalized = 0u;
             return false;
         }
+        // Reads 2048-byte disc sectors by LBN the same way the EE side does (original disc LBNs).
+        // Returns false if the host has no such reader; the IOP then uses its own image access.
+        virtual bool readCdSectors(uint32_t lbn, uint32_t sectors, void *destination)
+        {
+            (void)lbn;
+            (void)sectors;
+            (void)destination;
+            return false;
+        }
+
         // 48 kHz interleaved stereo produced by the emulated SPU2 (called on the IOP/EE thread).
         virtual void submitAudio(const int16_t *interleavedStereo, size_t frames)
         {

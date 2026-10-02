@@ -9,6 +9,9 @@
 
 namespace ps2_stubs
 {
+    // The same disc reader sceCdRead uses (files registered at their original LBNs), for the IOP.
+    bool readCdSectorsForHost(uint32_t lbn, uint32_t sectors, uint8_t *dst);
+
 
     struct CdDebugFileEntry
     {

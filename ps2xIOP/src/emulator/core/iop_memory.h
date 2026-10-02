@@ -78,6 +78,8 @@ namespace ps2x::iop::detail
 
         // SPU2 registers (0x1F900000..) and SPU DMA channels 4/7 go to this device when set.
         void attachSpu2(Spu2 *spu2) noexcept { m_spu2 = spu2; }
+        // End of the loaded modules: RAM from here up to HeapBase is used when the heap is full.
+        void setLowArenaBase(uint32_t address) noexcept { m_lowArenaBase = (address + 0xFFFu) & ~0xFFFu; }
 
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
@@ -95,5 +97,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
         Spu2 *m_spu2 = nullptr;
+        uint32_t m_lowArenaBase = 0;
     };
 }

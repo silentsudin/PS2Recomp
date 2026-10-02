@@ -36,6 +36,7 @@ namespace ps2x::iop::detail
         m_hardware.clear();
         m_allocations.clear();
         m_heapCursor = HeapBase;
+        m_lowArenaBase = 0;
         m_interruptStatus = 0;
         m_interruptMask = 0;
         m_interruptControl = 1;
@@ -351,23 +352,34 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
-        for (;;)
+        // First fit from the bottom of the heap, so freed blocks are reused; if the heap proper is
+        // full, use the free RAM between the loaded modules and HeapBase (on a real IOP the heap is
+        // everything above the modules).
+        auto findFree = [&](uint32_t begin, uint32_t end) -> uint32_t
         {
-            bool overlap = false;
-            for (const auto &block : m_allocations)
+            uint32_t candidate = alignUp(begin, alignment);
+            for (;;)
             {
-                if (candidate < block.address + block.size && block.address < candidate + size)
+                if (candidate > end || size > end - candidate)
+                    return 0u;
+                bool overlap = false;
+                for (const auto &block : m_allocations)
                 {
-                    candidate = alignUp(block.address + block.size, alignment);
-                    overlap = true;
-                    break;
+                    if (candidate < block.address + block.size && block.address < candidate + size)
+                    {
+                        candidate = alignUp(block.address + block.size, alignment);
+                        overlap = true;
+                        break;
+                    }
                 }
+                if (!overlap)
+                    return candidate;
             }
-            if (!overlap)
-                break;
-        }
-        if (candidate > HeapLimit || size > HeapLimit - candidate)
+        };
+        uint32_t candidate = findFree(HeapBase, HeapLimit);
+        if (candidate == 0u && m_lowArenaBase != 0u && m_lowArenaBase < HeapBase)
+            candidate = findFree(m_lowArenaBase, HeapBase);
+        if (candidate == 0u)
             return 0u;
         m_allocations.push_back({candidate, size});
         markOwned(candidate, size);

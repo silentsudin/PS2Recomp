@@ -39,6 +39,7 @@ public:
     };
 
     void submitAudio(const int16_t *interleavedStereo, size_t frames) override;
+    bool readCdSectors(uint32_t lbn, uint32_t sectors, void *destination) override;
     explicit PS2IopHostAdapter(PS2Runtime &runtime);
     ~PS2IopHostAdapter() override;
 

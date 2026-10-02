@@ -41,9 +41,9 @@ namespace
 
 void ps2AudioOutStart()
 {
-    // Off by default while the SPU2 emulation is incomplete (RT_AUDIO=1 turns it on).
+    // RT_AUDIO=0 turns sound off.
     const char *enabled = std::getenv("RT_AUDIO");
-    if (!(enabled && *enabled == '1'))
+    if (enabled && *enabled == '0')
         return;
     if (g_started.exchange(true) || !IsAudioDeviceReady())
         return;

@@ -650,6 +650,7 @@ namespace ps2x::iop::detail
             ModuleLoadResult result{true, -1, -1};
             const IopImageLoadResult loaded = IopModuleLoader::load(image, memory, moduleCursor);
             moduleCursor = loaded.nextModuleCursor;
+            memory.setLowArenaBase(moduleCursor + 0x1000u);
             if (!loaded)
             {
                 if (loaded.error == IopImageLoadError::InvalidElf)
