@@ -397,6 +397,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool capture = ps2_test::frameCaptureRequested();
+    // Headless test runs only need pictures that a test asks for; latching every frame would read
+    // back each one from the GPU and hold up the GS thread.
+    static const bool headless = [] { const char *e = std::getenv("RT_HEADLESS"); return e && *e == '1'; }();
+    if (headless && !capture)
+    {
+        outWidth = s_lastWidth ? s_lastWidth : FB_WIDTH;
+        outHeight = s_lastHeight ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        return;
+    }
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick || capture;
     if (needsLatch)
     {

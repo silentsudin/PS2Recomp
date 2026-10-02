@@ -15,6 +15,7 @@
 #include <thread>
 
 #include "gs/ps2_gif_arbiter.h"
+#include "gs/gs_display_phase.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(USE_SSE2NEON)
@@ -286,13 +287,14 @@ public:
     // Vblanks at which DISPFB1 showed a different buffer than at the previous one: the frames the
     // game actually presented (at most one per vblank).
     uint64_t displayFlips() const { return m_displayFlips.load(std::memory_order_relaxed); }
-    void sampleDisplayAtVblank()
+    void sampleDisplayAtVblank(uint64_t vblank)
     {
         const uint64_t dispfb = gs_regs.dispfb1;
         if (dispfb != m_lastVblankDispfb)
         {
             m_lastVblankDispfb = dispfb;
             m_displayFlips.fetch_add(1, std::memory_order_relaxed);
+            ps2x::gs::g_displayFieldPhase.store(static_cast<uint32_t>((vblank & 1u) ^ 1u), std::memory_order_relaxed);
         }
     }
     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
