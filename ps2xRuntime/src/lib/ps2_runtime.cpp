@@ -689,6 +689,10 @@ bool PS2Runtime::syncCoreSubsystems()
                                                              m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                              [this](const uint8_t *p, uint32_t n)
                                                              { m_memory.submitGifPacket(GifPathId::Path1, p, n); });
+                                     // RT_VU1_STATS=1: runs, VU cycles and host time per second (diagnostics).
+                                     static const bool vu1Stats = [] { const char *e = std::getenv("RT_VU1_STATS"); return e && *e == '1'; }();
+                                     const auto statsStart = vu1Stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                                     const uint64_t statsCycles = m_vu1.state().cycles;
                                      bool ranNative = false;
                                      if (m_vu1Native && !capturing)
                                      {
@@ -710,6 +714,25 @@ bool PS2Runtime::syncCoreSubsystems()
                                                        m_gs, &m_memory, startPC, top, itop, 65536);
                                      if (capturing)
                                          m_vu1Capture->end(m_vu1, m_memory.getVU1Data(), PS2_VU1_DATA_SIZE);
+                                     if (vu1Stats)
+                                     {
+                                         static uint64_t runs = 0, cycles = 0, nanos = 0, nativeRuns = 0;
+                                         static auto window = std::chrono::steady_clock::now();
+                                         const auto now = std::chrono::steady_clock::now();
+                                         ++runs;
+                                         nativeRuns += ranNative ? 1u : 0u;
+                                         cycles += m_vu1.state().cycles - statsCycles;
+                                         nanos += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - statsStart).count());
+                                         const double secs = std::chrono::duration<double>(now - window).count();
+                                         if (secs >= 2.0)
+                                         {
+                                             std::fprintf(stderr, "[vu1-stats] %.0f runs/s (%.0f%% native), %.1f M VU cycles/s, %.1f ms/s host, %.0f cycles/run\n",
+                                                          runs / secs, runs ? 100.0 * nativeRuns / runs : 0.0, cycles / secs / 1e6,
+                                                          nanos / secs / 1e6, runs ? double(cycles) / runs : 0.0);
+                                             runs = cycles = nanos = nativeRuns = 0;
+                                             window = now;
+                                         }
+                                     }
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |

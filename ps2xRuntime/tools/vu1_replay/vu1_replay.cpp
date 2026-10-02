@@ -118,6 +118,7 @@ int main(int argc, char **argv)
         if (std::string(argv[a]) == "--bench" && a + 1 < argc)
             bench = std::atoi(argv[a + 1]);
     double benchSeconds = 0.0;
+    uint64_t vuCycles = 0;
 
     while (!r.atEnd() && r.ok)
     {
@@ -188,6 +189,7 @@ int main(int argc, char **argv)
             vu.execute(code.data(), static_cast<uint32_t>(code.size()), data.data(), static_cast<uint32_t>(data.size()),
                        gs, nullptr, rec.startPC, rec.top, rec.itop, 65536);
 
+        vuCycles += vu.state().cycles; // reset() zeroed the cycle counter
         std::string problems = diffState(rec.out, vu.state());
         if (data != rec.dataOut)
         {
@@ -244,6 +246,7 @@ int main(int argc, char **argv)
     std::cout << "\n";
     for (auto &[why, n] : deoptWhy)
         std::cout << "  deopt reason " << why.first << " at pc 0x" << std::hex << why.second << std::dec << ": " << n << "\n";
+    std::cout << "average " << (vuCycles / std::max<uint32_t>(1u, total - skipped)) << " VU cycles per run\n";
     if (bench > 0)
         std::cout << "bench: " << (benchSeconds * 1e6 / (double(total - skipped) * bench)) << " us per run\n";
     return failed == 0 && r.ok ? 0 : 1;
