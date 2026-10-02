@@ -139,6 +139,7 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            pendingIopCycles = 0;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -763,6 +764,20 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        // IOP cycles owed but not yet run. The EE reports time in small chunks (each block of
+        // recompiled code); running the IOP for every chunk made its per-call servicing (SPU2,
+        // DMA, timers, thread scan) the main cost of the whole emulation. Cycles are batched and
+        // flushed before anything the EE does with the IOP (RPC, SIF DMA, memory access).
+        uint64_t pendingIopCycles = 0;
+        void flushPending() noexcept
+        {
+            if (pendingIopCycles)
+            {
+                const uint64_t cycles = pendingIopCycles;
+                pendingIopCycles = 0;
+                runCycles(cycles);
+            }
+        }
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -787,30 +802,35 @@ namespace ps2x::iop::detail
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->flushPending();
         return m_impl->loadModule(path, arguments, argumentSize);
     }
 
     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->flushPending();
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
+        m_impl->flushPending();
         return m_impl->stopModule(moduleId, result);
     }
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
-        const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        m_impl->pendingIopCycles += total / 8u;
+        static constexpr uint64_t kIopBatchCycles = 512; // ~14 us of IOP time
+        if (m_impl->pendingIopCycles >= kIopBatchCycles)
+            m_impl->flushPending();
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        m_impl->flushPending();
         return m_impl->rpc.handleRpc(request, *m_impl);
     }
 
@@ -821,33 +841,50 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
+        m_impl->flushPending();
         m_impl->rpc.onSifTransfer(transfer);
     }
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
     {
+        m_impl->flushPending();
         return m_impl->memory.allocate(size, alignment);
     }
 
     bool IopEmulator::freeMemory(uint32_t address)
     {
+        m_impl->flushPending();
         return m_impl->memory.freeAllocation(address);
     }
 
     bool IopEmulator::readMemory(uint32_t address, void *destination, size_t size) const
     {
+        m_impl->flushPending();
+        if (address >= 0x1F900000u && address + size <= 0x1F900800u && (address & 1u) == 0u && (size & 1u) == 0u)
+        {
+            // The SPU2 register file (for diagnostics and tests).
+            auto *out = static_cast<uint8_t *>(destination);
+            for (size_t i = 0; i < size; i += 2u)
+            {
+                const uint16_t value = m_impl->memory.read16(address + static_cast<uint32_t>(i));
+                std::memcpy(out + i, &value, sizeof(value));
+            }
+            return true;
+        }
         return isMemoryRange(address, size) &&
                m_impl->memory.readRam(address, destination, size);
     }
 
     bool IopEmulator::writeMemory(uint32_t address, const void *source, size_t size)
     {
+        m_impl->flushPending();
         return isMemoryRange(address, size) &&
                m_impl->memory.writeRam(address, source, size);
     }
 
     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
     {
+        m_impl->flushPending();
         return isMemoryRange(address, size) &&
                m_impl->memory.zeroRam(address, size);
     }
@@ -865,6 +902,7 @@ namespace ps2x::iop::detail
 
     uint64_t IopEmulator::cycles() const noexcept
     {
+        m_impl->flushPending();
         return m_impl->totalCycles;
     }
 
