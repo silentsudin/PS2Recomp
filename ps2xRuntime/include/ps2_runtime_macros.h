@@ -603,6 +603,122 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
 #define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
 
+// EE FPU semantics that differ from IEEE (see the EE Core Instruction Set Manual; PCSX2's FPU.cpp
+// is the reference used here). The EE has no Inf/NaN/denormals and always rounds toward zero.
+namespace ps2_fpu
+{
+    constexpr uint32_t kFlagI = 0x00020000u, kFlagD = 0x00010000u, kFlagSI = 0x00000040u, kFlagSD = 0x00000020u;
+    inline uint32_t bits(float v) { uint32_t b; std::memcpy(&b, &v, 4); return b; }
+    inline float fromBits(uint32_t b) { float v; std::memcpy(&v, &b, 4); return v; }
+    inline bool isZero(uint32_t b) { return (b & 0x7F800000u) == 0u; } // denormals count as zero
+}
+
+// CVT.W.S: truncates; values outside int32 (exponent > 2^31) saturate by sign.
+inline int32_t ps2_fpu_cvt_w_s(float value)
+{
+    const uint32_t b = ps2_fpu::bits(value);
+    if ((b & 0x7F800000u) <= 0x4E800000u)
+        return static_cast<int32_t>(value);
+    return (b & 0x80000000u) ? static_cast<int32_t>(0x80000000u) : 0x7FFFFFFF;
+}
+
+// SQRT.S fd, ft: sqrt(|ft|); a negative operand sets I/SI.
+inline float ps2_fpu_sqrt_s(uint32_t &fcr31, float ft)
+{
+    const uint32_t b = ps2_fpu::bits(ft);
+    fcr31 &= ~ps2_fpu::kFlagD;
+    if (ps2_fpu::isZero(b))
+        return ps2_fpu::fromBits(b & 0x80000000u);
+    if (b & 0x80000000u)
+        fcr31 |= ps2_fpu::kFlagI | ps2_fpu::kFlagSI;
+    return static_cast<float>(std::sqrt(std::fabs(static_cast<double>(ft))));
+}
+
+// RSQRT.S fd, fs, ft: fs / sqrt(|ft|); ft == 0 gives +-max and sets D/SD.
+inline float ps2_fpu_rsqrt_s(uint32_t &fcr31, float fs, float ft)
+{
+    const uint32_t b = ps2_fpu::bits(ft);
+    fcr31 &= ~(ps2_fpu::kFlagD | ps2_fpu::kFlagI);
+    if (ps2_fpu::isZero(b))
+    {
+        fcr31 |= ps2_fpu::kFlagD | ps2_fpu::kFlagSD;
+        return ps2_fpu::fromBits((b & 0x80000000u) | 0x7F7FFFFFu);
+    }
+    if (b & 0x80000000u)
+        fcr31 |= ps2_fpu::kFlagI | ps2_fpu::kFlagSI;
+    const float root = static_cast<float>(std::sqrt(std::fabs(static_cast<double>(ft))));
+    return fs / root;
+}
+
+// DIV.S fd, fs, ft: x/0 gives +-max (sign fs^ft) and sets D/SD, or I/SI for 0/0.
+inline float ps2_fpu_div_s(uint32_t &fcr31, float fs, float ft)
+{
+    const uint32_t bs = ps2_fpu::bits(fs), bt = ps2_fpu::bits(ft);
+    fcr31 &= ~(ps2_fpu::kFlagD | ps2_fpu::kFlagI);
+    if (ps2_fpu::isZero(bt))
+    {
+        fcr31 |= ps2_fpu::isZero(bs) ? (ps2_fpu::kFlagI | ps2_fpu::kFlagSI) : (ps2_fpu::kFlagD | ps2_fpu::kFlagSD);
+        return ps2_fpu::fromBits(((bs ^ bt) & 0x80000000u) | 0x7F7FFFFFu);
+    }
+    return fs / ft;
+}
+
+// VU0 macro-mode DIV/SQRT/RSQRT into Q (VU semantics: x/0 gives +-max, sqrt uses |ft|).
+inline float ps2_vu_div(float fs, float ft)
+{
+    const uint32_t bs = ps2_fpu::bits(fs), bt = ps2_fpu::bits(ft);
+    if (ps2_fpu::isZero(bt))
+        return ps2_fpu::fromBits(((bs ^ bt) & 0x80000000u) | 0x7F7FFFFFu);
+    return fs / ft;
+}
+
+inline float ps2_vu_sqrt(float ft)
+{
+    return static_cast<float>(std::sqrt(std::fabs(static_cast<double>(ft))));
+}
+
+inline float ps2_vu_rsqrt(float fs, float ft)
+{
+    const uint32_t bs = ps2_fpu::bits(fs), bt = ps2_fpu::bits(ft);
+    if (ps2_fpu::isZero(bt))
+    {
+        const uint32_t sign = (bs ^ bt) & 0x80000000u;
+        return ps2_fpu::fromBits(ps2_fpu::isZero(bs) ? sign : (sign | 0x7F7FFFFFu));
+    }
+    return fs / ps2_vu_sqrt(ft);
+}
+
+// VU0 macro-mode FMAC flags: MAC (Z bits 0-3, S bits 4-7, O bits 12-15; x is the high bit of each
+// nibble) and status (Z/S/O plus sticky ZS/SS/OS), from the result lanes selected by `dest`
+// (x=8, y=4, z=2, w=1). Games use e.g. VSUB into VF0 purely to test these flags.
+template <typename Ctx>
+inline void ps2_vu0_fmac_flags(Ctx *ctx, __m128 result, uint32_t dest)
+{
+    alignas(16) uint32_t lanes[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(lanes), _mm_castps_si128(result));
+    uint32_t mac = 0u;
+    for (uint32_t c = 0; c < 4u; ++c)
+    {
+        const uint32_t bit = 3u - c; // x -> bit 3
+        if ((dest & (1u << bit)) == 0u)
+            continue;
+        const uint32_t v = lanes[c];
+        const uint32_t exponent = (v >> 23) & 0xFFu;
+        if (exponent == 0u)
+            mac |= 1u << bit;              // zero (denormals count as zero)
+        else if (exponent == 0xFFu)
+            mac |= 1u << (bit + 12u);      // overflow
+        if (v & 0x80000000u)
+            mac |= 1u << (bit + 4u);       // sign
+    }
+    uint32_t status = ctx->vu0_status & 0xFF0u;
+    if (mac & 0x000Fu) status |= 0x001u | 0x040u;
+    if (mac & 0x00F0u) status |= 0x002u | 0x080u;
+    if (mac & 0xF000u) status |= 0x008u | 0x200u;
+    ctx->vu0_mac_flags = mac;
+    ctx->vu0_status = static_cast<uint16_t>(status);
+}
+
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
 #define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
@@ -623,7 +739,7 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+#define FPU_CVT_W_S(a) ps2_fpu_cvt_w_s((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

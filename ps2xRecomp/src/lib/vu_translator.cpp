@@ -16,7 +16,51 @@ namespace ps2recomp
     {
     }
 
+    namespace
+    {
+        // Upper (FMAC) ops that update MAC/status flags. Returns 1 = result in fd, 2 = in ACC, 0 = none.
+        int fmacFlagTarget(const Instruction &inst)
+        {
+            const uint8_t special1 = static_cast<uint8_t>(inst.function & 0x3F);
+            if (special1 < 0x3C)
+            {
+                if (special1 <= 0x0F || (special1 >= 0x18 && special1 <= 0x1C) || special1 == 0x1E ||
+                    (special1 >= 0x20 && special1 <= 0x2A && special1 != 0x2B) || special1 == 0x2C ||
+                    special1 == 0x2D || special1 == 0x2E)
+                    return 1;
+                return 0;
+            }
+            const uint8_t special2 = static_cast<uint8_t>((((inst.raw >> 6) & 0x1F) << 2) | (inst.raw & 0x3));
+            if (special2 <= 0x0F || (special2 >= 0x18 && special2 <= 0x1C) || special2 == 0x1E ||
+                (special2 >= 0x20 && special2 <= 0x2A) || special2 == 0x2C || special2 == 0x2D || special2 == 0x2E)
+                return 2;
+            return 0;
+        }
+    }
+
     std::string VuTranslator::translate(const Instruction &inst)
+    {
+        std::string code = translateRaw(inst);
+        const uint8_t format = inst.rs;
+        if (format >= COP2_CO && format <= COP2_CO + 15)
+        {
+            // MAC/status flags from the result (macro mode: flags are immediate).
+            const int target = fmacFlagTarget(inst);
+            const uint32_t dest = (inst.raw >> 21) & 0xFu;
+            if (target == 1)
+                code += fmt::format(" ps2_vu0_fmac_flags(ctx, ctx->vu0_vf[{}], {}u);", inst.sa, dest);
+            else if (target == 2)
+                code += fmt::format(" ps2_vu0_fmac_flags(ctx, ctx->vu0_acc, {}u);", dest);
+        }
+        // VF0 is hard-wired to (0,0,0,1): writes to it (VSUB vf0,... as a flag test, QMTC2, ...)
+        // must not stick.
+        if ((format >= COP2_CO && format <= COP2_CO + 15 && (inst.sa == 0 || inst.rt == 0)) ||
+            (format == COP2_QMTC2 && inst.rd == 0))
+            code += " ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);";
+        return code;
+    }
+
+    std::string VuTranslator::translateRaw(const Instruction &inst)
     {
         uint8_t format = inst.rs; // Use parsed rs field for COP2 format
         uint8_t rt = inst.rt;

@@ -72,7 +72,10 @@ struct alignas(16) R5900Context
     uint32_t sa;         // Shift amount register
 
     // VU0 registers (when used in macro mode)
-    __m128 vu0_vf[32];        // VU0 vector float registers
+    // VU0 vector float registers. VF0 is hard-wired to (0,0,0,1); every context (including the
+    // R5900Context{} the EE scheduler creates per guest thread) must start that way, or code such
+    // as sceVu0UnitMatrix (VSUB/VADD.w from VF0) produces all-zero matrices.
+    __m128 vu0_vf[32] = {{0.0f, 0.0f, 0.0f, 1.0f}};
     uint16_t vi[16];          // VU0 vector integer registers
     float vu0_q;              // VU0 Q register (quotient)
     float vu0_p;              // VU0 P register (EFU result)
