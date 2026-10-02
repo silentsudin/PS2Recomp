@@ -43,6 +43,12 @@ namespace ps2_test
     // Sound output (48 kHz stereo), for the test server's "audio" command.
     void onAudio(const int16_t *interleavedStereo, size_t frames);
 
+    // Rendering on/off (VU1 microprograms and their drawing). Off only in test runs that don't
+    // need pictures: the game's logic does not depend on it (verified with state hashes), and it
+    // is the bulk of the cost in 3D scenes. RT_RENDER=0 starts with it off.
+    bool renderingEnabled();
+    void setRenderingEnabled(bool on);
+
     // Called on the EE thread at the start of every guest vblank.
     void onVblank(PS2Runtime &runtime, uint64_t vblank);
 
@@ -58,7 +64,11 @@ namespace ps2_test
     //   {"cmd":"frame","path":P}             the presented picture as raw RGBA -> {"width":W,"height":H}
     //   {"cmd":"stats"}                      vblank, presented frames, thread load
     //   {"cmd":"marker","kind":K,"text":T}   adds a marker to the movie being recorded
-    //   {"cmd":"audio"}                      sound since the last query: frames, rms, peak, hash
+    //   {"cmd":"render","on":0|1}            rendering on/off (see renderingEnabled)
+    //   {"cmd":"step","vblanks":N,"buttons":B,"lx":..,"reads":"ee:ADDR:LEN,..."}
+    //                                        pad + run + reads in one round trip -> {"vblank","data":[hex,..]}
+    //   {"cmd":"audio"}                      sound since the last query: frames, rms, peak, hash,
+    //                                        lr_diff (mean |left - right|)
     //   {"cmd":"quit"}
     void startServerIfRequested(PS2Runtime &runtime);
 

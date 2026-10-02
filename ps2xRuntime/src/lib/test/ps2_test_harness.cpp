@@ -70,6 +70,7 @@ namespace ps2_test
         std::condition_variable g_parkCv;   // game thread waits here while parked
         std::condition_variable g_serverCv; // server waits for the game to park / a capture
         bool g_serverEnabled = false;
+        std::atomic<bool> g_rendering{[] { const char *e = std::getenv("RT_RENDER"); return !(e && *e == '0'); }()};
         bool g_attached = false;
         uint64_t g_runTarget = 0;           // park when reaching this vblank
         uint64_t g_parkedAt = UINT64_MAX;   // vblank the game is parked at, or UINT64_MAX
@@ -80,6 +81,7 @@ namespace ps2_test
         double g_audioSquares = 0.0;
         int g_audioPeak = 0;
         uint64_t g_audioHash = 0xcbf29ce484222325ull;
+        double g_audioLrDiff = 0.0; // sum of |left - right|: 0 for mono sound
         // Frame capture hand-off with the render thread.
         bool g_captureRequested = false;
         bool g_captureDone = false;
@@ -475,6 +477,50 @@ namespace ps2_test
                        ",\"vif1_busy_ns\":" + std::to_string(memory.gifVif1BusyNanos()) +
                        ",\"gs_busy_ns\":" + std::to_string(memory.gsThreadBusyNanos()) + "}";
             }
+            if (cmd == "render")
+            {
+                setRenderingEnabled(jsonNumber(line, "on", 1) != 0);
+                return "{\"ok\":true}";
+            }
+            if (cmd == "step")
+            {
+                // Pad (optional) + run + reads, one round trip for driving bots.
+                if (!jsonValue(line, "buttons").empty())
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    g_serverPad = PadState{static_cast<uint16_t>(jsonNumber(line, "buttons", 0xFFFF)),
+                                           static_cast<uint8_t>(jsonNumber(line, "lx", 128)),
+                                           static_cast<uint8_t>(jsonNumber(line, "ly", 128)),
+                                           static_cast<uint8_t>(jsonNumber(line, "rx", 128)),
+                                           static_cast<uint8_t>(jsonNumber(line, "ry", 128))};
+                    g_serverPadActive = true;
+                }
+                const std::string ran = handle(runtime, "{\"cmd\":\"run\",\"vblanks\":" +
+                                                            std::to_string(jsonNumber(line, "vblanks", 1)) + "}");
+                if (ran.find("\"ok\":true") == std::string::npos)
+                    return ran;
+                std::string reply = "{\"ok\":true,\"vblank\":" + std::to_string(g_parkedAt) + ",\"data\":[";
+                std::istringstream reads(jsonValue(line, "reads"));
+                bool first = true;
+                for (std::string item; std::getline(reads, item, ',');)
+                {
+                    std::istringstream parts(item);
+                    std::string space, addrText, lenText;
+                    std::getline(parts, space, ':');
+                    std::getline(parts, addrText, ':');
+                    std::getline(parts, lenText, ':');
+                    const auto addr = static_cast<uint32_t>(std::strtoull(addrText.c_str(), nullptr, 0));
+                    const size_t len = std::strtoull(lenText.c_str(), nullptr, 0);
+                    std::vector<uint8_t> buffer(len);
+                    if (space == "iop")
+                        runtime.readIopMemory(addr, buffer.data(), len);
+                    else if (const uint8_t *src = memorySpace(runtime, space, addr, len))
+                        std::memcpy(buffer.data(), src, len);
+                    reply += std::string(first ? "" : ",") + "\"" + toHex(buffer.data(), len) + "\"";
+                    first = false;
+                }
+                return reply + "]}";
+            }
             if (cmd == "marker")
             {
                 addMarker(jsonValue(line, "kind"), jsonValue(line, "text"));
@@ -485,13 +531,16 @@ namespace ps2_test
                 std::lock_guard<std::mutex> lock(g_mutex);
                 const double rms = g_audioFrames ? std::sqrt(g_audioSquares / (2.0 * static_cast<double>(g_audioFrames))) : 0.0;
                 char reply[256];
-                std::snprintf(reply, sizeof(reply), "{\"ok\":true,\"frames\":%llu,\"rms\":%.2f,\"peak\":%d,\"hash\":\"%016llx\"}",
+                std::snprintf(reply, sizeof(reply),
+                              "{\"ok\":true,\"frames\":%llu,\"rms\":%.2f,\"peak\":%d,\"hash\":\"%016llx\",\"lr_diff\":%.3f}",
                               static_cast<unsigned long long>(g_audioFrames), rms, g_audioPeak,
-                              static_cast<unsigned long long>(g_audioHash));
+                              static_cast<unsigned long long>(g_audioHash),
+                              g_audioFrames ? g_audioLrDiff / static_cast<double>(g_audioFrames) : 0.0);
                 g_audioFrames = 0;
                 g_audioSquares = 0.0;
                 g_audioPeak = 0;
                 g_audioHash = 0xcbf29ce484222325ull;
+                g_audioLrDiff = 0.0;
                 return reply;
             }
             if (cmd == "quit")
@@ -575,11 +624,16 @@ namespace ps2_test
             .detach();
     }
 
+    bool renderingEnabled() { return g_rendering.load(std::memory_order_relaxed); }
+    void setRenderingEnabled(bool on) { g_rendering.store(on, std::memory_order_relaxed); }
+
     void onAudio(const int16_t *interleavedStereo, size_t frames)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_serverEnabled && !g_attached)
             return;
+        for (size_t i = 0; i < frames; ++i)
+            g_audioLrDiff += std::abs(static_cast<int>(interleavedStereo[2 * i]) - interleavedStereo[2 * i + 1]);
         for (size_t i = 0; i < frames * 2; ++i)
         {
             const int v = interleavedStereo[i];
