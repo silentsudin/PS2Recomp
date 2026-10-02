@@ -57,6 +57,7 @@ namespace ps2_test
     //   {"cmd":"write","space":...,"addr":A,"data":"<hex>"}
     //   {"cmd":"frame","path":P}             the presented picture as raw RGBA -> {"width":W,"height":H}
     //   {"cmd":"stats"}                      vblank, presented frames, thread load
+    //   {"cmd":"marker","kind":K,"text":T}   adds a marker to the movie being recorded
     //   {"cmd":"audio"}                      sound since the last query: frames, rms, peak, hash
     //   {"cmd":"quit"}
     void startServerIfRequested(PS2Runtime &runtime);

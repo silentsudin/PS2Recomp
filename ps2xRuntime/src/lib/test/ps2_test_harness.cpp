@@ -475,6 +475,11 @@ namespace ps2_test
                        ",\"vif1_busy_ns\":" + std::to_string(memory.gifVif1BusyNanos()) +
                        ",\"gs_busy_ns\":" + std::to_string(memory.gsThreadBusyNanos()) + "}";
             }
+            if (cmd == "marker")
+            {
+                addMarker(jsonValue(line, "kind"), jsonValue(line, "text"));
+                return "{\"ok\":true}";
+            }
             if (cmd == "audio")
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
