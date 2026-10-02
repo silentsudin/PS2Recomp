@@ -25,6 +25,7 @@
 #include <cstring>
 #include <limits>
 #include <chrono>
+#include <unordered_set>
 #include <atomic>
 #include <thread>
 #include <unordered_map>
@@ -393,7 +394,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        rt->gsUnsynced().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -410,7 +411,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     uint32_t displayFbp = 0u;
     uint32_t sourceFbp = 0u;
     bool usedPreferredDisplaySource = false;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
+    if (!rt->gsUnsynced().copyLatchedHostPresentationFrame(s_scratch,
                                                    width,
                                                    height,
                                                    &displayFbp,
@@ -532,6 +533,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        m_memory.stopGifVif1Worker();
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -719,6 +721,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                      if (vu1Stats)
                                      {
                                          static uint64_t runs = 0, cycles = 0, nanos = 0, nativeRuns = 0;
+                                         static uint64_t byEntry[8] = {};
+                                         ++byEntry[(startPC >> 4) & 7u];
                                          static auto window = std::chrono::steady_clock::now();
                                          const auto now = std::chrono::steady_clock::now();
                                          ++runs;
@@ -731,10 +735,20 @@ bool PS2Runtime::syncCoreSubsystems()
                                              std::fprintf(stderr, "[vu1-stats] %.0f runs/s (%.0f%% native), %.1f M VU cycles/s, %.1f ms/s host, %.0f cycles/run\n",
                                                           runs / secs, runs ? 100.0 * nativeRuns / runs : 0.0, cycles / secs / 1e6,
                                                           nanos / secs / 1e6, runs ? double(cycles) / runs : 0.0);
+                                             static uint64_t lastStalls = 0;
+                                             const uint64_t stalls = m_memory.gifVif1Stalls();
+                                             std::fprintf(stderr, "[vu1-stats] gif/vif1 worker waits/s: %.0f\n", (stalls - lastStalls) / secs);
+                                             lastStalls = stalls;
+                                             std::fprintf(stderr, "[vu1-stats] by entry/s: %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f\n",
+                                                          byEntry[0] / secs, byEntry[1] / secs, byEntry[2] / secs, byEntry[3] / secs,
+                                                          byEntry[4] / secs, byEntry[5] / secs, byEntry[6] / secs, byEntry[7] / secs);
+                                             std::fill(std::begin(byEntry), std::end(byEntry), 0u);
                                              runs = cycles = nanos = nativeRuns = 0;
                                              window = now;
                                          }
                                      }
+                                     // On the GIF/VIF1 worker the EE context belongs to another thread.
+                                     if (!m_memory.gifVif1WorkerActive())
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -761,6 +775,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                                   m_gs, &m_memory, top, itop, 65536);
                                      if (capturing)
                                          m_vu1Capture->end(m_vu1, m_memory.getVU1Data(), PS2_VU1_DATA_SIZE);
+                                     // On the GIF/VIF1 worker the EE context belongs to another thread.
+                                     if (!m_memory.gifVif1WorkerActive())
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -768,6 +784,10 @@ bool PS2Runtime::syncCoreSubsystems()
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
+
+    // RT_GIF_THREAD=0 keeps GIF/VIF1/VU1 processing on the EE thread.
+    if (const char *e = std::getenv("RT_GIF_THREAD"); !(e && *e == '0'))
+        m_memory.startGifVif1Worker();
 
     m_boundRdram = rdram;
     m_boundGSVram = gsVram;
@@ -798,7 +818,14 @@ bool PS2Runtime::initialize(const char *title)
         ps2AudioOutStart();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+#if defined(PLATFORM_VITA)
         SetTargetFPS(60);
+#else
+        if (const char *hostFps = std::getenv("RT_HOST_FPS"))
+            SetTargetFPS(std::atoi(hostFps));
+        else
+            SetTargetFPS(0); // paced by guest vblanks in run()
+#endif
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -2242,6 +2269,7 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(GIF_TADR, tadr);
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
+    m_memory.syncGifVif1();
     if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
@@ -2463,6 +2491,11 @@ void PS2Runtime::run()
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
+#if defined(PLATFORM_VITA)
+    const bool pacePresentationToVblank = false;
+#else
+    const bool pacePresentationToVblank = std::getenv("RT_HOST_FPS") == nullptr;
+#endif
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -2499,6 +2532,7 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        const uint64_t presentedTick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
         BeginDrawing();
@@ -2524,6 +2558,17 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+
+        // Present once per guest vblank: wait for the next one (the EE scheduler times them on
+        // the host clock). raylib's sleep-based limiter oversleeps on a busy machine and presents
+        // fewer frames than the game draws. RT_HOST_FPS=<n> uses the limiter instead.
+        if (pacePresentationToVblank)
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+            while (m_memory.gs().vsyncTick.load(std::memory_order_acquire) == presentedTick &&
+                   std::chrono::steady_clock::now() < deadline && !isStopRequested())
+                std::this_thread::sleep_for(std::chrono::microseconds(250));
+        }
 
         if (WindowShouldClose())
         {

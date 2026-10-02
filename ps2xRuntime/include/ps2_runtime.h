@@ -472,8 +472,19 @@ public:
     inline PS2Memory &memory() { return m_memory; }
     inline const PS2Memory &memory() const { return m_memory; }
 
-    inline GS &gs() { return m_gs; }
-    inline const GS &gs() const { return m_gs; }
+    // The GS as the EE sees it: waits for queued GIF/VIF1 work first (PS2Memory::syncGifVif1).
+    inline GS &gs()
+    {
+        m_memory.syncGifVif1();
+        return m_gs;
+    }
+    inline const GS &gs() const
+    {
+        const_cast<PS2Memory &>(m_memory).syncGifVif1();
+        return m_gs;
+    }
+    // For the host side (presentation, debug UI), which must not wait for the EE's queued work.
+    inline GS &gsUnsynced() { return m_gs; }
     inline GifArbiter &gifArbiter() { return m_gifArbiter; }
     inline const GifArbiter &gifArbiter() const { return m_gifArbiter; }
     inline VU1Interpreter &vu0() { return m_vu0; }

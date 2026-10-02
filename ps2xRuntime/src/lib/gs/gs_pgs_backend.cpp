@@ -44,6 +44,27 @@ namespace ps2x::gs
             std::memcpy(&dst, &value, std::min(sizeof(Bits), sizeof(value)));
         }
 
+        bool envEquals(const char *name, const char *value)
+        {
+            const char *e = std::getenv(name);
+            return e && std::strcmp(e, value) == 0;
+        }
+
+        ParallelGS::SuperSampling superSamplingFromEnv(uint32_t fallback)
+        {
+            uint32_t rate = fallback;
+            if (const char *e = std::getenv("RT_GS_SSAA"))
+                rate = static_cast<uint32_t>(std::strtoul(e, nullptr, 10));
+            switch (rate)
+            {
+            case 2: return ParallelGS::SuperSampling::X2;
+            case 4: return ParallelGS::SuperSampling::X4;
+            case 8: return ParallelGS::SuperSampling::X8;
+            case 16: return ParallelGS::SuperSampling::X16;
+            default: return ParallelGS::SuperSampling::X1;
+            }
+        }
+
         class PgsBackend final : public GSRasterBackend, public GSPacketMirror
         {
         public:
@@ -70,6 +91,12 @@ namespace ps2x::gs
                 m_device.init_frame_contexts(4);
 
                 ParallelGS::GSOptions gsOptions = {};
+                // The game draws 224-line fields. Super-sampling plus a high-resolution progressive
+                // scanout (see present()) turns them into a full 448-line picture with no
+                // interlacing artefacts. RT_GS_SSAA=1|2|4|8|16 (default 4); RT_GS_PROGRESSIVE=0
+                // keeps the plain field deinterlacer.
+                m_progressive = !envEquals("RT_GS_PROGRESSIVE", "0");
+                gsOptions.super_sampling = superSamplingFromEnv(m_progressive ? 4u : 1u);
                 if (!m_iface.init(&m_device, gsOptions))
                 {
                     error = "paraLLEl-GS init failed (missing Vulkan features?)";
@@ -194,8 +221,14 @@ namespace ps2x::gs
                     vsync.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
                     vsync.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
                     vsync.adapt_to_internal_horizontal_resolution = true;
-                    // Road Trip renders 640x224 fields (INT=1, FFMD=1); paraLLEl-GS's default
-                    // deinterlacer reconstructs the 448-line picture from them.
+                    // Road Trip renders 640x224 fields (INT=1, FFMD=1). Progressive mode scans out
+                    // the super-sampled field at double height instead of bobbing between fields.
+                    if (m_progressive)
+                    {
+                        vsync.force_progressive = true;
+                        vsync.anti_blur = true;
+                        vsync.high_resolution_scanout = true;
+                    }
 
                     m_iface.flush();
                     ParallelGS::ScanoutResult scanout = m_iface.vsync(vsync);
@@ -217,6 +250,7 @@ namespace ps2x::gs
             }
 
         private:
+            bool m_progressive = true;
             Vulkan::Fence submitReadbackLocked(const Vulkan::Image &image)
             {
                 const uint32_t w = image.get_width();
@@ -244,16 +278,43 @@ namespace ps2x::gs
                 const auto *src = static_cast<const uint8_t *>(
                     m_device.map_host_buffer(*m_readback, Vulkan::MEMORY_ACCESS_READ_BIT));
 
+                // A high-resolution scanout can exceed the host frame; box-filter it down by an
+                // integer factor per axis.
+                const uint32_t fx = (w + kHostFrameWidth - 1u) / kHostFrameWidth;
+                const uint32_t fy = (h + kHostFrameHeight - 1u) / kHostFrameHeight;
                 PresentationFrame frame{};
-                frame.width = std::min(w, kHostFrameWidth);
-                frame.height = std::min(h, kHostFrameHeight);
+                frame.width = std::min(w / fx, kHostFrameWidth);
+                frame.height = std::min(h / fy, kHostFrameHeight);
                 frame.pixels.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
+                const uint32_t area = fx * fy;
                 for (uint32_t y = 0; y < frame.height; ++y)
                 {
                     uint8_t *dst = frame.pixels.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u;
-                    std::memcpy(dst, src + static_cast<size_t>(y) * w * 4u, static_cast<size_t>(frame.width) * 4u);
+                    if (area == 1u)
+                    {
+                        std::memcpy(dst, src + static_cast<size_t>(y) * w * 4u, static_cast<size_t>(frame.width) * 4u);
+                        for (uint32_t x = 0; x < frame.width; ++x)
+                            dst[x * 4u + 3u] = 0xFF;
+                        continue;
+                    }
                     for (uint32_t x = 0; x < frame.width; ++x)
+                    {
+                        uint32_t sum[3] = {};
+                        for (uint32_t sy = 0; sy < fy; ++sy)
+                        {
+                            const uint8_t *p = src + (static_cast<size_t>(y * fy + sy) * w + x * fx) * 4u;
+                            for (uint32_t sx = 0; sx < fx; ++sx, p += 4)
+                            {
+                                sum[0] += p[0];
+                                sum[1] += p[1];
+                                sum[2] += p[2];
+                            }
+                        }
+                        dst[x * 4u + 0u] = static_cast<uint8_t>(sum[0] / area);
+                        dst[x * 4u + 1u] = static_cast<uint8_t>(sum[1] / area);
+                        dst[x * 4u + 2u] = static_cast<uint8_t>(sum[2] / area);
                         dst[x * 4u + 3u] = 0xFF;
+                    }
                 }
                 m_device.unmap_host_buffer(*m_readback, Vulkan::MEMORY_ACCESS_READ_BIT);
                 return frame;

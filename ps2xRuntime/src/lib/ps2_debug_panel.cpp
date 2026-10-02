@@ -1515,7 +1515,7 @@ namespace
     void drawGsTab(PS2Runtime &runtime)
     {
         GSRegisters &regs = runtime.memory().gs();
-        const GSDebugSnapshot gs = runtime.gs().getDebugSnapshot();
+        const GSDebugSnapshot gs = runtime.gsUnsynced().getDebugSnapshot();
 
         ImGui::SeparatorText("GS private registers");
         if (ImGui::BeginTable("gspriv", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
@@ -1583,8 +1583,8 @@ namespace
         drawGsContext("Context 1", gs.ctx[1]);
 
         ImGui::SeparatorText("GS history");
-        bool gsHistoryPaused = runtime.gs().isDebugHistoryPaused();
-        std::vector<GSDebugHistoryEntry> history = runtime.gs().getDebugHistory();
+        bool gsHistoryPaused = runtime.gsUnsynced().isDebugHistoryPaused();
+        std::vector<GSDebugHistoryEntry> history = runtime.gsUnsynced().getDebugHistory();
         uint32_t latestFrame = 0u;
         if (!history.empty())
         {
@@ -1600,14 +1600,14 @@ namespace
         ImGui::SameLine();
         if (ImGui::Button("Clear GS history"))
         {
-            runtime.gs().clearDebugHistory();
+            runtime.gsUnsynced().clearDebugHistory();
             history.clear();
             latestFrame = 0u;
         }
         ImGui::SameLine();
         if (ImGui::Checkbox("Pause capture", &gsHistoryPaused))
         {
-            runtime.gs().setDebugHistoryPaused(gsHistoryPaused);
+            runtime.gsUnsynced().setDebugHistoryPaused(gsHistoryPaused);
         }
         ImGui::SameLine();
         if (ImGui::Button("Dump GS TXT"))

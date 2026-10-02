@@ -1,6 +1,9 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 enum VIFCmd : uint8_t
 {
@@ -28,6 +31,117 @@ enum VIFCmd : uint8_t
 
 namespace
 {
+    // Fast UNPACK for the common case: no write mask, CL >= WL (no fill writes). Same results as the
+    // generic loop in processVIF1Data, including its handling of the lanes V2/V3 do not supply.
+    template <uint32_t VL, uint32_t VN>
+    inline void decodeUnpackVector(const uint8_t *src, bool zeroExtend, uint32_t lanes[4])
+    {
+        if constexpr (VL == 3u)
+        {
+            uint16_t packed;
+            std::memcpy(&packed, src, sizeof(packed));
+            lanes[0] = packed & 0x1Fu;
+            lanes[1] = (packed >> 5) & 0x1Fu;
+            lanes[2] = (packed >> 10) & 0x1Fu;
+            lanes[3] = (packed >> 15) & 0x01u;
+            return;
+        }
+        auto component = [&](uint32_t c) -> uint32_t
+        {
+            if constexpr (VL == 0u)
+            {
+                uint32_t v;
+                std::memcpy(&v, src + c * 4u, sizeof(v));
+                return v;
+            }
+            else if constexpr (VL == 1u)
+            {
+                uint16_t v;
+                std::memcpy(&v, src + c * 2u, sizeof(v));
+                return zeroExtend ? v : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v)));
+            }
+            else
+            {
+                const uint8_t v = src[c];
+                return zeroExtend ? v : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v)));
+            }
+        };
+        if constexpr (VN == 0u)
+        {
+            lanes[0] = lanes[1] = lanes[2] = lanes[3] = component(0);
+        }
+        else
+        {
+            for (uint32_t c = 0; c <= VN; ++c)
+                lanes[c] = component(c);
+        }
+    }
+
+    template <uint32_t VL, uint32_t VN, uint32_t Mode>
+    void unpackFastT(uint8_t *vuData, const uint8_t *src, uint32_t count, uint32_t vuAddr, uint32_t cl, uint32_t wl,
+                     bool zeroExtend, uint32_t row[4])
+    {
+        constexpr uint32_t bytesPerVector = (VL == 3u) ? 2u : (VN + 1u) * (VL == 0u ? 4u : VL == 1u ? 2u : 1u);
+        constexpr bool canAdd = VL != 3u;
+        uint32_t block = 0, cyclePos = 0;
+        for (uint32_t i = 0; i < count; ++i, src += bytesPerVector)
+        {
+            uint8_t *dst = vuData + ((vuAddr + block * cl + cyclePos) & 0x3FFu) * 16u;
+            if (++cyclePos == wl)
+            {
+                cyclePos = 0;
+                ++block;
+            }
+            uint32_t lanes[4];
+            std::memcpy(lanes, dst, sizeof(lanes));
+            decodeUnpackVector<VL, VN>(src, zeroExtend, lanes);
+            if constexpr (canAdd && Mode != 0u)
+            {
+                for (uint32_t f = 0; f < 4u; ++f)
+                {
+                    lanes[f] += row[f];
+                    if constexpr (Mode == 2u)
+                        row[f] = lanes[f];
+                }
+            }
+            std::memcpy(dst, lanes, sizeof(lanes));
+        }
+    }
+
+    template <uint32_t VL, uint32_t VN>
+    void unpackFastMode(uint32_t mode, uint8_t *vuData, const uint8_t *src, uint32_t count, uint32_t vuAddr,
+                        uint32_t cl, uint32_t wl, bool zeroExtend, uint32_t row[4])
+    {
+        switch (mode)
+        {
+        case 1: unpackFastT<VL, VN, 1>(vuData, src, count, vuAddr, cl, wl, zeroExtend, row); break;
+        case 2: unpackFastT<VL, VN, 2>(vuData, src, count, vuAddr, cl, wl, zeroExtend, row); break;
+        default: unpackFastT<VL, VN, 0>(vuData, src, count, vuAddr, cl, wl, zeroExtend, row); break;
+        }
+    }
+
+    // Returns false for formats the fast path does not cover (V2-5/V3-5 style invalid encodings, mode 3).
+    bool unpackFast(uint32_t vl, uint32_t vn, uint32_t mode, uint8_t *vuData, const uint8_t *src, uint32_t count,
+                    uint32_t vuAddr, uint32_t cl, uint32_t wl, bool zeroExtend, uint32_t row[4])
+    {
+        if (mode == 3u)
+            return false;
+#define RT_UNPACK_CASE(L, N) \
+    case (L << 2) | N:       \
+        unpackFastMode<L, N>(mode, vuData, src, count, vuAddr, cl, wl, zeroExtend, row); \
+        return true;
+        switch ((vl << 2) | vn)
+        {
+            RT_UNPACK_CASE(0, 0) RT_UNPACK_CASE(0, 1) RT_UNPACK_CASE(0, 2) RT_UNPACK_CASE(0, 3)
+            RT_UNPACK_CASE(1, 0) RT_UNPACK_CASE(1, 1) RT_UNPACK_CASE(1, 2) RT_UNPACK_CASE(1, 3)
+            RT_UNPACK_CASE(2, 0) RT_UNPACK_CASE(2, 1) RT_UNPACK_CASE(2, 2) RT_UNPACK_CASE(2, 3)
+            RT_UNPACK_CASE(3, 3)
+        default:
+            return false;
+        }
+#undef RT_UNPACK_CASE
+    }
+
     constexpr uint8_t kGifFmtImage = 2u;
 
     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
@@ -572,7 +686,35 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            static const bool verifyUnpack = []
+            { const char *e = std::getenv("RT_VIF_VERIFY"); return e && *e == '1'; }();
+            bool fastDone = false;
+            std::vector<uint8_t> fastResult;
+            uint32_t fastRow[4] = {};
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && !maskEnable && cl >= wl)
+            {
+                uint32_t row[4];
+                std::memcpy(row, vif1_regs.row, sizeof(row));
+                std::vector<uint8_t> saved;
+                if (verifyUnpack)
+                    saved.assign(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
+                fastDone = unpackFast(vl, vn, vif1_regs.mode & 3u, m_vu1Data, data + pos, writeVectorCount, vuAddr,
+                                      cl, wl, zeroExtend, row);
+                if (fastDone && verifyUnpack)
+                {
+                    // Re-run the generic path from the same state and compare.
+                    fastResult.assign(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
+                    std::memcpy(fastRow, row, sizeof(row));
+                    std::memcpy(m_vu1Data, saved.data(), saved.size());
+                    fastDone = false;
+                }
+                else if (fastDone)
+                {
+                    std::memcpy(vif1_regs.row, row, sizeof(row));
+                }
+            }
+
+            if (!fastDone && m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
@@ -767,6 +909,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     }
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
+                }
+                if (!fastResult.empty())
+                {
+                    static uint32_t reports = 0;
+                    if ((std::memcmp(fastResult.data(), m_vu1Data, PS2_VU1_DATA_SIZE) != 0 ||
+                         std::memcmp(fastRow, vif1_regs.row, sizeof(fastRow)) != 0) &&
+                        reports++ < 20)
+                        std::fprintf(stderr, "[vif1] fast UNPACK mismatch vl=%u vn=%u mode=%u cl=%u wl=%u num=%u\n",
+                                     vl, vn, vif1_regs.mode & 3u, cl, wl, writeVectorCount);
                 }
             }
             pos += totalBytes;

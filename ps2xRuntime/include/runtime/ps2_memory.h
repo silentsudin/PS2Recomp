@@ -9,7 +9,10 @@
 #include <unordered_map>
 #include <atomic>
 #include <iostream>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <thread>
 
 #include "gs/ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
@@ -280,6 +283,18 @@ public:
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
+    // Vblanks at which DISPFB1 showed a different buffer than at the previous one: the frames the
+    // game actually presented (at most one per vblank).
+    uint64_t displayFlips() const { return m_displayFlips.load(std::memory_order_relaxed); }
+    void sampleDisplayAtVblank()
+    {
+        const uint64_t dispfb = gs_regs.dispfb1;
+        if (dispfb != m_lastVblankDispfb)
+        {
+            m_lastVblankDispfb = dispfb;
+            m_displayFlips.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
 
@@ -346,6 +361,22 @@ public:
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
+    // Asynchronous GIF/VIF1: GIF (PATH3) and VIF1 DMA transfers are snapshotted when kicked and
+    // processed in order on a worker thread, together with the VU1 microprograms and GS work they
+    // trigger, so the EE runs ahead as it does on hardware. The DMA completes for the EE at once
+    // (the data is already copied). Anything the EE can observe from the worker's side (GIF/VIF1
+    // registers and FIFOs, VU1 memory, GS registers and VRAM) first waits for the worker to catch up
+    // (syncGifVif1()).
+    void startGifVif1Worker();
+    void stopGifVif1Worker();
+    void syncGifVif1();
+    [[nodiscard]] bool gifVif1WorkerActive() const { return m_gifVif1Worker.joinable(); }
+    // Times syncGifVif1() had to wait (diagnostics).
+    [[nodiscard]] uint64_t gifVif1Stalls() const { return m_gifVif1Stalls.load(std::memory_order_relaxed); }
+    // Nanoseconds the worker / GS thread spent working (diagnostics: headroom at a capped frame rate).
+    [[nodiscard]] uint64_t gifVif1BusyNanos() const { return m_gifVif1BusyNs.load(std::memory_order_relaxed); }
+    [[nodiscard]] uint64_t gsThreadBusyNanos() const { return m_gsBusyNs.load(std::memory_order_relaxed); }
+
     int pollDmaRegisters();
 
     // Track code modifications for self-modifying code
@@ -374,6 +405,8 @@ public:
     std::atomic<uint64_t> m_gifCopyCount{0};
     std::atomic<uint64_t> m_gsWriteCount{0};
     std::atomic<uint64_t> m_vifWriteCount{0};
+    std::atomic<uint64_t> m_displayFlips{0};
+    uint64_t m_lastVblankDispfb = 0;
     std::atomic<uint64_t> m_vu0CodeGeneration{0};
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
@@ -423,6 +456,38 @@ public:
     std::vector<PendingTransfer> m_pendingVif1Transfers;
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
+
+    struct GifVif1Job
+    {
+        bool gif = false; // PATH3 packet data; otherwise a VIF1 stream
+        std::vector<uint8_t> data;
+    };
+    std::thread m_gifVif1Worker;
+    std::mutex m_gifVif1Mutex;
+    std::condition_variable m_gifVif1WorkCv;
+    std::condition_variable m_gifVif1IdleCv;
+    std::deque<GifVif1Job> m_gifVif1Queue;
+    std::atomic<uint64_t> m_gifVif1Submitted{0};
+    std::atomic<uint64_t> m_gifVif1Completed{0};
+    std::atomic<uint64_t> m_gifVif1Stalls{0};
+    std::atomic<uint64_t> m_gifVif1BusyNs{0};
+    std::atomic<uint64_t> m_gsBusyNs{0};
+    bool m_gifVif1Stop = false;
+    void gifVif1WorkerLoop();
+    void enqueueGifVif1(bool gif, const PendingTransfer &transfer);
+
+    // GS thread behind the GIF/VIF1 worker: the worker orders GIF packets (GifArbiter) and hands
+    // them over in batches; the GS thread feeds them to the GS. syncGifVif1() waits for both.
+    std::thread m_gsThread;
+    std::condition_variable m_gsWorkCv;
+    std::condition_variable m_gsIdleCv;
+    std::deque<std::vector<GifArbiterPacket>> m_gsQueue;
+    std::vector<GifArbiterPacket> m_gsPending; // worker-owned, not yet handed over
+    std::atomic<uint64_t> m_gsSubmitted{0};
+    std::atomic<uint64_t> m_gsCompleted{0};
+    void gsThreadLoop();
+    void drainGif();
+    void handOffGsBatch();
 
     struct CodeRegion
     {

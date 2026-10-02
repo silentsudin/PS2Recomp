@@ -3,6 +3,9 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <chrono>
+#include <pthread.h>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -12,6 +15,18 @@
 
 namespace
 {
+    // True on the GIF/VIF1 worker thread, which never waits for itself.
+    thread_local bool t_onGifVif1Worker = false;
+
+    // EE-visible state owned by the GIF/VIF1 worker: GIF registers, VIF1 registers, the VIF1 and GIF
+    // FIFOs.
+    inline bool isGifVif1Register(uint32_t addr)
+    {
+        return (addr >= 0x10003000u && addr < 0x10003100u) ||
+               (addr >= 0x10003C00u && addr < 0x10003E00u) ||
+               (addr >= 0x10005000u && addr < 0x10007000u);
+    }
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -246,6 +261,7 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    stopGifVif1Worker();
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -529,6 +545,8 @@ bool PS2Memory::isScratchpad(uint32_t address) const
 
 uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit)
 {
+    if (physAddr >= PS2_VU1_CODE_BASE && physAddr < 0x11010000u)
+        syncGifVif1();
     return const_cast<uint8_t *>(static_cast<const PS2Memory *>(this)->mapVuMemory(physAddr, size, offset, limit));
 }
 
@@ -823,6 +841,8 @@ uint64_t PS2Memory::read64(uint32_t address)
     // to avoid any side-effects from read32 handlers.
     if (isIoRegister(address))
     {
+        if (isGifVif1Register(address))
+            syncGifVif1();
         uint32_t lo = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
         uint32_t hi = m_ioRegisters.count(address + 4) ? m_ioRegisters[address + 4] : 0u;
         return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
@@ -963,6 +983,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
+            syncGifVif1(); // display changes must not overtake queued drawing
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             *reg = newVal;
@@ -1022,6 +1043,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
+            syncGifVif1(); // display changes must not overtake queued drawing
             *reg = value;
         }
         return;
@@ -1079,6 +1101,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
     if (!scratch && physAddr == 0x10005000u) // VIF1_FIFO
     {
+        syncGifVif1();
         alignas(16) uint8_t fifoData[16];
         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
         processVIF1Data(fifoData, sizeof(fifoData));
@@ -1124,6 +1147,8 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if (isGifVif1Register(address))
+        syncGifVif1();
     {
         static const bool traceSif = [] { const char *e = std::getenv("RT_RPC_TRACE"); return e && *e == '1'; }();
         if (traceSif && ((address >= 0x1000C000u && address < 0x1000D000u) || (address >= 0x1000F200u && address < 0x1000F300u)))
@@ -1684,7 +1709,13 @@ void PS2Memory::processPendingTransfers()
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
     }
 
-    for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
+    const bool async = gifVif1WorkerActive();
+    if (async)
+    {
+        for (const auto &p : m_pendingGifTransfers)
+            enqueueGifVif1(true, p);
+    }
+    for (size_t idx = 0; !async && idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
         if (!p.chainData.empty())
@@ -1807,6 +1838,12 @@ void PS2Memory::processPendingTransfers()
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
+    if (async)
+    {
+        for (const auto &p : m_pendingVif1Transfers)
+            enqueueGifVif1(false, p);
+        m_pendingVif1Transfers.clear();
+    }
     for (auto &p : m_pendingVif1Transfers)
     {
         if (!p.chainData.empty())
@@ -1864,8 +1901,8 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif1Transfers.clear();
 
-    if (m_gifArbiter)
-        m_gifArbiter->drain();
+    if (m_gifArbiter && !async)
+        drainGif();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
@@ -1910,6 +1947,197 @@ void PS2Memory::processPendingTransfers()
     }
 }
 
+void PS2Memory::enqueueGifVif1(bool gif, const PendingTransfer &transfer)
+{
+    GifVif1Job job;
+    job.gif = gif;
+    if (!transfer.chainData.empty())
+    {
+        job.data = transfer.chainData;
+    }
+    else if (transfer.qwc > 0)
+    {
+        uint32_t src = 0;
+        try
+        {
+            src = translateAddress(transfer.srcAddr);
+        }
+        catch (const std::exception &)
+        {
+            return;
+        }
+        const uint8_t *base = transfer.fromScratchpad ? m_scratchpad : m_rdram;
+        const uint32_t size = transfer.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        uint32_t bytesLeft = transfer.qwc * 16u;
+        job.data.reserve(bytesLeft);
+        while (bytesLeft > 0)
+        {
+            if (src >= size)
+                src = 0;
+            const uint32_t chunk = std::min(bytesLeft, size - src);
+            job.data.insert(job.data.end(), base + src, base + src + chunk);
+            bytesLeft -= chunk;
+            src += chunk;
+        }
+    }
+    if (job.data.empty())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
+        m_gifVif1Queue.push_back(std::move(job));
+        m_gifVif1Submitted.fetch_add(1, std::memory_order_release);
+    }
+    m_gifVif1WorkCv.notify_one();
+}
+
+void PS2Memory::gifVif1WorkerLoop()
+{
+    t_onGifVif1Worker = true;
+    for (;;)
+    {
+        GifVif1Job job;
+        {
+            std::unique_lock<std::mutex> lock(m_gifVif1Mutex);
+            m_gifVif1WorkCv.wait(lock, [&]
+                                 { return m_gifVif1Stop || !m_gifVif1Queue.empty(); });
+            if (m_gifVif1Queue.empty())
+                return;
+            job = std::move(m_gifVif1Queue.front());
+            m_gifVif1Queue.pop_front();
+        }
+        const auto busyStart = std::chrono::steady_clock::now();
+        const uint32_t size = static_cast<uint32_t>(job.data.size());
+        if (job.gif)
+        {
+            m_seenGifCopy = true;
+            m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+            submitGifPacket(GifPathId::Path3, job.data.data(), size, false);
+        }
+        else
+        {
+            processVIF1Data(job.data.data(), size);
+        }
+        if (m_gifArbiter)
+            drainGif();
+        handOffGsBatch();
+        m_gifVif1BusyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - busyStart).count()),
+                                  std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
+            m_gifVif1Completed.fetch_add(1, std::memory_order_release);
+        }
+        m_gifVif1IdleCv.notify_all();
+    }
+}
+
+void PS2Memory::startGifVif1Worker()
+{
+    if (m_gifVif1Worker.joinable())
+        return;
+    m_gifVif1Stop = false;
+    if (const char *e = std::getenv("RT_GS_THREAD"); !(e && *e == '0'))
+        m_gsThread = std::thread([this]
+                                 {
+#if defined(__APPLE__)
+                                     pthread_setname_np("GsThread");
+#endif
+                                     gsThreadLoop(); });
+    m_gifVif1Worker = std::thread([this]
+                                  {
+#if defined(__APPLE__)
+                                      pthread_setname_np("GifVif1Worker");
+#endif
+                                      gifVif1WorkerLoop(); });
+}
+
+void PS2Memory::stopGifVif1Worker()
+{
+    if (!m_gifVif1Worker.joinable())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
+        m_gifVif1Stop = true;
+    }
+    m_gifVif1WorkCv.notify_all();
+    m_gifVif1Worker.join();
+    if (m_gsThread.joinable())
+    {
+        m_gsWorkCv.notify_all();
+        m_gsThread.join();
+    }
+}
+
+void PS2Memory::syncGifVif1()
+{
+    if (t_onGifVif1Worker || !m_gifVif1Worker.joinable())
+        return;
+    const uint64_t target = m_gifVif1Submitted.load(std::memory_order_acquire);
+    if (m_gifVif1Completed.load(std::memory_order_acquire) >= target)
+        return;
+    m_gifVif1Stalls.fetch_add(1, std::memory_order_relaxed);
+    std::unique_lock<std::mutex> lock(m_gifVif1Mutex);
+    m_gifVif1IdleCv.wait(lock, [&]
+                         { return m_gifVif1Completed.load(std::memory_order_acquire) >= target; });
+    // The worker handed its GIF output to the GS thread before completing; wait for that too.
+    const uint64_t gsTarget = m_gsSubmitted.load(std::memory_order_acquire);
+    m_gsIdleCv.wait(lock, [&]
+                    { return m_gsCompleted.load(std::memory_order_acquire) >= gsTarget; });
+}
+
+void PS2Memory::drainGif()
+{
+    if (!m_gifArbiter)
+        return;
+    if (t_onGifVif1Worker && m_gsThread.joinable())
+    {
+        m_gifArbiter->drainInto(m_gsPending);
+        return;
+    }
+    m_gifArbiter->drain();
+}
+
+void PS2Memory::handOffGsBatch()
+{
+    if (m_gsPending.empty())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
+        m_gsQueue.push_back(std::move(m_gsPending));
+        m_gsSubmitted.fetch_add(1, std::memory_order_release);
+    }
+    m_gsPending.clear();
+    m_gsWorkCv.notify_one();
+}
+
+void PS2Memory::gsThreadLoop()
+{
+    for (;;)
+    {
+        std::vector<GifArbiterPacket> batch;
+        {
+            std::unique_lock<std::mutex> lock(m_gifVif1Mutex);
+            m_gsWorkCv.wait(lock, [&]
+                            { return m_gifVif1Stop || !m_gsQueue.empty(); });
+            if (m_gsQueue.empty())
+                return;
+            batch = std::move(m_gsQueue.front());
+            m_gsQueue.pop_front();
+        }
+        const auto busyStart = std::chrono::steady_clock::now();
+        m_gifArbiter->process(batch);
+        m_gsBusyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - busyStart).count()),
+                             std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
+            m_gsCompleted.fetch_add(1, std::memory_order_release);
+        }
+        m_gifVif1IdleCv.notify_all();
+        m_gsIdleCv.notify_all();
+    }
+}
+
 void PS2Memory::queueCompletedDmacCause(uint32_t cause)
 {
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
@@ -1945,7 +2173,7 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
     m_path3MaskedFifo.clear();
 
     if (m_gifArbiter && drainImmediately)
-        m_gifArbiter->drain();
+        drainGif();
 }
 
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
@@ -1969,7 +2197,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         m_gifPacketCallback(data, sizeBytes);
 
     if (m_gifArbiter && drainImmediately)
-        m_gifArbiter->drain();
+        drainGif();
 }
 
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
@@ -2285,6 +2513,8 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (isGifVif1Register(address))
+        syncGifVif1();
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))

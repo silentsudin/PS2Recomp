@@ -36,6 +36,10 @@ public:
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
     void drain();
+    // drain() in two halves: order the queued packets and move them (appended) to `out`, then hand
+    // them to the GS later, possibly from another thread.
+    void drainInto(std::vector<GifArbiterPacket> &out);
+    void process(const std::vector<GifArbiterPacket> &packets) const;
     bool empty() const { return m_queue.empty(); }
 
 private:
@@ -43,6 +47,7 @@ private:
     ProcessPathPacketFn m_processPathFn;
     std::vector<GifArbiterPacket> m_queue;
 
+    void sortQueue();
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);
 };

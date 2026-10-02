@@ -1,6 +1,7 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
@@ -32,11 +33,8 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     m_queue.push_back(std::move(pkt));
 }
 
-void GifArbiter::drain()
+void GifArbiter::sortQueue()
 {
-    if (!m_processFn && !m_processPathFn)
-        return;
-
     std::stable_sort(m_queue.begin(), m_queue.end(),
                      [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                      {
@@ -50,19 +48,42 @@ void GifArbiter::drain()
                          }
                          return pathPriority(a.pathId) < pathPriority(b.pathId);
                      });
+}
 
-    for (size_t i = 0; i < m_queue.size(); ++i)
+void GifArbiter::process(const std::vector<GifArbiterPacket> &packets) const
+{
+    for (const auto &pkt : packets)
     {
-        auto &pkt = m_queue[i];
-        if (!pkt.data.empty())
-        {
-            if (m_processPathFn)
-                m_processPathFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()), pkt.pathId);
-            else
-                m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
-        }
+        if (pkt.data.empty())
+            continue;
+        if (m_processPathFn)
+            m_processPathFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()), pkt.pathId);
+        else if (m_processFn)
+            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
     }
+}
+
+void GifArbiter::drain()
+{
+    if (!m_processFn && !m_processPathFn)
+        return;
+    sortQueue();
+    process(m_queue);
     m_queue.clear();
+}
+
+void GifArbiter::drainInto(std::vector<GifArbiterPacket> &out)
+{
+    if (m_queue.empty())
+        return;
+    sortQueue();
+    if (out.empty())
+        out.swap(m_queue);
+    else
+    {
+        std::move(m_queue.begin(), m_queue.end(), std::back_inserter(out));
+        m_queue.clear();
+    }
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

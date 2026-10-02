@@ -1887,6 +1887,7 @@ namespace
     {
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
+        runtime->memory().syncGifVif1(); // display changes must not overtake queued drawing
         auto &regs = runtime->memory().gs();
         regs.pmode = env.pmode;
         regs.smode2 = env.smode2;
