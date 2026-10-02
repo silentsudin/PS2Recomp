@@ -624,14 +624,43 @@ inline void VU1Interpreter::advanceOneCycle()
     m_state.cycles = m_cycle;
     // LSU commits become visible at the cycle boundary before PATH1 consumes
     // its next qword from VU memory.
-    commitReadyPipelines();
-    progressXgkick();
+    if (m_cycle >= m_nextCommitCycle)
+        commitReadyPipelines();
+    if (m_xgkick.active)
+        progressXgkick();
 }
 
+// Same result as calling advanceOneCycle() until targetCycle, but cycles before the next
+// pipeline commit are skipped in one step: nothing can change VU memory in between, so PATH1
+// just gets their transfer credit at once.
 inline void VU1Interpreter::advanceTo(uint64_t targetCycle)
 {
     while (m_cycle < targetCycle)
+    {
+        uint64_t stop = targetCycle;
+        if (m_nextCommitCycle > m_cycle && m_nextCommitCycle < stop)
+            stop = m_nextCommitCycle;
+        if (stop - m_cycle > 1u)
+        {
+            const uint64_t skip = stop - m_cycle - 1u;
+            m_cycle += skip;
+            m_state.cycles = m_cycle;
+            progressXgkick(static_cast<uint32_t>(skip));
+        }
         advanceOneCycle();
+    }
+}
+
+// Cycles until PATH1 next does something observable (reads a GIFtag or finishes).
+inline uint64_t VU1Interpreter::cyclesUntilXgkickEvent() const
+{
+    if (!m_xgkick.active)
+        return UINT64_MAX;
+    const uint64_t qwords = m_xgkick.currentTagEnd == 0u
+                                ? 1u
+                                : (m_xgkick.currentTagEnd > m_xgkick.copiedBytes ? (m_xgkick.currentTagEnd - m_xgkick.copiedBytes + 15u) / 16u : 1u);
+    const uint64_t need = qwords * 2u;
+    return need > m_xgkick.cycleCredit ? need - m_xgkick.cycleCredit : 1u;
 }
 
 inline void VU1Interpreter::commitReadyPipelines()
@@ -665,17 +694,7 @@ inline void VU1Interpreter::commitReadyPipelines()
     {
         if (!store.valid || store.readyCycle > m_cycle)
             continue;
-        if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
-        {
-            uint32_t oldWords[4]{};
-            std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
-            for (uint32_t component = 0; component < 4u; ++component)
-            {
-                if ((store.laneMask & laneForComponent(component)) != 0u)
-                    oldWords[component] = store.words[component];
-            }
-            std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
-        }
+        applyStore(store.address, store.words.data(), store.laneMask);
         store = {};
         --m_liveStore;
     }
@@ -735,12 +754,12 @@ inline void VU1Interpreter::commitReadyPipelines()
     m_nextCommitCycle = next;
 }
 
-inline void VU1Interpreter::progressXgkick()
+inline void VU1Interpreter::progressXgkick(uint32_t cycles)
 {
     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
         return;
 
-    ++m_xgkick.cycleCredit;
+    m_xgkick.cycleCredit += cycles;
     while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
     {
         m_xgkick.cycleCredit -= 2u;
@@ -929,8 +948,30 @@ inline void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statu
     m_fdiv.statusDi = statusDi & 0x30u;
 }
 
+inline void VU1Interpreter::applyStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
+{
+    if (m_activeVuData && address + 16u <= m_activeVuDataSize)
+    {
+        uint32_t oldWords[4]{};
+        std::memcpy(oldWords, m_activeVuData + address, sizeof(oldWords));
+        for (uint32_t component = 0; component < 4u; ++component)
+        {
+            if ((laneMask & laneForComponent(component)) != 0u)
+                oldWords[component] = words[component];
+        }
+        std::memcpy(m_activeVuData + address, oldWords, sizeof(oldWords));
+    }
+}
+
 inline void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
+    // Recompiled code: a store lands at the next cycle boundary, before anything (the next
+    // pair, PATH1) can read VU memory, so writing it now is equivalent.
+    if (m_lazyFlags)
+    {
+        applyStore(address, words, laneMask);
+        return;
+    }
     for (PendingStore &store : m_storePipeline)
     {
         if (!store.valid)
@@ -990,7 +1031,7 @@ inline void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         return;
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
-    m_xgkick = {};
+    m_xgkick.clear();
     m_xgkick.active = true;
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.

@@ -196,6 +196,16 @@ private:
         uint64_t issueCycle = 0;
         bool active = false;
         bool currentTagEop = false;
+
+        // Resets the transfer state. The packet buffer is left as is: only bytes this
+        // transfer has copied (< copiedBytes) are ever read, and clearing 64 KiB per
+        // XGKICK showed up in profiles.
+        void clear()
+        {
+            sourceAddress = totalBytes = copiedBytes = currentTagEnd = cycleCredit = 0;
+            issueCycle = 0;
+            active = currentTagEop = false;
+        }
     };
 
     static constexpr uint32_t kFmacLatency = 4u;
@@ -308,7 +318,9 @@ private:
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
-    void progressXgkick();
+    void progressXgkick(uint32_t cycles = 1u);
+    void applyStore(uint32_t address, const uint32_t words[4], uint8_t laneMask);
+    uint64_t cyclesUntilXgkickEvent() const;
     void finishXgkick();
     template <bool Immediate = false>
     bool executePair(const DecodedInstructionPair &decoded, uint8_t *vuData, uint32_t dataSize,

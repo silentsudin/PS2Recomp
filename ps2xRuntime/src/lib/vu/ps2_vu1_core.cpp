@@ -73,7 +73,7 @@ void VU1Interpreter::resetScheduler()
     m_accWritePipeline = {};
     m_liveFlag = m_liveEfu = m_liveStore = m_liveVf = m_liveVi = m_liveAcc = 0;
     m_nextCommitCycle = 0;
-    m_xgkick = {};
+    m_xgkick.clear();
     m_vfReady = {};
     m_viReady = {};
     m_accReady = {};
@@ -159,8 +159,17 @@ bool VU1Interpreter::pipelinesPending() const
 
 void VU1Interpreter::flushPipelines()
 {
+    // Jump from event to event (pipeline commit, PATH1 tag/end) instead of cycle by cycle;
+    // stops on the same cycle as the one-cycle loop would.
     while (pipelinesPending())
-        advanceOneCycle();
+    {
+        uint64_t step = cyclesUntilXgkickEvent();
+        if (m_nextCommitCycle != UINT64_MAX)
+            step = std::min<uint64_t>(step, m_nextCommitCycle > m_cycle ? m_nextCommitCycle - m_cycle : 1u);
+        if (step == UINT64_MAX)
+            step = 1u;
+        advanceTo(m_cycle + step);
+    }
 }
 
 uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
