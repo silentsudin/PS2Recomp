@@ -2528,6 +2528,7 @@ void PS2Runtime::run()
 #else
     const bool pacePresentationToVblank = std::getenv("RT_HOST_FPS") == nullptr;
 #endif
+    uint64_t pacedTick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -2564,7 +2565,6 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        const uint64_t presentedTick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
         BeginDrawing();
@@ -2597,9 +2597,10 @@ void PS2Runtime::run()
         if (pacePresentationToVblank)
         {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-            while (m_memory.gs().vsyncTick.load(std::memory_order_acquire) == presentedTick &&
+            while (m_memory.gs().vsyncTick.load(std::memory_order_acquire) == pacedTick &&
                    std::chrono::steady_clock::now() < deadline && !isStopRequested())
                 std::this_thread::sleep_for(std::chrono::microseconds(250));
+            pacedTick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
         }
 
         if (WindowShouldClose())

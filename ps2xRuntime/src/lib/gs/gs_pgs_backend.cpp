@@ -217,7 +217,18 @@ namespace ps2x::gs
                     priv.smode1.LC = 32;
 
                     ParallelGS::VSyncInfo vsync = {};
-                    vsync.phase = static_cast<uint32_t>(request.vsyncTick & 1u);
+                    // Field phase. The game draws each buffer for one field (with that field's
+                    // half-line offset) and flips it in during the previous field, so the phase is
+                    // the opposite of the vblank at which the buffer first appears. It is held
+                    // while the buffer stays on screen; deriving it from every vblank made the
+                    // picture shake by a line whenever a frame was shown twice.
+                    if (request.dispfb1 != m_phaseDispfb || !m_hasPhase)
+                    {
+                        m_phaseDispfb = request.dispfb1;
+                        m_heldPhase = static_cast<uint32_t>((request.vsyncTick & 1u) ^ 1u);
+                        m_hasPhase = true;
+                    }
+                    vsync.phase = m_heldPhase;
                     vsync.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
                     vsync.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
                     vsync.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
@@ -252,6 +263,9 @@ namespace ps2x::gs
 
         private:
             bool m_progressive = true;
+            uint64_t m_phaseDispfb = 0;
+            uint32_t m_heldPhase = 0;
+            bool m_hasPhase = false;
             Vulkan::Fence submitReadbackLocked(const Vulkan::Image &image)
             {
                 const uint32_t w = image.get_width();
