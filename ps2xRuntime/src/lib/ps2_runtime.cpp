@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "runtime/ps2_test_harness.h"
 #include "ps2_audio_out.h"
 #include "runtime/ps2_vu1_capture.h"
 #include "runtime/vu/ps2_vu1_native.h"
@@ -395,7 +396,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static int s_texHeight = FB_HEIGHT;
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    const bool capture = ps2_test::frameCaptureRequested();
+    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick || capture;
     if (needsLatch)
     {
         rt->gsUnsynced().latchHostPresentationFrame();
@@ -415,12 +417,16 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     uint32_t displayFbp = 0u;
     uint32_t sourceFbp = 0u;
     bool usedPreferredDisplaySource = false;
-    if (!rt->gsUnsynced().copyLatchedHostPresentationFrame(s_scratch,
-                                                   width,
-                                                   height,
-                                                   &displayFbp,
-                                                   &sourceFbp,
-                                                   &usedPreferredDisplaySource))
+    const bool haveFrame = rt->gsUnsynced().copyLatchedHostPresentationFrame(s_scratch,
+                                                                    width,
+                                                                    height,
+                                                                    &displayFbp,
+                                                                    &sourceFbp,
+                                                                    &usedPreferredDisplaySource);
+    if (capture)
+        ps2_test::deliverFrameCapture(haveFrame ? s_scratch : std::vector<uint8_t>{}, haveFrame ? width : 0u,
+                                      haveFrame ? height : 0u);
+    if (!haveFrame)
     {
         Image blank = GenImageColor(s_texWidth, s_texHeight, MAGENTA);
         UpdateTexture(tex, blank.data);
@@ -845,11 +851,16 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        // RT_HEADLESS=1 (test runs): hidden window, no audio device.
+        const bool headless = [] { const char *e = std::getenv("RT_HEADLESS"); return e && *e == '1'; }();
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE | (headless ? FLAG_WINDOW_HIDDEN : 0u));
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-        InitAudioDevice();
-        ps2AudioOutStart();
-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        if (!headless)
+        {
+            InitAudioDevice();
+            ps2AudioOutStart();
+        }
+        m_audioBackend.setAudioReady(!headless && IsAudioDeviceReady());
 #endif
 #if defined(PLATFORM_VITA)
         SetTargetFPS(60);
@@ -2479,6 +2490,7 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 
 void PS2Runtime::run()
 {
+    ps2_test::startServerIfRequested(*this);
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();

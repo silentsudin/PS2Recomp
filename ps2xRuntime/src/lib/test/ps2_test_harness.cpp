@@ -3,6 +3,12 @@
 #include "ps2_runtime.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <thread>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -58,6 +64,21 @@ namespace ps2_test
         bool g_recordedAny = false;
         uint64_t g_currentVblank = 0;
         FILE *g_hashLog = nullptr;
+
+        // Test server (lockstep).
+        std::condition_variable g_parkCv;   // game thread waits here while parked
+        std::condition_variable g_serverCv; // server waits for the game to park / a capture
+        bool g_serverEnabled = false;
+        bool g_attached = false;
+        uint64_t g_runTarget = 0;           // park when reaching this vblank
+        uint64_t g_parkedAt = UINT64_MAX;   // vblank the game is parked at, or UINT64_MAX
+        bool g_serverPadActive = false;
+        PadState g_serverPad;
+        // Frame capture hand-off with the render thread.
+        bool g_captureRequested = false;
+        bool g_captureDone = false;
+        std::vector<uint8_t> g_capture;
+        uint32_t g_captureWidth = 0, g_captureHeight = 0;
         uint64_t g_hashInterval = 60;
 
         uint64_t hashBytes(const uint8_t *data, size_t size, uint64_t h = 0xcbf29ce484222325ull)
@@ -166,6 +187,11 @@ namespace ps2_test
                 scripted = true;
                 return g_movie[g_movieIndex].vblank <= vblank ? g_movie[g_movieIndex].state : PadState{};
             }
+            if (g_serverPadActive)
+            {
+                scripted = true;
+                return g_serverPad;
+            }
             if (!g_script.empty())
             {
                 scripted = true;
@@ -234,8 +260,19 @@ namespace ps2_test
     {
         PadState state;
         {
-            std::lock_guard<std::mutex> lock(g_mutex);
+            std::unique_lock<std::mutex> lock(g_mutex);
             configureLocked();
+            g_currentVblank = vblank;
+            // Lockstep: with a test server, park at the target vblank until the client asks for
+            // more (or detaches). The game starts parked at vblank 1 so runs begin identically.
+            if (g_serverEnabled && (!g_attached || vblank >= g_runTarget))
+            {
+                g_parkedAt = vblank;
+                g_serverCv.notify_all();
+                g_parkCv.wait(lock, [&]
+                              { return (g_attached && vblank < g_runTarget) || !g_serverEnabled || runtime.isStopRequested(); });
+                g_parkedAt = UINT64_MAX;
+            }
             g_currentVblank = vblank;
             bool scripted = false;
             state = nextStateLocked(vblank, scripted);
@@ -260,5 +297,275 @@ namespace ps2_test
             std::fprintf(stderr, "[test] reached vblank %llu, stopping\n", static_cast<unsigned long long>(vblank));
             runtime.requestStop();
         }
+    }
+
+    namespace
+    {
+        std::string jsonValue(const std::string &line, const char *key)
+        {
+            const std::string needle = std::string("\"") + key + "\"";
+            size_t at = line.find(needle);
+            if (at == std::string::npos)
+                return {};
+            at = line.find(':', at + needle.size());
+            if (at == std::string::npos)
+                return {};
+            ++at;
+            while (at < line.size() && line[at] == ' ')
+                ++at;
+            if (at < line.size() && line[at] == '"')
+            {
+                const size_t end = line.find('"', at + 1);
+                return line.substr(at + 1, end == std::string::npos ? std::string::npos : end - at - 1);
+            }
+            size_t end = at;
+            while (end < line.size() && line[end] != ',' && line[end] != '}' && line[end] != ' ')
+                ++end;
+            return line.substr(at, end - at);
+        }
+
+        uint64_t jsonNumber(const std::string &line, const char *key, uint64_t fallback = 0)
+        {
+            const std::string v = jsonValue(line, key);
+            return v.empty() ? fallback : std::strtoull(v.c_str(), nullptr, 0);
+        }
+
+        std::string toHex(const uint8_t *data, size_t size)
+        {
+            static const char *digits = "0123456789abcdef";
+            std::string out(size * 2, '0');
+            for (size_t i = 0; i < size; ++i)
+            {
+                out[2 * i] = digits[data[i] >> 4];
+                out[2 * i + 1] = digits[data[i] & 15];
+            }
+            return out;
+        }
+
+        std::vector<uint8_t> fromHex(const std::string &hex)
+        {
+            std::vector<uint8_t> out(hex.size() / 2);
+            for (size_t i = 0; i < out.size(); ++i)
+                out[i] = static_cast<uint8_t>(std::strtoul(hex.substr(2 * i, 2).c_str(), nullptr, 16));
+            return out;
+        }
+
+        // Guest memory for read/write: returns a host pointer for [addr, addr+len) or nullptr.
+        uint8_t *memorySpace(PS2Runtime &runtime, const std::string &space, uint32_t addr, size_t len)
+        {
+            PS2Memory &memory = runtime.memory();
+            if (space == "ee" || space.empty())
+            {
+                const uint32_t phys = addr & 0x1FFFFFFFu;
+                return phys + len <= PS2_RAM_SIZE ? memory.getRDRAM() + phys : nullptr;
+            }
+            if (space == "spr")
+            {
+                const uint32_t off = addr & (PS2_SCRATCHPAD_SIZE - 1u);
+                return off + len <= PS2_SCRATCHPAD_SIZE ? memory.getScratchpad() + off : nullptr;
+            }
+            if (space == "vu1")
+            {
+                memory.syncGifVif1();
+                const uint32_t off = addr & (PS2_VU1_DATA_SIZE - 1u);
+                return off + len <= PS2_VU1_DATA_SIZE ? memory.getVU1Data() + off : nullptr;
+            }
+            return nullptr;
+        }
+
+        std::string handle(PS2Runtime &runtime, const std::string &line)
+        {
+            const std::string cmd = jsonValue(line, "cmd");
+            if (cmd == "run")
+            {
+                const uint64_t count = jsonNumber(line, "vblanks", 1);
+                std::unique_lock<std::mutex> lock(g_mutex);
+                if (g_parkedAt == UINT64_MAX)
+                    g_serverCv.wait(lock, [&] { return g_parkedAt != UINT64_MAX || runtime.isStopRequested(); });
+                const uint64_t from = g_parkedAt;
+                g_runTarget = from + count;
+                g_parkCv.notify_all();
+                g_serverCv.wait(lock, [&]
+                                { return (g_parkedAt != UINT64_MAX && g_parkedAt >= g_runTarget) || runtime.isStopRequested(); });
+                if (runtime.isStopRequested())
+                    return "{\"ok\":false,\"error\":\"stopped\"}";
+                return "{\"ok\":true,\"vblank\":" + std::to_string(g_parkedAt) + "}";
+            }
+            if (cmd == "pad")
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_serverPad = PadState{static_cast<uint16_t>(jsonNumber(line, "buttons", 0xFFFF)),
+                                       static_cast<uint8_t>(jsonNumber(line, "lx", 128)),
+                                       static_cast<uint8_t>(jsonNumber(line, "ly", 128)),
+                                       static_cast<uint8_t>(jsonNumber(line, "rx", 128)),
+                                       static_cast<uint8_t>(jsonNumber(line, "ry", 128))};
+                g_serverPadActive = true;
+                return "{\"ok\":true}";
+            }
+            if (cmd == "release_pad")
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_serverPadActive = false;
+                return "{\"ok\":true}";
+            }
+            if (cmd == "read" || cmd == "write")
+            {
+                const std::string space = jsonValue(line, "space");
+                const auto addr = static_cast<uint32_t>(jsonNumber(line, "addr"));
+                if (cmd == "read")
+                {
+                    const size_t len = jsonNumber(line, "len", 4);
+                    std::vector<uint8_t> buffer(len);
+                    bool ok = false;
+                    if (space == "iop")
+                        ok = runtime.readIopMemory(addr, buffer.data(), len);
+                    else if (const uint8_t *src = memorySpace(runtime, space, addr, len))
+                    {
+                        std::memcpy(buffer.data(), src, len);
+                        ok = true;
+                    }
+                    return ok ? "{\"ok\":true,\"data\":\"" + toHex(buffer.data(), len) + "\"}"
+                              : "{\"ok\":false,\"error\":\"bad address\"}";
+                }
+                const std::vector<uint8_t> data = fromHex(jsonValue(line, "data"));
+                bool ok = false;
+                if (space == "iop")
+                    ok = runtime.writeIopMemory(addr, data.data(), data.size());
+                else if (uint8_t *dst = memorySpace(runtime, space, addr, data.size()))
+                {
+                    std::memcpy(dst, data.data(), data.size());
+                    ok = true;
+                }
+                return ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"bad address\"}";
+            }
+            if (cmd == "frame")
+            {
+                const std::string path = jsonValue(line, "path");
+                runtime.memory().syncGifVif1();
+                std::unique_lock<std::mutex> lock(g_mutex);
+                g_captureDone = false;
+                g_captureRequested = true;
+                if (!g_serverCv.wait_for(lock, std::chrono::seconds(10), [] { return g_captureDone; }))
+                {
+                    g_captureRequested = false;
+                    return "{\"ok\":false,\"error\":\"no frame\"}";
+                }
+                if (FILE *f = std::fopen(path.c_str(), "wb"))
+                {
+                    std::fwrite(g_capture.data(), 1, g_capture.size(), f);
+                    std::fclose(f);
+                }
+                else
+                    return "{\"ok\":false,\"error\":\"cannot write\"}";
+                return "{\"ok\":true,\"width\":" + std::to_string(g_captureWidth) + ",\"height\":" +
+                       std::to_string(g_captureHeight) + "}";
+            }
+            if (cmd == "stats")
+            {
+                PS2Memory &memory = runtime.memory();
+                std::lock_guard<std::mutex> lock(g_mutex);
+                return "{\"ok\":true,\"vblank\":" + std::to_string(g_currentVblank) +
+                       ",\"flips\":" + std::to_string(memory.displayFlips()) +
+                       ",\"vif1_busy_ns\":" + std::to_string(memory.gifVif1BusyNanos()) +
+                       ",\"gs_busy_ns\":" + std::to_string(memory.gsThreadBusyNanos()) + "}";
+            }
+            if (cmd == "quit")
+            {
+                runtime.requestStop();
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_parkCv.notify_all();
+                return "{\"ok\":true}";
+            }
+            return "{\"ok\":false,\"error\":\"unknown command\"}";
+        }
+
+        void serveClient(PS2Runtime &runtime, int fd)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_attached = true;
+            }
+            std::string buffer;
+            char chunk[65536];
+            for (;;)
+            {
+                const ssize_t n = ::read(fd, chunk, sizeof(chunk));
+                if (n <= 0)
+                    break;
+                buffer.append(chunk, static_cast<size_t>(n));
+                size_t nl;
+                while ((nl = buffer.find('\n')) != std::string::npos)
+                {
+                    const std::string line = buffer.substr(0, nl);
+                    buffer.erase(0, nl + 1);
+                    const std::string reply = handle(runtime, line) + "\n";
+                    size_t sent = 0;
+                    while (sent < reply.size())
+                    {
+                        const ssize_t w = ::write(fd, reply.data() + sent, reply.size() - sent);
+                        if (w <= 0)
+                            break;
+                        sent += static_cast<size_t>(w);
+                    }
+                }
+            }
+            ::close(fd);
+            // Detached: let the game run freely until the next client.
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_attached = false;
+            g_serverEnabled = false;
+            g_serverPadActive = false;
+            g_parkCv.notify_all();
+        }
+    }
+
+    void startServerIfRequested(PS2Runtime &runtime)
+    {
+        const char *path = std::getenv("RT_TEST_SOCKET");
+        if (!path)
+            return;
+        const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+        ::unlink(path);
+        if (listener < 0 || ::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
+            ::listen(listener, 1) != 0)
+        {
+            std::fprintf(stderr, "[test] cannot listen on %s\n", path);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_serverEnabled = true;
+        }
+        std::fprintf(stderr, "[test] control socket %s\n", path);
+        std::thread([&runtime, listener]
+                    {
+                        // One client for the whole run; the game waits at vblank 1 until it attaches.
+                        const int fd = ::accept(listener, nullptr, nullptr);
+                        ::close(listener);
+                        if (fd >= 0)
+                            serveClient(runtime, fd); })
+            .detach();
+    }
+
+    bool frameCaptureRequested()
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        return g_captureRequested;
+    }
+
+    void deliverFrameCapture(const std::vector<uint8_t> &rgba, uint32_t width, uint32_t height)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_captureRequested)
+            return;
+        g_capture = rgba;
+        g_captureWidth = width;
+        g_captureHeight = height;
+        g_captureRequested = false;
+        g_captureDone = true;
+        g_serverCv.notify_all();
     }
 }

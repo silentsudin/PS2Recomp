@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 class PS2Runtime;
 
@@ -41,4 +42,23 @@ namespace ps2_test
 
     // Called on the EE thread at the start of every guest vblank.
     void onVblank(PS2Runtime &runtime, uint64_t vblank);
+
+    // RT_TEST_SOCKET=<path>: a JSON-lines control server on a Unix socket for test drivers (one
+    // client at a time). While a client is attached the game runs in lockstep: it parks at a vblank
+    // until the client asks for more, so reads, writes, pad changes and frame grabs happen between
+    // two exact vblanks. Commands (one JSON object per line, reply likewise):
+    //   {"cmd":"run","vblanks":N}            run N vblanks, reply {"vblank":v} when parked again
+    //   {"cmd":"pad","buttons":B,"lx":..}    pad state from the next vblank on (B active-low)
+    //   {"cmd":"release_pad"}                back to movie/script/live input
+    //   {"cmd":"read","space":"ee|spr|iop|vu1","addr":A,"len":L}  -> {"data":"<hex>"}
+    //   {"cmd":"write","space":...,"addr":A,"data":"<hex>"}
+    //   {"cmd":"frame","path":P}             the presented picture as raw RGBA -> {"width":W,"height":H}
+    //   {"cmd":"stats"}                      vblank, presented frames, thread load
+    //   {"cmd":"quit"}
+    void startServerIfRequested(PS2Runtime &runtime);
+
+    // Render thread: a frame grab is waiting (latch the picture even if the vblank is unchanged),
+    // and hands the latched picture (tightly packed RGBA) to it.
+    bool frameCaptureRequested();
+    void deliverFrameCapture(const std::vector<uint8_t> &rgba, uint32_t width, uint32_t height);
 }
