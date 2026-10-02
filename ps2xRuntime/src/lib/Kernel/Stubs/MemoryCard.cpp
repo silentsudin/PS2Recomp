@@ -151,6 +151,14 @@ namespace ps2_stubs
             return (parent / (leaf + "_slot" + std::to_string(port))).lexically_normal();
         }
 
+        // RT_MC_TRACE=1: log memory card path operations.
+        bool mcTraceEnabled()
+        {
+            static const bool enabled = []
+            { const char *e = std::getenv("RT_MC_TRACE"); return e && *e == '1'; }();
+            return enabled;
+        }
+
         void ensureMcRootExists(int32_t port)
         {
             std::error_code ec;
@@ -433,8 +441,11 @@ namespace ps2_stubs
         FILE *openMcHostFile(const std::filesystem::path &hostPath, uint32_t flags)
         {
             const uint32_t access = flags & PS2_FIO_O_RDWR;
-            const bool read = (access == PS2_FIO_O_RDONLY) || (access == PS2_FIO_O_RDWR);
-            const bool write = (access == PS2_FIO_O_WRONLY) || (access == PS2_FIO_O_RDWR);
+            // libmc games often open with O_CREAT alone (no access bits) just to create a file,
+            // then reopen it for writing. Treat that as read/write so the file gets created.
+            const bool createOnly = access == 0u && (flags & PS2_FIO_O_CREAT) != 0u;
+            const bool read = createOnly || (access == PS2_FIO_O_RDONLY) || (access == PS2_FIO_O_RDWR);
+            const bool write = createOnly || (access == PS2_FIO_O_WRONLY) || (access == PS2_FIO_O_RDWR);
             const bool append = (flags & PS2_FIO_O_APPEND) != 0u;
             const bool create = (flags & PS2_FIO_O_CREAT) != 0u;
             const bool truncate = (flags & PS2_FIO_O_TRUNC) != 0u;
@@ -975,6 +986,9 @@ namespace ps2_stubs
                 }
             }
 
+            if (mcTraceEnabled())
+                std::fprintf(stderr, "[MC] mkdir port=%d path=\"%s\" -> \"%s\" result=%d\n", port, path.c_str(),
+                             guestMcPathToHostPath(port, normalizeGuestMcPathLocked(port, path)).string().c_str(), result);
             setMcCommandResultLocked(kMcCmdMkdir, result);
         }
         setReturnS32(ctx, 0);
@@ -1038,6 +1052,9 @@ namespace ps2_stubs
                     }
                 }
             }
+            if (mcTraceEnabled())
+                std::fprintf(stderr, "[MC] open port=%d path=\"%s\" -> \"%s\" flags=0x%x result=%d\n", port, path.c_str(),
+                             guestMcPathToHostPath(port, normalizeGuestMcPathLocked(port, path)).string().c_str(), flags, result);
             setMcCommandResultLocked(kMcCmdOpen, result);
         }
         setReturnS32(ctx, 0);
