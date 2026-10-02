@@ -38,6 +38,7 @@ public:
         uint64_t m_token = 0;
     };
 
+    void submitAudio(const int16_t *interleavedStereo, size_t frames) override;
     explicit PS2IopHostAdapter(PS2Runtime &runtime);
     ~PS2IopHostAdapter() override;
 

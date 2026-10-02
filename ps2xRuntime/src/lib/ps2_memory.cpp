@@ -1124,6 +1124,11 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    {
+        static const bool traceSif = [] { const char *e = std::getenv("RT_RPC_TRACE"); return e && *e == '1'; }();
+        if (traceSif && ((address >= 0x1000C000u && address < 0x1000D000u) || (address >= 0x1000F200u && address < 0x1000F300u)))
+            std::fprintf(stderr, "[sif-reg] w %08x = %08x\n", address, value);
+    }
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))

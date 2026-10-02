@@ -10,6 +10,8 @@
 
 namespace ps2x::iop::detail
 {
+    class Spu2;
+
     class IopMemory
     {
     public:
@@ -68,9 +70,14 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+        // An SPU DMA (IRQ 0x24/0x28) finished: clear its CHCR start bit.
+        void completeSpuDma(int irq);
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+
+        // SPU2 registers (0x1F900000..) and SPU DMA channels 4/7 go to this device when set.
+        void attachSpu2(Spu2 *spu2) noexcept { m_spu2 = spu2; }
 
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
@@ -87,5 +94,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        Spu2 *m_spu2 = nullptr;
     };
 }

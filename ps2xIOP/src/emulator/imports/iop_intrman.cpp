@@ -1,4 +1,6 @@
 #include "iop_intrman.h"
+#include <cstdlib>
+#include <cstdio>
 
 #include "../core/iop_cpu.h"
 #include "../core/iop_memory.h"
@@ -94,6 +96,14 @@ namespace ps2x::iop::detail
 
     bool IopIntrman::dispatchInterrupt(int irq, IopGuestExecutor &executor) const
     {
+        static const bool trace = [] { const char *e = std::getenv("RT_SPU2_TRACE"); return e && *e == '2'; }();
+        if (trace)
+        {
+            const auto en = m_enabled.find(irq);
+            const auto h = m_handlers.find(irq);
+            std::fprintf(stderr, "[iop-intr] irq=0x%x enabled=%d handler=0x%x\n", irq, en != m_enabled.end() && en->second,
+                         h != m_handlers.end() ? h->second.function : 0u);
+        }
         const auto enabled = m_enabled.find(irq);
         if (enabled == m_enabled.end() || !enabled->second)
             return false;

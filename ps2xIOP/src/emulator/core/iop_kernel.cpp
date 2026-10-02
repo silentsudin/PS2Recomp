@@ -401,6 +401,12 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
+            if (it->second.current <= 0 && ordinal == 8 && m_currentThread == nullptr && m_waitWithoutThread)
+            {
+                for (int guard = 0; guard < 4096 && it->second.current <= 0; ++guard)
+                    if (!m_waitWithoutThread())
+                        break;
+            }
             if (it->second.current > 0)
             {
                 --it->second.current;
@@ -597,6 +603,12 @@ namespace ps2x::iop::detail
             }
             const uint32_t bits = cpu.gpr[5];
             const uint32_t mode = cpu.gpr[6];
+            if (ordinal == 10 && m_currentThread == nullptr && m_waitWithoutThread)
+            {
+                for (int guard = 0; guard < 4096 && !eventSatisfied(event->second, bits, mode); ++guard)
+                    if (!m_waitWithoutThread())
+                        break;
+            }
             if (eventSatisfied(event->second, bits, mode))
             {
                 if (cpu.gpr[7] != 0u)

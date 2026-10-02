@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "iop_cpu.h"
 
 #include <cstddef>
@@ -68,7 +70,14 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
 
+        // Called when WaitEventFlag/WaitSema must block but no IOP thread is current (an RPC server
+        // running synchronously on a temporary context): advance to the next pending event (DMA
+        // completion) and service it. Returns false when nothing is pending.
+        void setWaitWithoutThreadHook(std::function<bool()> hook) { m_waitWithoutThread = std::move(hook); }
+
     private:
+        std::function<bool()> m_waitWithoutThread;
+
         struct Semaphore
         {
             int id = 0;

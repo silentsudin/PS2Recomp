@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "ps2_audio_out.h"
 #include "runtime/ps2_vu1_capture.h"
 #include "runtime/vu/ps2_vu1_native.h"
 #include "ps2_log.h"
@@ -539,6 +540,7 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
+            ps2AudioOutStop();
             CloseAudioDevice();
             m_audioBackend.setAudioReady(false);
         }
@@ -793,6 +795,7 @@ bool PS2Runtime::initialize(const char *title)
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
+        ps2AudioOutStart();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
         SetTargetFPS(60);

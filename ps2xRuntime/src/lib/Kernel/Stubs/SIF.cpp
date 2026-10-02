@@ -658,6 +658,15 @@ namespace ps2_stubs
             }
         });
 
+        static const bool traceSif = [] { const char *e = std::getenv("RT_RPC_TRACE"); return e && *e == '1'; }();
+        if (traceSif)
+            for (uint32_t i = 0; i < count && i < 32u; ++i)
+            {
+                const uint32_t desc = dmatAddr + i * 16u;
+                std::fprintf(stderr, "[sif-dma] ee->iop src=0x%x dst=0x%x size=0x%x attr=0x%x ra=0x%x\n", READ32(desc + 0),
+                             READ32(desc + 4), READ32(desc + 8), READ32(desc + 12), getRegU32(ctx, 31));
+            }
+
         if (!dmatAddr || count == 0u || count > 32u)
         {
             setReturnS32(ctx, 0);

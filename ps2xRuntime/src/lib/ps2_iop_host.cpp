@@ -1,4 +1,5 @@
 #include "ps2_iop_host.h"
+#include "ps2_audio_out.h"
 
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
@@ -529,4 +530,9 @@ void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
         prefix = "[ps2xIOP:error]";
     }
     std::cerr << prefix << ' ' << message << std::endl;
+}
+
+void PS2IopHostAdapter::submitAudio(const int16_t *interleavedStereo, size_t frames)
+{
+    ps2AudioOutSubmit(interleavedStereo, frames);
 }

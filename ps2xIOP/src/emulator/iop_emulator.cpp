@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
 #include "core/iop_cpu.h"
@@ -15,6 +17,7 @@
 #include "imports/iop_sysmem.h"
 #include "imports/iop_timrman.h"
 #include "imports/iop_vblank.h"
+#include "spu2/iop_spu2.h"
 #include "iop_emulator_const.h"
 
 #include <algorithm>
@@ -116,6 +119,11 @@ namespace ps2x::iop::detail
         void reset()
         {
             memory.reset();
+            spu2.reset();
+            memory.attachSpu2(&spu2);
+            spu2.setAudioSink([this](const int16_t *samples, size_t frames) { host.submitAudio(samples, frames); });
+            kernel.setWaitWithoutThreadHook([this] { return advanceToNextPendingEvent(); });
+            spu2Cycles = 0;
             kernel.reset();
             modules.clear();
             imports.reset();
@@ -239,6 +247,21 @@ namespace ps2x::iop::detail
 
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
         {
+            // RT_IOP_IMPORT_TRACE=1: log each distinct library:ordinal the first time it's called,
+            // and every 2^k-th call after that (diagnostics).
+            static const int traceImports = [] { const char *e = std::getenv("RT_IOP_IMPORT_TRACE"); return e ? std::atoi(e) : 0; }();
+            if (traceImports)
+            {
+                static std::map<std::string, uint64_t> counts;
+                const std::string key = std::string(call.library) + ":" + std::to_string(call.ordinal);
+                const uint64_t n = ++counts[key];
+                const bool every = traceImports == 2 && (iequals(call.library, "libsd") || iequals(call.library, "cdvdman") ||
+                                                         iequals(call.library, "thsemap") || iequals(call.library, "thevent") ||
+                                                         iequals(call.library, "thbase"));
+                if (every || (n & (n - 1u)) == 0u)
+                    std::fprintf(stderr, "[iop-import] %s x%llu pc=0x%x ra=0x%x a0=0x%x a1=0x%x\n", key.c_str(),
+                                 static_cast<unsigned long long>(n), cpu.pc, cpu.gpr[31], cpu.gpr[4], cpu.gpr[5]);
+            }
             const uint32_t a0 = cpu.gpr[4];
             auto setV0 = [&](uint32_t value)
             {
@@ -481,6 +504,34 @@ namespace ps2x::iop::detail
         }
 
         // Not that good to use exception handling for control flow but will do for now
+        // See IopKernel::setWaitWithoutThreadHook.
+        // The blocked code isn't on an IOP thread, so it can't yield: make progress for it by
+        // completing the next pending DMA (its interrupt handler usually ends the wait).
+        bool advanceToNextPendingEvent()
+        {
+            if (pendingDmaInterrupts.empty() || servicingDmaInterrupts)
+                return false;
+            uint64_t next = UINT64_MAX;
+            for (const auto &[irq, cycle] : pendingDmaInterrupts)
+                next = std::min(next, cycle);
+            if (next > totalCycles)
+                totalCycles = next;
+            serviceSpu2();
+            servicePendingDmaInterrupts();
+            return true;
+        }
+
+        void serviceSpu2()
+        {
+            if (totalCycles > spu2Cycles)
+            {
+                spu2.advance(totalCycles - spu2Cycles);
+                spu2Cycles = totalCycles;
+            }
+            if (spu2.takeInterrupt())
+                (void)intrman.dispatchInterrupt(kSpu2Irq, *this);
+        }
+
         void servicePendingDmaInterrupts()
         {
             if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
@@ -502,7 +553,12 @@ namespace ps2x::iop::detail
             try
             {
                 for (const int irq : completed)
+                {
+                    memory.completeSpuDma(irq);
+                    if (irq == 0x24 || irq == 0x28)
+                        spu2.dmaComplete(irq == 0x28 ? 1 : 0);
                     (void)intrman.dispatchInterrupt(irq, *this);
+                }
             }
             catch (...)
             {
@@ -560,6 +616,7 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    serviceSpu2();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
@@ -684,6 +741,9 @@ namespace ps2x::iop::detail
         IopKernel kernel;
         IopCdvd cdvd;
         IopVblank vblank;
+        Spu2 spu2;
+        uint64_t spu2Cycles = 0;
+        static constexpr int kSpu2Irq = 9;
         IopRpcBridge rpc;
         IopSysclib sysclib;
         IopStdio stdio;

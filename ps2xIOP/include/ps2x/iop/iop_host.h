@@ -90,6 +90,12 @@ namespace ps2x::iop
             normalized = 0u;
             return false;
         }
+        // 48 kHz interleaved stereo produced by the emulated SPU2 (called on the IOP/EE thread).
+        virtual void submitAudio(const int16_t *interleavedStereo, size_t frames)
+        {
+            (void)interleavedStereo;
+            (void)frames;
+        }
         virtual uint32_t allocateIopHandle(IopHandleKind kind) = 0;
         virtual uint32_t allocateGuest(uint32_t size, uint32_t alignment) = 0;
         virtual void freeGuest(uint32_t address) = 0;
