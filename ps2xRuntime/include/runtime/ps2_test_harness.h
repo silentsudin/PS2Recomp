@@ -11,7 +11,7 @@
 //  - RT_EXIT_AT_VBLANK=<n> stops the game after n vblanks.
 //
 // Movie format (text): "# roadtrip-movie 1" header, then "<vblank> <buttons hex> <lx> <ly> <rx> <ry>"
-// whenever the state changes, and "# marker <vblank> <kind> <text>" lines. Buttons are active-low
+// whenever the state changes, "# marker <vblank> <kind> <text>" lines, and "# end <vblank>". Buttons are active-low
 // DualShock bits (0xFFFF = nothing pressed); sticks are 0..255 with 128 centred.
 
 #include <cstdint>
@@ -34,6 +34,10 @@ namespace ps2_test
     void addMarker(const std::string &kind, const std::string &text = {});
     // True while a movie or script drives the pad.
     bool inputScripted();
+
+    // Ends the movie being recorded ("# end <vblank>": after it, playback returns to live input;
+    // without it the last state holds). Called on exit.
+    void finishRecording();
 
     // Called on the EE thread at the start of every guest vblank.
     void onVblank(PS2Runtime &runtime, uint64_t vblank);

@@ -80,8 +80,14 @@ namespace ps2_test
             std::ifstream in(path);
             if (!in)
                 return false;
+            g_movieEnd = UINT64_MAX; // without an end line the last state holds forever
             for (std::string line; std::getline(in, line);)
             {
+                if (line.rfind("# end ", 0) == 0)
+                {
+                    g_movieEnd = std::strtoull(line.c_str() + 6, nullptr, 10);
+                    continue;
+                }
                 if (line.empty() || line[0] == '#')
                     continue;
                 std::istringstream fields(line);
@@ -93,7 +99,6 @@ namespace ps2_test
                 e.state = PadState{static_cast<uint16_t>(buttons), static_cast<uint8_t>(lx), static_cast<uint8_t>(ly),
                                    static_cast<uint8_t>(rx), static_cast<uint8_t>(ry)};
                 g_movie.push_back(e);
-                g_movieEnd = e.vblank;
             }
             return true;
         }
@@ -130,8 +135,8 @@ namespace ps2_test
             if (const char *play = std::getenv("RT_MOVIE_PLAY"))
             {
                 if (loadMovie(play))
-                    std::fprintf(stderr, "[movie] playing %s (%zu changes, ends at vblank %llu)\n", play, g_movie.size(),
-                                 static_cast<unsigned long long>(g_movieEnd));
+                    std::fprintf(stderr, "[movie] playing %s (%zu changes, ends at vblank %lld)\n", play, g_movie.size(),
+                                 g_movieEnd == UINT64_MAX ? -1ll : static_cast<long long>(g_movieEnd));
                 else
                     std::fprintf(stderr, "[movie] cannot read %s\n", play);
             }
@@ -154,7 +159,7 @@ namespace ps2_test
         PadState nextStateLocked(uint64_t vblank, bool &scripted)
         {
             scripted = false;
-            if (!g_movie.empty() && vblank <= g_movieEnd + 1u)
+            if (!g_movie.empty() && vblank < g_movieEnd)
             {
                 while (g_movieIndex + 1 < g_movie.size() && g_movie[g_movieIndex + 1].vblank <= vblank)
                     ++g_movieIndex;
@@ -190,6 +195,16 @@ namespace ps2_test
                          static_cast<unsigned long long>(iopHash));
             std::fflush(g_hashLog);
         }
+    }
+
+    void finishRecording()
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_record)
+            return;
+        std::fprintf(g_record, "# end %llu\n", static_cast<unsigned long long>(g_currentVblank));
+        std::fclose(g_record);
+        g_record = nullptr;
     }
 
     void setLiveInput(const PadState &state)
@@ -241,8 +256,7 @@ namespace ps2_test
         { const char *e = std::getenv("RT_EXIT_AT_VBLANK"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
         if (exitAt != 0u && vblank >= exitAt)
         {
-            if (g_record)
-                std::fflush(g_record);
+            finishRecording();
             std::fprintf(stderr, "[test] reached vblank %llu, stopping\n", static_cast<unsigned long long>(vblank));
             runtime.requestStop();
         }
