@@ -1,6 +1,7 @@
 #include "runtime/ps2_test_harness.h"
 
 #include "ps2_runtime.h"
+#include "Stubs/Pad.h"
 
 #include <algorithm>
 #include <cmath>
@@ -23,7 +24,8 @@
 
 namespace ps2_stubs
 {
-    void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
+    void setPadOverridePort(int port, uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry,
+                            bool connected);
 }
 
 namespace ps2_test
@@ -46,7 +48,16 @@ namespace ps2_test
         struct MovieEntry
         {
             uint64_t vblank;
+            int port;          // -1: both ports (version 1 movies)
             PadState state;
+            int connect = -1;  // 0/1: a "# connect" line (pad unplugged / plugged in) instead of a state
+        };
+
+        // What both pads read at one vblank.
+        struct Pads
+        {
+            PadState state[kPadPorts];
+            bool connected[kPadPorts] = {true, true};
         };
 
         struct ScriptPress
@@ -56,14 +67,16 @@ namespace ps2_test
         };
 
         std::mutex g_mutex;
-        PadState g_live;
+        PadState g_live[kPadPorts];
+        bool g_liveConnected[kPadPorts] = {true, true};
         bool g_configured = false;
         std::vector<MovieEntry> g_movie;
-        size_t g_movieIndex = 0;
+        size_t g_movieIndex = 0;  // entries before this one have been applied to g_moviePads
+        Pads g_moviePads;
         uint64_t g_movieEnd = 0;
         std::vector<ScriptPress> g_script;
         FILE *g_record = nullptr;
-        PadState g_lastRecorded;
+        Pads g_lastRecorded;
         bool g_recordedAny = false;
         uint64_t g_currentVblank = 0;
         FILE *g_hashLog = nullptr;
@@ -78,7 +91,10 @@ namespace ps2_test
         uint64_t g_runTarget = 0;           // park when reaching this vblank
         uint64_t g_parkedAt = UINT64_MAX;   // vblank the game is parked at, or UINT64_MAX
         bool g_serverPadActive = false;
-        PadState g_serverPad;
+        Pads g_serverPads;
+        // Vibration per port (any thread reads, the EE thread writes).
+        std::mutex g_actMutex;
+        ActuatorState g_actuators[kPadPorts];
         // Sound since the last "audio" query.
         uint64_t g_audioFrames = 0;
         double g_audioSquares = 0.0;
@@ -113,20 +129,46 @@ namespace ps2_test
             if (!in)
                 return false;
             g_movieEnd = UINT64_MAX; // without an end line the last state holds forever
+            int version = 1;
             for (std::string line; std::getline(in, line);)
             {
+                if (line.rfind("# roadtrip-movie ", 0) == 0)
+                {
+                    version = std::atoi(line.c_str() + 17);
+                    continue;
+                }
                 if (line.rfind("# end ", 0) == 0)
                 {
                     g_movieEnd = std::strtoull(line.c_str() + 6, nullptr, 10);
+                    continue;
+                }
+                if (line.rfind("# connect ", 0) == 0)
+                {
+                    MovieEntry e{};
+                    unsigned long long vblank = 0;
+                    int port = 0, connected = 1;
+                    if (std::sscanf(line.c_str() + 10, "%llu %d %d", &vblank, &port, &connected) == 3 && port >= 0 &&
+                        port < kPadPorts)
+                    {
+                        e.vblank = vblank;
+                        e.port = port;
+                        e.connect = connected ? 1 : 0;
+                        g_movie.push_back(e);
+                    }
                     continue;
                 }
                 if (line.empty() || line[0] == '#')
                     continue;
                 std::istringstream fields(line);
                 MovieEntry e{};
+                e.port = -1;
+                if (version >= 2)
+                    fields >> e.vblank >> e.port;
+                else
+                    fields >> e.vblank;
                 unsigned buttons = 0, lx = 128, ly = 128, rx = 128, ry = 128;
-                fields >> e.vblank >> std::hex >> buttons >> std::dec >> lx >> ly >> rx >> ry;
-                if (!fields)
+                fields >> std::hex >> buttons >> std::dec >> lx >> ly >> rx >> ry;
+                if (!fields || e.port >= kPadPorts)
                     continue;
                 e.state = PadState{static_cast<uint16_t>(buttons), static_cast<uint8_t>(lx), static_cast<uint8_t>(ly),
                                    static_cast<uint8_t>(rx), static_cast<uint8_t>(ry)};
@@ -178,7 +220,7 @@ namespace ps2_test
             {
                 g_record = std::fopen(record, "w");
                 if (g_record)
-                    std::fprintf(g_record, "# roadtrip-movie 1\n");
+                    std::fprintf(g_record, "# roadtrip-movie 2\n");
             }
             if (const char *hash = std::getenv("RT_STATE_HASH"))
             {
@@ -188,33 +230,55 @@ namespace ps2_test
             }
         }
 
-        PadState nextStateLocked(uint64_t vblank, bool &scripted)
+        Pads nextStateLocked(uint64_t vblank, bool &scripted)
         {
             scripted = false;
             if (!g_movie.empty() && vblank < g_movieEnd)
             {
-                while (g_movieIndex + 1 < g_movie.size() && g_movie[g_movieIndex + 1].vblank <= vblank)
-                    ++g_movieIndex;
+                while (g_movieIndex < g_movie.size() && g_movie[g_movieIndex].vblank <= vblank)
+                {
+                    const MovieEntry &e = g_movie[g_movieIndex++];
+                    for (int port = 0; port < kPadPorts; ++port)
+                    {
+                        if (e.port != -1 && e.port != port)
+                            continue;
+                        if (e.connect >= 0)
+                            g_moviePads.connected[port] = e.connect != 0;
+                        else
+                            g_moviePads.state[port] = e.state;
+                    }
+                }
                 scripted = true;
-                return g_movie[g_movieIndex].vblank <= vblank ? g_movie[g_movieIndex].state : PadState{};
+                return g_moviePads;
             }
             if (g_serverPadActive)
             {
                 scripted = true;
-                return g_serverPad;
+                return g_serverPads;
+            }
+            Pads pads;
+            for (int port = 0; port < kPadPorts; ++port)
+            {
+                pads.state[port] = g_live[port];
+                pads.connected[port] = g_liveConnected[port];
             }
             if (!g_script.empty())
             {
+                // A script presses buttons on both pads (as before per-port input); live input
+                // still works alongside it (e.g. to take over afterwards).
                 scripted = true;
                 PadState s{};
                 for (const auto &p : g_script)
                     if (vblank >= p.from && vblank < p.until)
                         s.buttons &= static_cast<uint16_t>(~p.mask);
-                // Live input still works alongside a script (e.g. to take over afterwards).
-                s.buttons &= g_live.buttons;
-                return s;
+                for (int port = 0; port < kPadPorts; ++port)
+                {
+                    const uint16_t live = g_live[port].buttons;
+                    pads.state[port] = s;
+                    pads.state[port].buttons &= live;
+                }
             }
-            return g_live;
+            return pads;
         }
 
         void logStateHash(PS2Runtime &runtime, uint64_t vblank)
@@ -244,10 +308,50 @@ namespace ps2_test
         g_record = nullptr;
     }
 
-    void setLiveInput(const PadState &state)
+    void setLiveInput(const PadState &state) { setLiveInput(0, state); }
+
+    void setLiveInput(int port, const PadState &state)
+    {
+        if (port < 0 || port >= kPadPorts)
+            return;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_live[port] = state;
+    }
+
+    void setLiveConnected(int port, bool connected)
+    {
+        if (port < 0 || port >= kPadPorts)
+            return;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_liveConnected[port] = connected;
+    }
+
+    ActuatorState actuatorState(int port)
+    {
+        if (port < 0 || port >= kPadPorts)
+            return {};
+        std::lock_guard<std::mutex> lock(g_actMutex);
+        return g_actuators[port];
+    }
+
+    void onActuator(int port, uint8_t small, uint8_t large)
+    {
+        if (port < 0 || port >= kPadPorts)
+            return;
+        std::lock_guard<std::mutex> lock(g_actMutex);
+        ActuatorState &a = g_actuators[port];
+        if (a.small != small || a.large != large)
+        {
+            a.small = small;
+            a.large = large;
+            ++a.changes;
+        }
+    }
+
+    uint64_t currentVblank()
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_live = state;
+        return g_currentVblank;
     }
 
     void addMarker(const std::string &kind, const std::string &text)
@@ -269,7 +373,7 @@ namespace ps2_test
 
     void onVblank(PS2Runtime &runtime, uint64_t vblank)
     {
-        PadState state;
+        Pads pads;
         {
             std::unique_lock<std::mutex> lock(g_mutex);
             configureLocked();
@@ -286,17 +390,29 @@ namespace ps2_test
             }
             g_currentVblank = vblank;
             bool scripted = false;
-            state = nextStateLocked(vblank, scripted);
-            if (g_record && (!g_recordedAny || !(state == g_lastRecorded)))
+            pads = nextStateLocked(vblank, scripted);
+            if (g_record)
             {
-                std::fprintf(g_record, "%llu %04x %u %u %u %u\n", static_cast<unsigned long long>(vblank), state.buttons,
-                             state.lx, state.ly, state.rx, state.ry);
+                const auto at = static_cast<unsigned long long>(vblank);
+                for (int port = 0; port < kPadPorts; ++port)
+                {
+                    if (!g_recordedAny || pads.connected[port] != g_lastRecorded.connected[port])
+                        std::fprintf(g_record, "# connect %llu %d %d\n", at, port, pads.connected[port] ? 1 : 0);
+                    const PadState &st = pads.state[port];
+                    if (!g_recordedAny || !(st == g_lastRecorded.state[port]))
+                        std::fprintf(g_record, "%llu %d %04x %u %u %u %u\n", at, port, st.buttons, st.lx, st.ly, st.rx,
+                                     st.ry);
+                }
                 std::fflush(g_record);
-                g_lastRecorded = state;
+                g_lastRecorded = pads;
                 g_recordedAny = true;
             }
         }
-        ps2_stubs::setPadOverrideState(state.buttons, state.lx, state.ly, state.rx, state.ry);
+        for (int port = 0; port < kPadPorts; ++port)
+        {
+            const PadState &st = pads.state[port];
+            ps2_stubs::setPadOverridePort(port, st.buttons, st.lx, st.ly, st.rx, st.ry, pads.connected[port]);
+        }
         if (g_hashLog && vblank % g_hashInterval == 0u)
             logStateHash(runtime, vblank);
         // RT_EXIT_AT_VBLANK=<n>: stop the game after n guest vblanks (unattended runs).
@@ -384,6 +500,29 @@ namespace ps2_test
             return nullptr;
         }
 
+        // A "pad"/"step" command's pad fields: without "port" both pads get the state (as before
+        // per-port input), with it only that one; "connected" plugs/unplugs it.
+        void applyServerPadLocked(const std::string &line)
+        {
+            const PadState state{static_cast<uint16_t>(jsonNumber(line, "buttons", 0xFFFF)),
+                                 static_cast<uint8_t>(jsonNumber(line, "lx", 128)),
+                                 static_cast<uint8_t>(jsonNumber(line, "ly", 128)),
+                                 static_cast<uint8_t>(jsonNumber(line, "rx", 128)),
+                                 static_cast<uint8_t>(jsonNumber(line, "ry", 128))};
+            const std::string portText = jsonValue(line, "port");
+            const std::string connectedText = jsonValue(line, "connected");
+            for (int port = 0; port < kPadPorts; ++port)
+            {
+                if (!portText.empty() && std::atoi(portText.c_str()) != port)
+                    continue;
+                if (!jsonValue(line, "buttons").empty() || jsonValue(line, "cmd") == "pad")
+                    g_serverPads.state[port] = state;
+                if (!connectedText.empty())
+                    g_serverPads.connected[port] = std::atoi(connectedText.c_str()) != 0;
+            }
+            g_serverPadActive = true;
+        }
+
         std::string handle(PS2Runtime &runtime, const std::string &line)
         {
             const std::string cmd = jsonValue(line, "cmd");
@@ -405,19 +544,41 @@ namespace ps2_test
             if (cmd == "pad")
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
-                g_serverPad = PadState{static_cast<uint16_t>(jsonNumber(line, "buttons", 0xFFFF)),
-                                       static_cast<uint8_t>(jsonNumber(line, "lx", 128)),
-                                       static_cast<uint8_t>(jsonNumber(line, "ly", 128)),
-                                       static_cast<uint8_t>(jsonNumber(line, "rx", 128)),
-                                       static_cast<uint8_t>(jsonNumber(line, "ry", 128))};
-                g_serverPadActive = true;
+                applyServerPadLocked(line);
                 return "{\"ok\":true}";
             }
             if (cmd == "release_pad")
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_serverPadActive = false;
+                g_serverPads = Pads{};
                 return "{\"ok\":true}";
+            }
+            if (cmd == "actuators")
+            {
+                std::string reply = "{\"ok\":true,\"ports\":[";
+                for (int port = 0; port < kPadPorts; ++port)
+                {
+                    const ActuatorState a = actuatorState(port);
+                    reply += std::string(port ? "," : "") + "{\"small\":" + std::to_string(a.small) +
+                             ",\"large\":" + std::to_string(a.large) + ",\"changes\":" + std::to_string(a.changes) + "}";
+                }
+                return reply + "]}";
+            }
+            if (cmd == "pad_info")
+            {
+                const ps2_stubs::PadDebugSnapshot snap = ps2_stubs::getPadDebugSnapshot();
+                std::string reply = "{\"ok\":true,\"ports\":[";
+                for (int port = 0; port < kPadPorts; ++port)
+                {
+                    const auto &p = snap.ports[port][0];
+                    reply += std::string(port ? "," : "") + "{\"open\":" + (p.open ? "true" : "false") +
+                             ",\"analog\":" + (p.analogMode ? "true" : "false") +
+                             ",\"connected\":" + (p.connected ? "true" : "false") +
+                             ",\"reads\":" + std::to_string(p.readCount) +
+                             ",\"align\":\"" + toHex(p.actAlign, sizeof(p.actAlign)) + "\"}";
+                }
+                return reply + "]}";
             }
             if (cmd == "read" || cmd == "write")
             {
@@ -488,15 +649,10 @@ namespace ps2_test
             if (cmd == "step")
             {
                 // Pad (optional) + run + reads, one round trip for driving bots.
-                if (!jsonValue(line, "buttons").empty())
+                if (!jsonValue(line, "buttons").empty() || !jsonValue(line, "connected").empty())
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
-                    g_serverPad = PadState{static_cast<uint16_t>(jsonNumber(line, "buttons", 0xFFFF)),
-                                           static_cast<uint8_t>(jsonNumber(line, "lx", 128)),
-                                           static_cast<uint8_t>(jsonNumber(line, "ly", 128)),
-                                           static_cast<uint8_t>(jsonNumber(line, "rx", 128)),
-                                           static_cast<uint8_t>(jsonNumber(line, "ry", 128))};
-                    g_serverPadActive = true;
+                    applyServerPadLocked(line);
                 }
                 const std::string ran = handle(runtime, "{\"cmd\":\"run\",\"vblanks\":" +
                                                             std::to_string(jsonNumber(line, "vblanks", 1)) + "}");

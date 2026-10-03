@@ -10,9 +10,11 @@
 //    (default 60), to compare runs for determinism.
 //  - RT_EXIT_AT_VBLANK=<n> stops the game after n vblanks.
 //
-// Movie format (text): "# roadtrip-movie 1" header, then "<vblank> <buttons hex> <lx> <ly> <rx> <ry>"
-// whenever the state changes, "# marker <vblank> <kind> <text>" lines, and "# end <vblank>". Buttons are active-low
-// DualShock bits (0xFFFF = nothing pressed); sticks are 0..255 with 128 centred.
+// Movie format (text), version 2: "# roadtrip-movie 2" header, then "<vblank> <port> <buttons hex> <lx> <ly>
+// <rx> <ry>" whenever a port's state changes, "# connect <vblank> <port> 0|1" when a pad is unplugged or
+// plugged in, "# marker <vblank> <kind> <text>" lines, and "# end <vblank>". Version 1 movies (no port
+// column) drive both ports with the same state. Buttons are active-low DualShock bits (0xFFFF = nothing
+// pressed); sticks are 0..255 with 128 centred.
 
 #include <cstdint>
 #include <string>
@@ -29,8 +31,29 @@ namespace ps2_test
         bool operator==(const PadState &) const = default;
     };
 
-    // Host input from the keyboard/gamepad (any thread). Used when nothing else drives the pad.
+    constexpr int kPadPorts = 2;
+
+    // Host input from the keyboard/gamepads (any thread). Used when nothing else drives the pads
+    // (and never while a test client is attached). The one-argument form is port 0.
     void setLiveInput(const PadState &state);
+    void setLiveInput(int port, const PadState &state);
+    // Whether a pad is plugged into the port (port 0 defaults to yes, port 1 to no once the host
+    // reports anything for it; until then both are connected, as before).
+    void setLiveConnected(int port, bool connected);
+
+    // Vibration: the motor speeds the game last set for a port (small: 0/1, large: 0..255),
+    // for the host to poll (any thread). `changes` counts updates that changed the values.
+    struct ActuatorState
+    {
+        uint8_t small = 0, large = 0;
+        uint64_t changes = 0;
+    };
+    ActuatorState actuatorState(int port);
+    // Called by the pad emulation (EE thread) whenever the game sends motor values.
+    void onActuator(int port, uint8_t small, uint8_t large);
+
+    // The vblank the game is at (for logs).
+    uint64_t currentVblank();
     // Adds a marker to the movie being recorded (any thread).
     void addMarker(const std::string &kind, const std::string &text = {});
     // True while a movie or script drives the pad.
@@ -57,15 +80,18 @@ namespace ps2_test
     // until the client asks for more, so reads, writes, pad changes and frame grabs happen between
     // two exact vblanks. Commands (one JSON object per line, reply likewise):
     //   {"cmd":"run","vblanks":N}            run N vblanks, reply {"vblank":v} when parked again
-    //   {"cmd":"pad","buttons":B,"lx":..}    pad state from the next vblank on (B active-low)
-    //   {"cmd":"release_pad"}                back to movie/script/live input
+    //   {"cmd":"pad","buttons":B,"lx":..}    pad state from the next vblank on (B active-low); with
+    //                                        "port":0|1 only that port (else both), "connected":0|1
+    //   {"cmd":"release_pad"}                back to movie/script/live input (both ports)
+    //   {"cmd":"actuators"}                  motor values per port: small, large, changes
+    //   {"cmd":"pad_info"}                   per port: open, analog, connected, align
     //   {"cmd":"read","space":"ee|spr|iop|vu1","addr":A,"len":L}  -> {"data":"<hex>"}
     //   {"cmd":"write","space":...,"addr":A,"data":"<hex>"}
     //   {"cmd":"frame","path":P}             the presented picture as raw RGBA -> {"width":W,"height":H}
     //   {"cmd":"stats"}                      vblank, presented frames, thread load
     //   {"cmd":"marker","kind":K,"text":T}   adds a marker to the movie being recorded
     //   {"cmd":"render","on":0|1}            rendering on/off (see renderingEnabled)
-    //   {"cmd":"step","vblanks":N,"buttons":B,"lx":..,"reads":"ee:ADDR:LEN,..."}
+    //   {"cmd":"step","vblanks":N,"buttons":B,"lx":..,"port":P,"reads":"ee:ADDR:LEN,..."}
     //                                        pad + run + reads in one round trip -> {"vblank","data":[hex,..]}
     //   {"cmd":"audio"}                      sound since the last query: frames, rms, peak, hash,
     //                                        lr_diff (mean |left - right|)

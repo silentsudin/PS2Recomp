@@ -61,6 +61,10 @@ namespace ps2_stubs
         uint8_t lx = 0x80u;
         uint8_t ly = 0x80u;
         uint8_t lastData[kPadDebugDataSize]{};
+        bool connected = true;
+        uint8_t actAlign[6]{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        uint8_t smallMotor = 0u;
+        uint8_t largeMotor = 0u;
     };
 
     struct PadDebugSnapshot
@@ -76,6 +80,12 @@ namespace ps2_stubs
     };
 
     PadDebugSnapshot getPadDebugSnapshot();
+    // Host input for both ports at once (the same state on each, as before per-port input).
     void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
+    // Host input for one port. A disconnected port reads as an unplugged pad (scePadGetState
+    // DISCONNECTED, scePadRead fails); plugging it back in goes through FINDPAD and returns the
+    // pad in digital mode, as a real DualShock does.
+    void setPadOverridePort(int port, uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry,
+                            bool connected);
     void clearPadOverrideState();
 }

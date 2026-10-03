@@ -1,5 +1,8 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/ps2_test_harness.h"
+
+#include <cstdarg>
 
 namespace ps2_stubs
 {
@@ -11,6 +14,7 @@ namespace ps2_stubs
         constexpr int32_t kPadTypeDigital = 4;
         constexpr int32_t kPadTypeDualShock = 7;
         constexpr int32_t kPadStateDisconnected = 0;
+        constexpr int32_t kPadStateFindPad = 1;
         constexpr int32_t kPadStateExecCmd = 5;
         constexpr int32_t kPadStateStable = 6;
         constexpr size_t kPadPortCount = 2;
@@ -58,14 +62,47 @@ namespace ps2_stubs
             uint8_t lastData[32]{};
             uint32_t readCount = 0u;
             uint32_t lastReadDataAddr = 0u;
+            // Actuators: scePadSetActAlign says which byte of the scePadSetActDirect data drives
+            // which motor (0 = small, on/off; 1 = large, 0..255; 0xFF = unused).
+            uint8_t actAlign[6]{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+            uint8_t smallMotor = 0u;
+            uint8_t largeMotor = 0u;
         };
 
         std::mutex g_padOverrideMutex;
         std::mutex g_padStateMutex;
         bool g_padOverrideEnabled = false;
-        PadInputState g_padOverrideState{};
+        PadInputState g_padOverrideState[kPadPortCount]{};
+        bool g_padConnected[kPadPortCount]{true, true};
         PadPortState g_padPorts[kPadPortCount]{};
         int g_padReadLogCount = 0;
+
+        // RT_PAD_TRACE=1: logs the game's pad commands (mode, actuators, state changes).
+        bool padTrace()
+        {
+            static const bool on = []
+            { const char *e = std::getenv("RT_PAD_TRACE"); return e && *e && *e != '0'; }();
+            return on;
+        }
+
+        void tracePad(const char *what, int port, const char *fmt = "", ...)
+        {
+            if (!padTrace())
+                return;
+            char detail[160] = "";
+            va_list args;
+            va_start(args, fmt);
+            std::vsnprintf(detail, sizeof(detail), fmt, args);
+            va_end(args);
+            std::fprintf(stderr, "[pad] vblank %llu port %d %s %s\n",
+                         static_cast<unsigned long long>(ps2_test::currentVblank()), port, what, detail);
+        }
+
+        bool portConnected(int port)
+        {
+            std::lock_guard<std::mutex> lock(g_padOverrideMutex);
+            return !g_padOverrideEnabled || port < 0 || port >= static_cast<int>(kPadPortCount) || g_padConnected[port];
+        }
 
         uint8_t axisToByte(float axis)
         {
@@ -288,9 +325,11 @@ namespace ps2_stubs
             bool useOverride = false;
             {
                 std::lock_guard<std::mutex> lock(g_padOverrideMutex);
-                if (g_padOverrideEnabled)
+                if (g_padOverrideEnabled && port >= 0 && port < static_cast<int>(kPadPortCount))
                 {
-                    state = g_padOverrideState;
+                    if (!g_padConnected[port])
+                        return false; // nothing plugged into this port
+                    state = g_padOverrideState[port];
                     useOverride = true;
                 }
             }
@@ -363,6 +402,7 @@ namespace ps2_stubs
             return;
         }
 
+        tracePad("EnterPressMode", static_cast<int>(getRegU32(ctx, 4)));
         portState->pressureEnabled = true;
         portState->reqState = 0u;
         queueExecCmdStateLocked(*portState);
@@ -458,7 +498,12 @@ namespace ps2_stubs
         PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
                                                            static_cast<int>(getRegU32(ctx, 5)));
         int32_t state = kPadStateDisconnected;
-        if (portState && portState->open)
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        if (portState && portState->open && !portConnected(port))
+        {
+            state = kPadStateDisconnected;
+        }
+        else if (portState && portState->open)
         {
             if (portState->transientState != 0u)
             {
@@ -468,6 +513,15 @@ namespace ps2_stubs
             else
             {
                 state = kPadStateStable;
+            }
+        }
+        if (padTrace() && portState)
+        {
+            static int32_t lastState[kPadPortCount] = {-1, -1};
+            if (port >= 0 && port < static_cast<int>(kPadPortCount) && lastState[port] != state)
+            {
+                lastState[port] = state;
+                tracePad("GetState", port, "%d", state);
             }
         }
         setReturnS32(ctx, state);
@@ -485,6 +539,7 @@ namespace ps2_stubs
             return;
         }
 
+        tracePad("InfoAct", static_cast<int>(getRegU32(ctx, 4)), "act %d", act);
         if (act < 0)
         {
             setReturnS32(ctx, 2); // small + large motors
@@ -616,6 +671,8 @@ namespace ps2_stubs
         portState->dmaAddr = dmaAddr;
         portState->reqState = 0u;
         portState->transientState = 0u;
+        std::memset(portState->actAlign, 0xFF, sizeof(portState->actAlign));
+        portState->smallMotor = portState->largeMotor = 0u;
         if (dmaStr)
         {
             ps2TraceGuestRangeWrite(rdram, dmaAddr, 32u, "scePadPortOpen", ctx);
@@ -639,6 +696,7 @@ namespace ps2_stubs
         ps2TraceGuestRangeWrite(rdram, dataAddr, 32u, "scePadRead", ctx);
         if (!readPadPortData(port, slot, runtime, data, dataAddr))
         {
+            data[0] = 0xFFu; // no valid data (as libpad reports a missing pad)
             setReturnS32(ctx, 0);
             return;
         }
@@ -687,15 +745,55 @@ namespace ps2_stubs
 
     void scePadSetActAlign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        const uint8_t *align = getConstMemPtr(rdram, getRegU32(ctx, 6));
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
+        if (!portState || !portState->open || !align)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::memcpy(portState->actAlign, align, sizeof(portState->actAlign));
+        tracePad("SetActAlign", port, "%02x %02x %02x %02x %02x %02x", align[0], align[1], align[2], align[3],
+                 align[4], align[5]);
+        portState->reqState = 0u;
+        queueExecCmdStateLocked(*portState);
         setReturnS32(ctx, 1);
     }
 
     void scePadSetActDirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        const uint8_t *data = getConstMemPtr(rdram, getRegU32(ctx, 6));
+        uint8_t small = 0u, large = 0u;
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_padStateMutex);
+            PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
+            if (!portState || !portState->open || !data)
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+            // Each data byte goes to the motor its align slot names: only 6 bytes are read, so a
+            // port's buffer may overlap the next one's without leaking into this pad.
+            for (int i = 0; i < 6; ++i)
+            {
+                if (portState->actAlign[i] == 0u)
+                    small = data[i] != 0u ? 1u : 0u;
+                else if (portState->actAlign[i] == 1u)
+                    large = data[i];
+            }
+            changed = small != portState->smallMotor || large != portState->largeMotor;
+            portState->smallMotor = small;
+            portState->largeMotor = large;
+        }
+        if (changed)
+            tracePad("SetActDirect", port, "small %u large %u", small, large);
+        ps2_test::onActuator(port, small, large);
         setReturnS32(ctx, 1);
     }
 
@@ -729,6 +827,7 @@ namespace ps2_stubs
         }
 
         portState->analogMode = (getRegU32(ctx, 6) != 0u);
+        tracePad("SetMainMode", static_cast<int>(getRegU32(ctx, 4)), "%u lock %u", getRegU32(ctx, 6), getRegU32(ctx, 7));
         portState->reqState = 0u;
         queueExecCmdStateLocked(*portState);
         setReturnS32(ctx, 1);
@@ -801,14 +900,17 @@ namespace ps2_stubs
     PadDebugSnapshot getPadDebugSnapshot()
     {
         PadDebugSnapshot snapshot{};
+        bool connected[kPadPortCount]{true, true};
         {
             std::lock_guard<std::mutex> lock(g_padOverrideMutex);
             snapshot.overrideEnabled = g_padOverrideEnabled;
-            snapshot.overrideButtons = g_padOverrideState.buttons;
-            snapshot.overrideRx = g_padOverrideState.rx;
-            snapshot.overrideRy = g_padOverrideState.ry;
-            snapshot.overrideLx = g_padOverrideState.lx;
-            snapshot.overrideLy = g_padOverrideState.ly;
+            snapshot.overrideButtons = g_padOverrideState[0].buttons;
+            snapshot.overrideRx = g_padOverrideState[0].rx;
+            snapshot.overrideRy = g_padOverrideState[0].ry;
+            snapshot.overrideLx = g_padOverrideState[0].lx;
+            snapshot.overrideLy = g_padOverrideState[0].ly;
+            for (size_t port = 0; port < kPadPortCount; ++port)
+                connected[port] = !g_padOverrideEnabled || g_padConnected[port];
         }
 
         {
@@ -837,6 +939,10 @@ namespace ps2_stubs
                     dst.lx = src.lastInput.lx;
                     dst.ly = src.lastInput.ly;
                     std::memcpy(dst.lastData, src.lastData, sizeof(dst.lastData));
+                    dst.connected = connected[port];
+                    std::memcpy(dst.actAlign, src.actAlign, sizeof(dst.actAlign));
+                    dst.smallMotor = src.smallMotor;
+                    dst.largeMotor = src.largeMotor;
                 }
             }
         }
@@ -845,19 +951,50 @@ namespace ps2_stubs
 
     void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry)
     {
-        std::lock_guard<std::mutex> lock(g_padOverrideMutex);
-        g_padOverrideEnabled = true;
-        g_padOverrideState.buttons = buttons;
-        g_padOverrideState.lx = lx;
-        g_padOverrideState.ly = ly;
-        g_padOverrideState.rx = rx;
-        g_padOverrideState.ry = ry;
+        for (int port = 0; port < static_cast<int>(kPadPortCount); ++port)
+            setPadOverridePort(port, buttons, lx, ly, rx, ry, true);
+    }
+
+    void setPadOverridePort(int port, uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, bool connected)
+    {
+        if (port < 0 || port >= static_cast<int>(kPadPortCount))
+            return;
+        bool plugged = false, unplugged = false;
+        {
+            std::lock_guard<std::mutex> lock(g_padOverrideMutex);
+            g_padOverrideEnabled = true;
+            PadInputState &state = g_padOverrideState[port];
+            state.buttons = buttons;
+            state.lx = lx;
+            state.ly = ly;
+            state.rx = rx;
+            state.ry = ry;
+            plugged = connected && !g_padConnected[port];
+            unplugged = !connected && g_padConnected[port];
+            g_padConnected[port] = connected;
+        }
+        if (!plugged && !unplugged)
+            return;
+        tracePad(plugged ? "connected" : "disconnected", port);
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        PadPortState &portState = g_padPorts[port];
+        // A pad plugged (back) in is found again and starts in digital mode with its motors off;
+        // the game's pad driver then sets its mode and actuators up again.
+        portState.analogMode = false;
+        portState.pressureEnabled = false;
+        std::memset(portState.actAlign, 0xFF, sizeof(portState.actAlign));
+        portState.smallMotor = portState.largeMotor = 0u;
+        portState.transientState = plugged && portState.open ? static_cast<uint32_t>(kPadStateFindPad) : 0u;
+        if (unplugged)
+            ps2_test::onActuator(port, 0u, 0u);
     }
 
     void clearPadOverrideState()
     {
         std::lock_guard<std::mutex> lock(g_padOverrideMutex);
         g_padOverrideEnabled = false;
-        g_padOverrideState = PadInputState{};
+        for (PadInputState &state : g_padOverrideState)
+            state = PadInputState{};
+        g_padConnected[0] = g_padConnected[1] = true;
     }
 }
