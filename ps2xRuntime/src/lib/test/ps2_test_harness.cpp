@@ -9,6 +9,8 @@
 #include <thread>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <poll.h>
+#include <unistd.h>
 #include <unistd.h>
 #include <cstdio>
 #include <cstring>
@@ -72,6 +74,7 @@ namespace ps2_test
         bool g_serverEnabled = false;
         std::atomic<bool> g_rendering{[] { const char *e = std::getenv("RT_RENDER"); return !(e && *e == '0'); }()};
         bool g_attached = false;
+        std::atomic<bool> g_quitRequested{false}; // an orderly quit: shut down normally
         uint64_t g_runTarget = 0;           // park when reaching this vblank
         uint64_t g_parkedAt = UINT64_MAX;   // vblank the game is parked at, or UINT64_MAX
         bool g_serverPadActive = false;
@@ -545,6 +548,7 @@ namespace ps2_test
             }
             if (cmd == "quit")
             {
+                g_quitRequested.store(true);
                 runtime.requestStop();
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_parkCv.notify_all();
@@ -584,12 +588,33 @@ namespace ps2_test
                 }
             }
             ::close(fd);
-            // Detached: let the game run freely until the next client.
-            std::lock_guard<std::mutex> lock(g_mutex);
-            g_attached = false;
-            g_serverEnabled = false;
-            g_serverPadActive = false;
-            g_parkCv.notify_all();
+            if (g_quitRequested.load())
+                return; // the normal shutdown is under way (finishes a recorded movie, etc.)
+            // The test driver is gone (it crashed or was killed): a test instance has no
+            // reason to keep running, so it exits rather than linger in the background.
+            std::fprintf(stderr, "[test] client disconnected; exiting\n");
+            std::fflush(nullptr);
+            std::_Exit(0);
+        }
+
+        // Test instances also exit if their parent process dies or no client ever attaches, so
+        // a crashed or killed test run never leaves games behind.
+        void startOrphanWatch()
+        {
+            const pid_t parent = ::getppid();
+            std::thread([parent]
+                        {
+                            for (;;)
+                            {
+                                std::this_thread::sleep_for(std::chrono::seconds(1));
+                                if (::getppid() != parent)
+                                {
+                                    std::fprintf(stderr, "[test] parent process gone; exiting\n");
+                                    std::fflush(nullptr);
+                                    std::_Exit(0);
+                                }
+                            } })
+                .detach();
         }
     }
 
@@ -614,9 +639,17 @@ namespace ps2_test
             g_serverEnabled = true;
         }
         std::fprintf(stderr, "[test] control socket %s\n", path);
+        startOrphanWatch();
         std::thread([&runtime, listener]
                     {
                         // One client for the whole run; the game waits at vblank 1 until it attaches.
+                        pollfd waiting{listener, POLLIN, 0};
+                        if (::poll(&waiting, 1, 300 * 1000) <= 0)
+                        {
+                            std::fprintf(stderr, "[test] no client attached within 300 s; exiting\n");
+                            std::fflush(nullptr);
+                            std::_Exit(0);
+                        }
                         const int fd = ::accept(listener, nullptr, nullptr);
                         ::close(listener);
                         if (fd >= 0)
