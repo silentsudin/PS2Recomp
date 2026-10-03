@@ -1495,6 +1495,16 @@ namespace
             ImGui::EndTable();
         }
 
+        ImGui::SeparatorText("Connection and vibration");
+        for (size_t port = 0; port < ps2_stubs::kPadDebugPortCount; ++port)
+        {
+            const ps2_stubs::PadDebugPortSnapshot &row = snapshot.ports[port][0];
+            const uint8_t *a = row.actAlign;
+            ImGui::Text("port=%zu %s  motors: small=%u large=%3u  align=%02X %02X %02X %02X %02X %02X", port,
+                        row.connected ? "connected   " : "disconnected", row.smallMotor, row.largeMotor, a[0], a[1],
+                        a[2], a[3], a[4], a[5]);
+        }
+
         ImGui::SeparatorText("Last scePadRead bytes");
         for (size_t port = 0; port < ps2_stubs::kPadDebugPortCount; ++port)
         {
@@ -2217,6 +2227,20 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     }
 
     rlImGuiBegin();
+    drawWindow(runtime);
+    rlImGuiEnd();
+#else
+    (void)runtime;
+#endif
+}
+
+void PS2DebugPanel::drawWindow(PS2Runtime &runtime)
+{
+#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+    if (!m_initialized || !m_visible)
+    {
+        return;
+    }
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
@@ -2302,8 +2326,6 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         }
     }
     ImGui::End();
-
-    rlImGuiEnd();
 #else
     (void)runtime;
 #endif

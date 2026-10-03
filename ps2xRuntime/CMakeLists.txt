@@ -71,14 +71,47 @@ else()
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 
+    # Host platform layer under raylib: GLFW (raylib 5.5, the default) or SDL3 (raylib 6.0 on its
+    # SDL backend; SDL3 also brings modern gamepad support: XInput, DualSense/DualShock 4 over
+    # HIDAPI, Switch Pro, rumble, LEDs).
+    set(PS2X_HOST_PLATFORM "GLFW" CACHE STRING "Host platform layer: GLFW or SDL3")
+    set_property(CACHE PS2X_HOST_PLATFORM PROPERTY STRINGS GLFW SDL3)
+    set(PS2X_RAYLIB_TAG "5.5")
+    set(PS2X_RLIMGUI_TAG "Raylib_5_5")
+
     if(PS2X_IS_ANDROID)
         set(PLATFORM "Android" CACHE STRING "" FORCE)
+    elseif(PS2X_HOST_PLATFORM STREQUAL "SDL3")
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(SDL_AUDIO OFF CACHE BOOL "" FORCE)      # raylib's miniaudio plays the sound
+        set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+        set(SDL_GPU OFF CACHE BOOL "" FORCE)
+        set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+        set(SDL_HIDAPI ON CACHE BOOL "" FORCE)
+        set(SDL_HAPTIC ON CACHE BOOL "" FORCE)
+        set(SDL_JOYSTICK ON CACHE BOOL "" FORCE)
+        set(SDL_SENSOR ON CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            SDL3
+            GIT_REPOSITORY "https://github.com/libsdl-org/SDL.git"
+            GIT_TAG "release-3.4.18"
+            GIT_SHALLOW TRUE
+            GIT_PROGRESS TRUE
+        )
+        FetchContent_MakeAvailable(SDL3)
+        set(PLATFORM "SDL" CACHE STRING "" FORCE)
+        set(PS2X_RAYLIB_TAG "6.0")
+        set(PS2X_RLIMGUI_TAG "Raylib_6_0")
     endif()
 
     FetchContent_Declare(
         raylib
         GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
-        GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
+        GIT_TAG "${PS2X_RAYLIB_TAG}"
         GIT_PROGRESS TRUE
     )
     FetchContent_MakeAvailable(raylib)
@@ -110,7 +143,7 @@ else()
         FetchContent_Declare(
             rlImGui
             GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
-            GIT_TAG "Raylib_5_5"
+            GIT_TAG "${PS2X_RLIMGUI_TAG}"
             GIT_SHALLOW TRUE
         )
         FetchContent_GetProperties(rlImGui)

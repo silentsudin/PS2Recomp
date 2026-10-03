@@ -8,7 +8,10 @@ class PS2DebugPanel
 public:
     void initialize();
     void shutdown();
+    // F1 toggles; opens and closes its own ImGui frame.
     void draw(PS2Runtime &runtime);
+    // Only the panel's window, inside an ImGui frame the caller owns (to share it with other windows).
+    void drawWindow(PS2Runtime &runtime);
 
     bool isVisible() const { return m_visible; }
     void setVisible(bool visible) { m_visible = visible; }
