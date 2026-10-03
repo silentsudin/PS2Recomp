@@ -848,6 +848,15 @@ bool PS2Runtime::syncCoreSubsystems()
     return true;
 }
 
+namespace
+{
+    bool headlessMode()
+    {
+        static const bool headless = [] { const char *e = std::getenv("RT_HEADLESS"); return e && *e == '1'; }();
+        return headless;
+    }
+}
+
 bool PS2Runtime::initialize(const char *title)
 {
     try
@@ -866,10 +875,15 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        // RT_HEADLESS=1 (test runs): hidden window, no audio device.
-        const bool headless = [] { const char *e = std::getenv("RT_HEADLESS"); return e && *e == '1'; }();
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE | (headless ? FLAG_WINDOW_HIDDEN : 0u));
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        // RT_HEADLESS=1 (test runs): no window and no audio device. Pictures come from the GS's
+        // latched frame on request (test harness), so nothing depends on the window server
+        // (a hidden window still aborted in its buffer swap whenever the display slept).
+        const bool headless = headlessMode();
+        if (!headless)
+        {
+            SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        }
         if (!headless)
         {
             InitAudioDevice();
@@ -885,7 +899,7 @@ bool PS2Runtime::initialize(const char *title)
         else
             SetTargetFPS(0); // paced by guest vblanks in run()
 #endif
-        if (m_debugUiInitCallback)
+        if (m_debugUiInitCallback && !headlessMode())
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
             m_debugUiInitialized = true;
@@ -2522,11 +2536,16 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
+    const bool headless = headlessMode();
     // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
-    SetTextureFilter(frameTex, TEXTURE_FILTER_BILINEAR);
+    Texture2D frameTex{};
+    if (!headless)
+    {
+        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+        frameTex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+        SetTextureFilter(frameTex, TEXTURE_FILTER_BILINEAR);
+    }
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -2592,6 +2611,22 @@ void PS2Runtime::run()
 
             }
         });
+        if (headless)
+        {
+            // No window: hand the test harness the pictures it asks for, nothing else.
+            if (ps2_test::frameCaptureRequested())
+            {
+                gsUnsynced().latchHostPresentationFrame();
+                std::vector<uint8_t> pixels;
+                uint32_t width = 0u, height = 0u;
+                const bool haveFrame = gsUnsynced().copyLatchedHostPresentationFrame(pixels, width, height,
+                                                                                    nullptr, nullptr, nullptr);
+                ps2_test::deliverFrameCapture(haveFrame ? pixels : std::vector<uint8_t>{}, haveFrame ? width : 0u,
+                                              haveFrame ? height : 0u);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            continue;
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -2651,8 +2686,11 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    UnloadTexture(frameTex);
-    CloseWindow();
+    if (!headless)
+    {
+        UnloadTexture(frameTex);
+        CloseWindow();
+    }
 
     RUNTIME_LOG("[run] exiting loop");
 }
