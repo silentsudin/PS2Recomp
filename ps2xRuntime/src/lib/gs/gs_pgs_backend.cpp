@@ -176,6 +176,18 @@ namespace ps2x::gs
                 m_iface.set_hacks(m_hacks);
             }
 
+            bool WantsDepthSnapshot() const override
+            {
+                return m_shared && m_shared->wantDepth.load(std::memory_order_relaxed);
+            }
+
+            void SnapshotDepth(uint32_t zbp, uint32_t fbw) override
+            {
+                const auto lock = lockDevice();
+                m_iface.flush();
+                m_iface.snapshot_depth(zbp, fbw, 512);
+            }
+
             // ---------------------------------------------------------------- GSPacketMirror
             void MirrorGifPacket(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes) override
             {
@@ -312,8 +324,20 @@ namespace ps2x::gs
                         vsync.high_resolution_scanout = m_samples >= 4u;
                     }
 
+                    if (onGpu && request.depthValid && m_shared->wantDepth.load(std::memory_order_relaxed))
+                    {
+                        vsync.scanout_depth = true;
+                        vsync.depth_zbp = request.depthZbp;
+                        vsync.depth_psm = 0x30u | (request.depthPsm & 0xFu); // PSMZ32/24/16/16S
+                        static int dbg = 0;
+                        if (std::getenv("RT_SHOW_DEPTH") && (dbg++ % 120) == 0)
+                            std::fprintf(stderr, "[depth] zbp=%u psm=0x%x dispfb fbp=%u fbw=%u\n", request.depthZbp, vsync.depth_psm,
+                                         unsigned(request.dispfb1 & 0x1FF), unsigned((request.dispfb1 >> 9) & 0x3F));
+                    }
                     m_iface.flush();
                     ParallelGS::ScanoutResult scanout = m_iface.vsync(vsync);
+                    if (onGpu)
+                        m_shared->depth = scanout.depth;
                     if (scanout.image)
                     {
                         w = scanout.image->get_width();

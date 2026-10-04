@@ -56,6 +56,15 @@ namespace ps2x::gs
         // are 2D-backed: the title draws a full-screen picture instead.
         void framePresented();
 
+        // True once per driving frame, after the packet in which its HUD phase began (the 3D is
+        // complete before that packet: the time to keep its depth).
+        bool consumeHudStart()
+        {
+            const bool started = m_hudStarted;
+            m_hudStarted = false;
+            return started;
+        }
+
         // The last finished frame was 2D-backed (show it 4:3), or a driving frame (show it wide).
         bool lastFrameWas2D() const { return m_lastFrame2D; }
         // A driving frame is being drawn or was the last one (the camera hook widens only then).
@@ -86,6 +95,7 @@ namespace ps2x::gs
         bool m_lastFrame2D = false;
         uint32_t m_clears = 0;
         uint32_t m_2DVotes = 0, m_driveVotes = 0;
+        bool m_hudStarted = false;
         float m_dbgMinY = 0;   // clears since the last presented frame
         Vertex m_unit[2048];
         uint32_t m_unitCount = 0;

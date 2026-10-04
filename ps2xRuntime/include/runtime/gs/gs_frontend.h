@@ -203,6 +203,8 @@ private:
     GSContext m_ctx[2];
     GSPrimReg m_prim{};
     ps2x::gs::WideLayout m_wide;           // widescreen 2D placement (gs_wide_layout.h)
+    GSZbufReg m_lastZbuf3D{};              // the Z buffer of the last 3D (PATH1) draw
+    bool m_haveZbuf3D = false;
     // m_wide's answers for other threads without the state lock (the game's camera hook asks on
     // every camera build): published after each change, under the lock.
     std::atomic<bool> m_wideDriving{false}, m_wide2D{false};

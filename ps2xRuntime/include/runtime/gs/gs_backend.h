@@ -34,6 +34,14 @@ public:
     virtual void UploadImage(const uint8_t *data, uint32_t sizeBytes) = 0;
 
     virtual void Flush() = 0;
+    // Depth for temporal upscalers: whether to keep each frame's 3D depth, and keeping it (called
+    // when the frame's 3D is complete, before its HUD and post-processing overwrite Z).
+    virtual bool WantsDepthSnapshot() const { return false; }
+    virtual void SnapshotDepth(uint32_t zbp, uint32_t fbw)
+    {
+        (void)zbp;
+        (void)fbw;
+    }
     virtual void TextureFlush() = 0;
     virtual void Sync(GSSyncReason reason) = 0;
     virtual PresentationFrame Present(const GSPresentationRequest &request) = 0;

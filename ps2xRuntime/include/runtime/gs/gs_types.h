@@ -292,6 +292,10 @@ struct GSPresentationRequest
     // `readback` still copies it to the CPU (test captures).
     bool keepOnGpu = false;
     bool readback = true;
+    // The Z buffer the 3D (PATH1) draws used last (for a depth scanout), if any.
+    bool depthValid = false;
+    uint32_t depthZbp = 0;
+    uint32_t depthPsm = 0; // ZBUF.PSM (low 4 bits)
 };
 
 struct PresentationFrame

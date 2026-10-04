@@ -7,6 +7,7 @@
 
 #include "device.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -26,6 +27,9 @@ namespace ps2x::gs
         std::mutex mutex;
         // The newest picture, in SHADER_READ_ONLY_OPTIMAL (guarded by `mutex`).
         Vulkan::ImageHandle scanout;
+        // The raw Z behind it (R32F, same size) when wantDepth is set (guarded by `mutex`).
+        Vulkan::ImageHandle depth;
+        std::atomic<bool> wantDepth{false};
         // A paraLLEl-GS backend renders on this device (otherwise the CPU GS: pictures are uploaded).
         bool attached = false;
         // Submits the GS's open command buffers (with `mutex` held). A frame context only advances

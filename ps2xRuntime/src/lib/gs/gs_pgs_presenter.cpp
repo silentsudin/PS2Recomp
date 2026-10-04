@@ -196,6 +196,12 @@ namespace ps2x::gs
                 m_smaaEdges = post(post_spirv::smaa_edges_frag, sizeof(post_spirv::smaa_edges_frag), 16, 0x1, 0x1);
                 m_smaaWeights = post(post_spirv::smaa_weights_frag, sizeof(post_spirv::smaa_weights_frag), 16, 0x1, 0x7);
                 m_smaaBlend = post(post_spirv::smaa_blend_frag, sizeof(post_spirv::smaa_blend_frag), 16, 0x1, 0x3);
+                m_depthView = post(post_spirv::depth_view_frag, sizeof(post_spirv::depth_view_frag), 4, 0x1);
+                if (const char *e = std::getenv("RT_SHOW_DEPTH"); e && *e == '1')
+                {
+                    m_showDepth = true;
+                    m_shared.wantDepth = true;
+                }
 #if defined(__APPLE__)
                 // MetalFX through MoltenVK's Metal objects.
                 {
@@ -449,6 +455,14 @@ namespace ps2x::gs
                 if (!image)
                     return;
                 const uint32_t sw = image->get_width(), sh = image->get_height();
+                if (m_showDepth && m_shared.depth)
+                {
+                    const float rcpMax = 1.0f / 16777216.0f;
+                    const PassInput depth[1] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(cmd, m_aaImage, sw, sh, m_depthView, depth, 1, &rcpMax, sizeof(rcpMax), false);
+                    m_final = m_aaImage.get();
+                    return;
+                }
                 if (m_post.aa == PostProcess::AntiAliasing::Smaa)
                 {
                     const float metrics[4] = {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh), static_cast<float>(sw),
@@ -754,6 +768,8 @@ namespace ps2x::gs
             Vulkan::Program *m_fxaa = nullptr, *m_easu = nullptr, *m_rcas = nullptr;
             PostProcess m_post;
             Vulkan::ImageHandle m_aaImage, m_upImage; // intermediate pictures
+            Vulkan::Program *m_depthView = nullptr;
+            bool m_showDepth = false;
             Vulkan::Program *m_smaaEdges = nullptr, *m_smaaWeights = nullptr, *m_smaaBlend = nullptr;
             Vulkan::ImageHandle m_smaaArea, m_smaaSearch, m_smaaEdgeImage, m_smaaWeightImage;
             const Vulkan::Image *m_final = nullptr;   // what the final pass draws this frame

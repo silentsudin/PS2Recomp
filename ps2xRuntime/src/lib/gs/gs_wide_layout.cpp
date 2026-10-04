@@ -130,7 +130,10 @@ namespace ps2x::gs
         if (m_mode != Mode::Driving)
             return;
         if (!m_hud && pathIndex >= 1 && !st.ctxt && st.tme)
+        {
             m_hud = true;
+            m_hudStarted = true;
+        }
         // Full-screen sprites (the fade, the final post-pass) stretch with the 3D.
         if (!m_hud || (st.type == kSprite && width >= kFullScreen) || !active())
             return;

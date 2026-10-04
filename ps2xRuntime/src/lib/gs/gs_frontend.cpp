@@ -543,6 +543,12 @@ void GS::latchHostPresentationFrame(bool keepOnGpu, bool readback)
         publishWideUnlocked();
     }
     request.keepOnGpu = keepOnGpu;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        request.depthValid = m_haveZbuf3D;
+        request.depthZbp = m_lastZbuf3D.zbp;
+        request.depthPsm = m_lastZbuf3D.psm;
+    }
     request.readback = readback;
 
     PresentationFrame frame{};
@@ -657,9 +663,10 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
-    if (m_wide.active())
+    if (m_wide.active() || m_backend->WantsDepthSnapshot())
     {
         // Widescreen: narrow the HUD in a copy, which both the mirror and the parse below see.
+        // (Without widescreen the copy is left as it is; the pass only finds the HUD phase.)
         m_wideScratch.assign(data, data + sizeBytes);
         ps2x::gs::WideLayout::PrimState st;
         st.type = static_cast<uint32_t>(m_prim.type);
@@ -672,6 +679,12 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
         }
         m_wide.transformPacket(pathIndex, m_wideScratch.data(), sizeBytes, st);
         publishWideUnlocked();
+        // The frame's 3D is complete before its HUD: keep its depth (HUD and post-pass overwrite Z).
+        if (m_wide.consumeHudStart() && m_haveZbuf3D && m_backend->WantsDepthSnapshot())
+        {
+            const uint32_t fbw = m_ctx[1].frame.fbw ? m_ctx[1].frame.fbw : m_ctx[0].frame.fbw;
+            m_backend->SnapshotDepth(m_lastZbuf3D.zbp, fbw);
+        }
         data = m_wideScratch.data();
     }
 
@@ -1669,7 +1682,14 @@ void GS::vertexKick(bool drawing)
     ++m_vtxCount;
     ++m_vtxIndex;
     if (drawing)
+    {
         logBatchVertex(m_vtxQueue[(m_vtxCount - 1) % kMaxVerts]);
+        if (m_curPath == 0)
+        {
+            m_lastZbuf3D = m_ctx[m_prim.ctxt ? 1 : 0].zbuf;
+            m_haveZbuf3D = true;
+        }
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t debugIndex = s_debugGsVertexKickCount.fetch_add(1, std::memory_order_relaxed);
@@ -1903,4 +1923,5 @@ void GS::markFrameStart()
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_wide.frameStart();
     publishWideUnlocked();
+
 }
