@@ -730,6 +730,10 @@ namespace ps2x::gs
                             if (std::chrono::steady_clock::now() >= sliceEnd)
                                 break;
                         }
+                        // Submit before letting go of the lock: the real GS's flushes advance the
+                        // device's frame context, which waits for every open command buffer (a
+                        // deadlock if this one stayed open while we wait for the lock).
+                        shadow.flush();
                     }
                     stream.clear();
                     if (dropped)

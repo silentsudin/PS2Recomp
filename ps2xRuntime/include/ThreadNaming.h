@@ -50,4 +50,14 @@ namespace ThreadNaming
         pthread_setname_np(pthread_self(), name.data());
 #endif
     }
+
+    // The emulation's hot threads (game, VIF1/VU1, GS): the scheduler keeps them on performance
+    // cores. With default QoS macOS may move them to efficiency cores when the machine is busy,
+    // and a game frame that only just fits in 16.7 ms then misses its vblank (30 fps).
+    inline void SetCurrentThreadInteractive()
+    {
+#if defined(__APPLE__)
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    }
 }

@@ -1,3 +1,4 @@
+#include "ThreadNaming.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
@@ -2042,12 +2043,14 @@ void PS2Memory::startGifVif1Worker()
 #if defined(__APPLE__)
                                      pthread_setname_np("GsThread");
 #endif
+                                     ThreadNaming::SetCurrentThreadInteractive();
                                      gsThreadLoop(); });
     m_gifVif1Worker = std::thread([this]
                                   {
 #if defined(__APPLE__)
                                       pthread_setname_np("GifVif1Worker");
 #endif
+                                      ThreadNaming::SetCurrentThreadInteractive();
                                       gifVif1WorkerLoop(); });
 }
 
@@ -2105,6 +2108,15 @@ void PS2Memory::drainGif()
     if (t_onGifVif1Worker && m_gsThread.joinable())
     {
         m_gifArbiter->drainInto(m_gsPending);
+        // Hand the GS thread work while VU1 is still producing it, so the two overlap: one
+        // batch per VIF1 job made the GS stage run after VU1, and a frame cost VU1 + GS.
+        // RT_GS_OVERLAP=0 keeps one batch per job.
+        static const bool overlap = [] {
+            const char *e = std::getenv("RT_GS_OVERLAP");
+            return !(e && *e == '0');
+        }();
+        if (overlap && m_gsPending.size() >= 24)
+            handOffGsBatch();
         return;
     }
     m_gifArbiter->drain();

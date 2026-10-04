@@ -2473,6 +2473,7 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        ThreadNaming::SetCurrentThreadInteractive();
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
