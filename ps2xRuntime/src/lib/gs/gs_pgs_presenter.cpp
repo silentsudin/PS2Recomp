@@ -140,6 +140,10 @@ namespace ps2x::gs
                 if (!m_wsi.init_device() || !m_wsi.init_surface_swapchain())
                     return fail("Vulkan", "swapchain creation failed");
                 m_shared.device = &m_wsi.get_device();
+                // paraLLEl-GS advances a frame context on every flush, and the swapchain on every
+                // frame: with Granite's default of 2 the game thread waits for the GPU inside a
+                // flush. 4, as the GS's own device had.
+                m_shared.device->init_frame_contexts(4);
 
                 Vulkan::ResourceLayout vert = {};
                 vert.input_mask = 0x7;
@@ -223,6 +227,7 @@ namespace ps2x::gs
             {
                 pumpEvents();
                 latch(runtime);
+                m_pictureAspect = pictureAspect(runtime, *this);
                 m_uiFrame = false;
                 if (drawUi)
                     drawUi();
@@ -300,13 +305,14 @@ namespace ps2x::gs
                 cmd.push_constants(pc, 0, sizeof(pc));
             }
 
-            // The game picture, letterboxed to 4:3 (the PS2 always drives a 4:3 TV).
+            // The game picture, letterboxed to 4:3 (the PS2 always drives a 4:3 TV) or, with
+            // widescreen, to the display aspect.
             void drawGame(Vulkan::CommandBuffer &cmd, float fw, float fh)
             {
                 const Vulkan::ImageHandle &image = m_shared.attached ? m_shared.scanout : m_cpuFrame;
                 if (!image)
                     return;
-                constexpr float kAspect = 4.0f / 3.0f;
+                const float kAspect = m_pictureAspect;
                 const float w = std::min(fw, fh * kAspect), h = w / kAspect;
                 const float x0 = (fw - w) * 0.5f, y0 = (fh - h) * 0.5f;
                 bindState(cmd, fw, fh);
@@ -498,6 +504,7 @@ namespace ps2x::gs
             Vulkan::ImageHandle m_cpuFrame; // CPU GS: the uploaded picture
             std::unordered_map<uint64_t, Vulkan::ImageHandle> m_textures; // by ImTextureID
             uint64_t m_nextTexture = 0;
+            float m_pictureAspect = 4.0f / 3.0f;
             uint64_t m_lastTick = 0;
             bool m_latched = false;
             bool m_closeRequested = false;

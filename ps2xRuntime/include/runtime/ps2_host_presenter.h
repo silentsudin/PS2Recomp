@@ -42,6 +42,11 @@ namespace ps2x
         // test capture is pending), then drawUi(), then present.
         virtual void frame(PS2Runtime &runtime, const std::function<void()> &drawUi) = 0;
 
+        // Widescreen: the picture's shape on screen (4:3 by default). Frames the GS marks as
+        // 2D-backed (title, menus; GS::lastFrameWas2D) are still shown 4:3, pillarboxed.
+        void setDisplayAspect(float aspect) { m_displayAspect = aspect; }
+        float displayAspect() const { return m_displayAspect; }
+
         // The SDL_Window of this presenter, or nullptr (raylib keeps its own).
         virtual void *sdlWindow() { return nullptr; }
 
@@ -51,7 +56,13 @@ namespace ps2x
             (void)pngPath;
             return false;
         }
+
+    protected:
+        float m_displayAspect = 4.0f / 3.0f;
     };
+
+    // The aspect to draw the newest picture at: the display aspect, or 4:3 for 2D-backed frames.
+    float pictureAspect(PS2Runtime &runtime, const HostPresenter &presenter);
 
     std::unique_ptr<HostPresenter> createRaylibPresenter();
 }

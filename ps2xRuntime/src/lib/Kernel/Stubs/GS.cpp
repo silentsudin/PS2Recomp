@@ -114,6 +114,7 @@ namespace ps2_stubs
                 return;
             }
 
+            runtime->gs().markFrameStart(); // the game clears once per frame, before drawing it
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value);

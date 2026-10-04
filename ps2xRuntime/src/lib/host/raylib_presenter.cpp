@@ -253,8 +253,9 @@ void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &o
             const float screenWidth = static_cast<float>(GetScreenWidth());
             const float screenHeight = static_cast<float>(GetScreenHeight());
             // The PS2 always drives a 4:3 TV: a 640x224 field buffer or a 512x448 frame buffer
-            // both fill the whole picture. Fit a 4:3 box instead of scaling pixels 1:1.
-            constexpr float kDisplayAspect = 4.0f / 3.0f;
+            // both fill the whole picture. Fit a 4:3 box (or the widescreen shape) instead of
+            // scaling pixels 1:1.
+            const float kDisplayAspect = ps2x::pictureAspect(runtime, *this);
             const float dstWidth = std::min(screenWidth, screenHeight * kDisplayAspect);
             const float dstHeight = dstWidth / kDisplayAspect;
             const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
@@ -283,4 +284,12 @@ void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &o
 std::unique_ptr<ps2x::HostPresenter> ps2x::createRaylibPresenter()
 {
     return std::make_unique<RaylibPresenter>();
+}
+
+float ps2x::pictureAspect(PS2Runtime &runtime, const HostPresenter &presenter)
+{
+    const float aspect = presenter.displayAspect();
+    if (aspect <= 4.0f / 3.0f + 0.01f || runtime.gsUnsynced().lastFrameWas2D())
+        return 4.0f / 3.0f;
+    return aspect;
 }

@@ -539,6 +539,7 @@ void GS::latchHostPresentationFrame(bool keepOnGpu, bool readback)
             return;
         }
         request = buildPresentationRequestUnlocked();
+        m_wide.framePresented();
     }
     request.keepOnGpu = keepOnGpu;
     request.readback = readback;
@@ -655,6 +656,23 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
+    if (m_wide.active())
+    {
+        // Widescreen: narrow the HUD in a copy, which both the mirror and the parse below see.
+        m_wideScratch.assign(data, data + sizeBytes);
+        ps2x::gs::WideLayout::PrimState st;
+        st.type = static_cast<uint32_t>(m_prim.type);
+        st.tme = m_prim.tme;
+        st.ctxt = m_prim.ctxt;
+        for (int c = 0; c < 2; ++c)
+        {
+            st.ofx[c] = m_ctx[c].xyoffset.ofx;
+            st.ofy[c] = m_ctx[c].xyoffset.ofy;
+        }
+        m_wide.transformPacket(pathIndex, m_wideScratch.data(), sizeBytes, st);
+        data = m_wideScratch.data();
+    }
+
     if (m_packetMirror)
         m_packetMirror->MirrorGifPacket(pathIndex, data, sizeBytes & ~15u);
     m_curPath = pathIndex;
@@ -756,6 +774,8 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
+    if (m_wide.active())
+        return false; // the regular path transforms the HUD
 
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
@@ -1854,4 +1874,34 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
         m_preferredDisplayDestFbp = ctx.frame.fbp;
         m_hasPreferredDisplaySource = true;
     }
+}
+
+void GS::setWideLayout(float aspect, ps2x::gs::HudPlacement placement)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_wide.configure(aspect, placement);
+}
+
+bool GS::lastFrameWas2D() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_wide.lastFrameWas2D();
+}
+
+bool GS::wideDriving() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_wide.active() && m_wide.driving();
+}
+
+float GS::wideHorizontalScale() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_wide.horizontalScale();
+}
+
+void GS::markFrameStart()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_wide.frameStart();
 }

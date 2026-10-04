@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
+#include "runtime/gs/gs_wide_layout.h"
 
 struct GSDebugSnapshot
 {
@@ -110,6 +111,16 @@ public:
     // pathIndex: 0 = PATH1, 1 = PATH2, 2 = PATH3 (forwarded to a GSPacketMirror backend).
     void processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+
+    // Widescreen: the window's aspect and where the HUD goes (gs_wide_layout.h). 4:3 = off.
+    void setWideLayout(float aspect, ps2x::gs::HudPlacement placement);
+    // The game started drawing a frame (its clear, sceGsClear-style, from the GS stubs).
+    void markFrameStart();
+    // The last frame was a 2D-backed screen (title, menus): show it 4:3 even when widescreen is on.
+    bool lastFrameWas2D() const;
+    // Widescreen is on and the game is driving (the 3D camera should be widened).
+    bool wideDriving() const;
+    float wideHorizontalScale() const;
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
                            uint64_t trxreg,
@@ -190,6 +201,8 @@ private:
 
     GSContext m_ctx[2];
     GSPrimReg m_prim{};
+    ps2x::gs::WideLayout m_wide;           // widescreen 2D placement (gs_wide_layout.h)
+    std::vector<uint8_t> m_wideScratch;    // the packet being transformed
     GSPrimReg m_primRegister{};
     GSPrimReg m_prmodeRegister{};
 
