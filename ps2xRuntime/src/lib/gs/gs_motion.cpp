@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace ps2x::gs
@@ -115,23 +116,37 @@ namespace ps2x::gs
 
     Mat4 MotionTracker::matchPrevious(const Object &obj, uint32_t ordinal) const
     {
+        // Measured at a race start (about 224 objects per frame): an object at the same draw
+        // position as last frame is the same object 93% of the time and moved 0.5-0.75 units;
+        // the rest are reorders (cars overtaking, objects culled), often hundreds of units off.
+        // Cars on the grid stand 10-30 units apart; a car's wheels sit 0.7-1.4 units from its
+        // body and turn a long way each frame. So: the same draw position if it is within 3
+        // units, else the nearest object within 3 units, orientation only breaking near ties.
         const auto &prev = m_prev[static_cast<int>(obj.kind)];
-        auto dist2 = [&](const Object &o) {
+        auto dt2 = [&](const Object &o) {
             const double dx = o.tx - obj.tx, dy = o.ty - obj.ty, dz = o.tz - obj.tz;
             return dx * dx + dy * dy + dz * dz;
         };
-        // Same draw order and close by: the same object (the common case). Otherwise the nearest.
-        constexpr double kNear = 40.0 * 40.0;
-        if (ordinal < prev.size() && dist2(prev[ordinal]) < kNear)
+        auto dr2 = [&](const Object &o) {
+            double dr = 0.0;
+            for (int k = 0; k < 9; ++k)
+                dr += (o.r[k] - obj.r[k]) * (o.r[k] - obj.r[k]);
+            return dr;
+        };
+        constexpr double kNear = 3.0 * 3.0;
+        if (ordinal < prev.size() && dt2(prev[ordinal]) < kNear)
             return prev[ordinal].base;
         const Object *best = nullptr;
-        double bestD = kNear;
+        double bestScore = 0.0;
         for (const Object &o : prev)
         {
-            const double d = dist2(o);
-            if (d < bestD)
+            const double d = dt2(o);
+            if (d >= kNear)
+                continue;
+            const double score = d + 0.05 * dr2(o);
+            if (!best || score < bestScore)
             {
-                bestD = d;
+                bestScore = score;
                 best = &o;
             }
         }
@@ -164,6 +179,13 @@ namespace ps2x::gs
             obj.tx = world.m[12];
             obj.ty = world.m[13];
             obj.tz = world.m[14];
+            for (int c = 0; c < 3; ++c)
+            {
+                const double *col = world.m + c * 4;
+                const double len = std::sqrt(col[0] * col[0] + col[1] * col[1] + col[2] * col[2]);
+                for (int k = 0; k < 3; ++k)
+                    obj.r[c * 3 + k] = len > 1e-12 ? col[k] / len : 0.0;
+            }
             auto &list = m_cur[static_cast<int>(obj.kind)];
             m_activePrevBase = matchPrevious(obj, static_cast<uint32_t>(list.size()));
             ++m_stats.objects;
@@ -345,17 +367,21 @@ namespace ps2x::gs
     }
 
     void MotionTracker::packetReproject(const uint8_t *data, uint32_t size, const MotionContext &ctx, double t,
-                                        std::vector<uint8_t> &out)
+                                        std::vector<uint8_t> &out, const std::vector<uint8_t> *keep)
     {
+        size_t vertexIndex = 0;
         out.assign(data, data + size);
         uint8_t *buf = out.data();
         auto store64 = [](uint8_t *p, uint64_t v) { std::memcpy(p, &v, 8); };
         // The vertex at (gx, gy, gz), moved on by t: false if it is left as it is. `ratio` is
         // w / w' for the texture coordinates.
         auto move = [&](uint16_t &gx, uint16_t &gy, uint32_t &gz, uint32_t zMax, double &ratio) {
-            const double X = gx / 16.0, Y = gy / 16.0, Z = static_cast<double>(gz);
-            if (std::fabs(X - 2048.0) > 1024.0 || std::fabs(Y - 2048.0) > 512.0)
+            const size_t v = vertexIndex++;
+            if (keep && v < keep->size() && (*keep)[v])
                 return false;
+            // Every vertex moves, off-screen ones too: big triangles near the camera reach into
+            // the guard band, and moving only some of their corners tore them.
+            const double X = gx / 16.0, Y = gy / 16.0, Z = static_cast<double>(gz);
             const double *inv = ctx.curInv.m;
             const double ww = inv[3] * X + inv[7] * Y + inv[11] * Z + inv[15];
             if (std::fabs(ww) < 1e-20)
@@ -377,9 +403,14 @@ namespace ps2x::gs
             const double nx = moved[0] / moved[3] * 16.0, ny = moved[1] / moved[3] * 16.0, nz = moved[2] / moved[3];
             if (!std::isfinite(nx) || !std::isfinite(ny) || !std::isfinite(nz))
                 return false;
+
             gx = static_cast<uint16_t>(std::clamp(std::lround(nx), 0l, 65535l));
             gy = static_cast<uint16_t>(std::clamp(std::lround(ny), 0l, 65535l));
-            gz = static_cast<uint32_t>(std::clamp(nz, 0.0, static_cast<double>(zMax)));
+            // Z stays as the game computed it. Decals (track lines) lie on the road with equal Z
+            // and pass a GEQUAL test; Z recomputed from each object's own matrices differed by a
+            // unit now and then and the decal flickered. Half a frame barely changes depth order.
+            (void)nz;
+            (void)zMax;
             ratio = w / moved[3];
             return true;
         };

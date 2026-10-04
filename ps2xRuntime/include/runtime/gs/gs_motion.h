@@ -67,10 +67,12 @@ namespace ps2x::gs
         static void packetMotion(const uint8_t *data, uint32_t size, const MotionContext &ctx, std::vector<uint32_t> &out);
         // Re-rendered frame generation: a copy of a PATH1 GIF packet with every vertex re-projected
         // with the object's matrix moved on by t frames (C + t (C - C_prev): t = 0.5 is half a
-        // frame ahead), Z included, and perspective texture coordinates (PACKED ST/Q) rescaled
-        // for the new w. Vertices in the guard band are left as they are.
+        // frame ahead) on screen (Z kept, so coplanar decals stay equal), and perspective texture
+        // coordinates (PACKED ST/Q) rescaled for the new w.
+        // `keep` (optional, one per vertex in kick order, like packetMotion's output): vertices
+        // that stay as they are (the HUD).
         static void packetReproject(const uint8_t *data, uint32_t size, const MotionContext &ctx, double t,
-                                    std::vector<uint8_t> &out);
+                                    std::vector<uint8_t> &out, const std::vector<uint8_t> *keep = nullptr);
 
         struct Stats
         {
@@ -84,6 +86,7 @@ namespace ps2x::gs
         {
             Kind kind;
             double tx, ty, tz; // world translation (W's last column)
+            double r[9];       // world rotation (W's 3x3, columns normalised)
             Mat4 base;         // C before any batch offset
         };
 

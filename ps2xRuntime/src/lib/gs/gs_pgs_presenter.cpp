@@ -14,6 +14,7 @@
 #include "imgui_spirv.h"
 #if defined(__APPLE__)
 #include "gs_metalfx.h"
+#include "gs_metal_present.h"
 #endif
 #include "post/post_spirv.h"
 
@@ -33,6 +34,7 @@
 #include "device.hpp"
 #include "wsi.hpp"
 
+#include <SDL3/SDL_metal.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
@@ -114,11 +116,13 @@ namespace ps2x::gs
                 return {"VK_KHR_swapchain"};
             }
 
-            explicit SdlPlatform(SDL_Window *window) : m_window(window) {}
+            SdlPlatform(SDL_Window *window, bool surface) : m_window(window), m_surface(surface) {}
 
             VkSurfaceKHR create_surface(VkInstance instance, VkPhysicalDevice) override
             {
                 VkSurfaceKHR surface = VK_NULL_HANDLE;
+                if (!m_surface) // presenting through Metal: no Vulkan swapchain on this window
+                    return VK_NULL_HANDLE;
                 if (!SDL_Vulkan_CreateSurface(m_window, instance, nullptr, &surface))
                 {
                     std::cerr << "[presenter] SDL_Vulkan_CreateSurface: " << SDL_GetError() << std::endl;
@@ -161,6 +165,7 @@ namespace ps2x::gs
 
         private:
             SDL_Window *m_window;
+            bool m_surface;
         };
 
         // ImGui's vertex layout, also used for the game picture's quad.
@@ -186,8 +191,15 @@ namespace ps2x::gs
                     return fail("SDL video", SDL_GetError());
                 if (!SDL_Vulkan_LoadLibrary(m_options.vulkanLibrary.empty() ? nullptr : m_options.vulkanLibrary.c_str()))
                     return fail("SDL_Vulkan_LoadLibrary", SDL_GetError());
+#if defined(__APPLE__)
+                // macOS presents through Metal (gs_metal_present.h); RT_METAL_PRESENT=0 uses the
+                // Vulkan swapchain (MoltenVK) as other platforms do.
+                if (const char *e = std::getenv("RT_METAL_PRESENT"); !(e && *e == '0'))
+                    m_metalPresent = true;
+#endif
                 m_window = SDL_CreateWindow(title, width, height,
-                                            SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                                            (m_metalPresent ? SDL_WINDOW_METAL : SDL_WINDOW_VULKAN) | SDL_WINDOW_RESIZABLE |
+                                                SDL_WINDOW_HIGH_PIXEL_DENSITY);
                 if (!m_window)
                     return fail("SDL_CreateWindow", SDL_GetError());
 
@@ -197,7 +209,7 @@ namespace ps2x::gs
                     return fail("Vulkan loader", "vkGetInstanceProcAddr unavailable");
 
                 pgsRegisterThread();
-                m_platform = std::make_unique<SdlPlatform>(m_window);
+                m_platform = std::make_unique<SdlPlatform>(m_window, !m_metalPresent);
                 m_wsi.set_platform(m_platform.get());
                 m_wsi.set_present_mode(m_options.vsync ? Vulkan::PresentMode::SyncToVBlank
                                                        : Vulkan::PresentMode::UnlockedMaybeTear);
@@ -212,9 +224,11 @@ namespace ps2x::gs
                                                       Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT |
                                                           Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT))
                     return fail("Vulkan", "instance/device creation failed");
-                if (!m_wsi.init_device() || !m_wsi.init_surface_swapchain())
+                if (!m_wsi.init_device() || (!m_metalPresent && !m_wsi.init_surface_swapchain()))
                     return fail("Vulkan", "swapchain creation failed");
-                if (presentAtTimeWanted())
+                if (presentAtTimeWanted() && m_metalPresent)
+                    m_presentAtTime = true; // Metal's presentDrawable:atTime:
+                else if (presentAtTimeWanted())
                 {
                     auto &table = const_cast<VolkDeviceTable &>(m_wsi.get_context().get_device_table());
                     g_realQueuePresent = table.vkQueuePresentKHR;
@@ -305,6 +319,14 @@ namespace ps2x::gs
                         m_metalfx = MetalFxSpatial::create(mtlDevice);
                         m_metalfxTemporal = MetalFxTemporal::create(mtlDevice);
                     }
+                    if (m_metalPresent)
+                    {
+                        m_metalView = SDL_Metal_CreateView(m_window);
+                        if (mtlDevice && m_metalView)
+                            m_metal = MetalPresent::create(mtlDevice, SDL_Metal_GetLayer(m_metalView), m_options.vsync);
+                        if (!m_metal)
+                            return fail("Metal", "could not present through the window's CAMetalLayer");
+                    }
                     std::cout << "[presenter] MetalFX spatial "
                               << (m_metalfx ? "available"
                                             : !getDevice ? "unavailable (no MoltenVK Metal interop)"
@@ -323,8 +345,8 @@ namespace ps2x::gs
                     Vulkan::ImageInitialData searchData = {searchTexBytes, 0, 0};
                     m_smaaSearch = m_shared.device->create_image(search, &searchData);
                 }
-                std::cout << "[presenter] Vulkan swapchain " << m_platform->get_surface_width() << "x"
-                          << m_platform->get_surface_height() << (m_options.vsync ? " (vsync)" : "") << std::endl;
+                std::cout << "[presenter] " << (m_metalPresent ? "Metal layer " : "Vulkan swapchain ") << m_platform->get_surface_width()
+                          << "x" << m_platform->get_surface_height() << (m_options.vsync ? " (vsync)" : "") << std::endl;
                 return true;
             }
 
@@ -902,7 +924,10 @@ namespace ps2x::gs
             // original by the GS's UI mask.
             void spareUi(Vulkan::CommandBuffer &cmd, float fw, float fh)
             {
-                const Vulkan::Image *original = sourceImage();
+                // A shadow frame takes its HUD from the real frame (same mask, same HUD).
+                const Vulkan::Image *original = m_sourceOverride ? (m_flickerOut ? m_flickerOut.get()
+                                                                                 : (m_shared.attached ? m_shared.scanout : m_cpuFrame).get())
+                                                                 : sourceImage();
                 if (!m_final || !original || m_final == original || !m_shared.ui ||
                     m_shared.ui->get_width() != original->get_width() || m_shared.ui->get_height() != original->get_height())
                     return;
@@ -1097,9 +1122,33 @@ namespace ps2x::gs
 #endif
                 if (m_shared.flushLocked)
                     m_shared.flushLocked();
-                if (!m_wsi.begin_frame())
-                    return;
-                const Vulkan::Image &back = dev.get_swapchain_view().get_image();
+                const Vulkan::Image *backImage = nullptr;
+                if (m_metalPresent)
+                {
+                    // Into an offscreen backbuffer (a ring of three: Metal may still be copying the
+                    // one before), presented through Metal after the lock is released.
+                    dev.next_frame_context();
+                    int pw = 0, ph = 0;
+                    SDL_GetWindowSizeInPixels(m_window, &pw, &ph);
+                    const uint32_t bw = static_cast<uint32_t>(std::max(pw, 1)), bh = static_cast<uint32_t>(std::max(ph, 1));
+                    m_backIndex = (m_backIndex + 1) % 3;
+                    Vulkan::ImageHandle &bb = m_backbuffers[m_backIndex];
+                    if (!bb || bb->get_width() != bw || bb->get_height() != bh)
+                    {
+                        auto info = Vulkan::ImageCreateInfo::render_target(bw, bh, VK_FORMAT_B8G8R8A8_UNORM);
+                        info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                        info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                        bb = dev.create_image(info);
+                    }
+                    backImage = bb.get();
+                }
+                else
+                {
+                    if (!m_wsi.begin_frame())
+                        return;
+                    backImage = &dev.get_swapchain_view().get_image();
+                }
+                const Vulkan::Image &back = *backImage;
                 const float fw = static_cast<float>(back.get_width()), fh = static_cast<float>(back.get_height());
                 auto cmd = dev.request_command_buffer();
                 // A new guest frame, or another display refresh of the same one.
@@ -1125,6 +1174,39 @@ namespace ps2x::gs
                     m_finalRcas = m_lastRcas;
                 }
                 spareUi(*cmd, fw, fh);
+                if (m_metalPresent)
+                {
+                    cmd->image_barrier(back, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, 0,
+                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                    Vulkan::RenderPassInfo rp = {};
+                    rp.num_color_attachments = 1;
+                    rp.color_attachments[0] = &back.get_view();
+                    rp.clear_attachments = 1;
+                    rp.store_attachments = 1;
+                    cmd->begin_render_pass(rp);
+                    drawScene(*cmd, fw, fh);
+                    cmd->end_render_pass();
+                    cmd->image_barrier(back, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+                    dev.submit(cmd); // MoltenVK commits it to the Metal queue before returning
+                    if (!m_capturePath.empty())
+                        captureLocked(fw, fh);
+                    schedulePresent();
+                    void *texture = nullptr, *queue = nullptr;
+                    m_getTexture(back.get_image(), &texture);
+                    m_getQueue(m_wsi.get_context().get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS], &queue);
+                    const uint64_t desired = g_desiredPresentNs, target = g_targetRefreshNs;
+                    g_desiredPresentNs = 0;
+                    lock.unlock();
+                    // Waits for a drawable here, holding nothing the GS thread needs.
+                    m_metal->present(queue, texture, back.get_width(), back.get_height(), desired ? static_cast<double>(desired) / 1e9 : 0.0,
+                                     [this, target](double presented) {
+                                         if (presented > 0.0 && target)
+                                             notePresented(static_cast<int64_t>(target), static_cast<int64_t>(presented * 1e9));
+                                     });
+                    return;
+                }
                 auto rp = dev.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
                 rp.clear_color[0] = {};
                 cmd->begin_render_pass(rp);
@@ -1137,6 +1219,14 @@ namespace ps2x::gs
                 m_wsi.end_frame();
             }
 
+            // Metal's presented times (from a Metal thread) for the adaptive present lead.
+            void notePresented(int64_t target, int64_t presented)
+            {
+                std::lock_guard<std::mutex> lock(m_presentedMutex);
+                if (m_presented.size() < 64)
+                    m_presented.push_back({target, presented});
+            }
+
             // With present-at-time, presents wait in the queue for their refresh, so the swapchain's
             // images (Metal keeps at most 3 drawables) can all be in flight at 120 presents per
             // second, and acquiring the next one would block inside render(), under the device
@@ -1144,6 +1234,8 @@ namespace ps2x::gs
             // the lock, until the present two back is on screen and its image is free again.
             void waitForDrawable()
             {
+                if (m_metalPresent)
+                    return; // Metal fetches its drawable after the device lock is released
                 const int64_t due = m_presentTargets[(m_presentCount + 1) % 3]; // two presents back
                 if (!m_presentAtTime || !due)
                     return;
@@ -1191,24 +1283,38 @@ namespace ps2x::gs
                 const int64_t minLead = 2000000, maxLead = period;
                 if (m_presentLead == 0)
                     m_presentLead = period / 2;
-                if (!m_pastTiming && g_timedSwapchain)
-                    m_pastTiming = reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(
-                        vkGetDeviceProcAddr(m_wsi.get_context().get_device(), "vkGetPastPresentationTimingGOOGLE"));
-                if (!m_pastTiming || !g_timedSwapchain)
-                    return;
-                VkPastPresentationTimingGOOGLE past[16];
-                uint32_t count = 16;
-                const VkResult r = m_pastTiming(m_wsi.get_context().get_device(), g_timedSwapchain, &count, past);
-                if (r != VK_SUCCESS && r != VK_INCOMPLETE)
-                    return;
-                for (uint32_t i = 0; i < count; ++i)
+                // (target refresh, time on screen) of recent presents: from Metal's presented
+                // handlers, or VK_GOOGLE_display_timing on the swapchain path.
+                std::vector<std::pair<int64_t, int64_t>> shown;
+                if (m_metalPresent)
                 {
-                    const TimedPresent &sent = g_timedPresents[past[i].presentID % 16];
-                    if (sent.id != past[i].presentID || !sent.target || !past[i].actualPresentTime)
-                        continue;
+                    std::lock_guard<std::mutex> lock(m_presentedMutex);
+                    shown.swap(m_presented);
+                }
+                else
+                {
+                    if (!m_pastTiming && g_timedSwapchain)
+                        m_pastTiming = reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(
+                            vkGetDeviceProcAddr(m_wsi.get_context().get_device(), "vkGetPastPresentationTimingGOOGLE"));
+                    if (!m_pastTiming || !g_timedSwapchain)
+                        return;
+                    VkPastPresentationTimingGOOGLE past[16];
+                    uint32_t count = 16;
+                    const VkResult r = m_pastTiming(m_wsi.get_context().get_device(), g_timedSwapchain, &count, past);
+                    if (r != VK_SUCCESS && r != VK_INCOMPLETE)
+                        return;
+                    for (uint32_t i = 0; i < count; ++i)
+                    {
+                        const TimedPresent &sent = g_timedPresents[past[i].presentID % 16];
+                        if (sent.id == past[i].presentID && sent.target && past[i].actualPresentTime)
+                            shown.push_back({sent.target, static_cast<int64_t>(past[i].actualPresentTime)});
+                    }
+                }
+                for (const auto &[sentTarget, actual] : shown)
+                {
                     // Metal's presented time sits a steady few ms after the display link's refresh
                     // time; a miss shows up a whole refresh later than that offset.
-                    const int64_t offset = static_cast<int64_t>(past[i].actualPresentTime) - sent.target;
+                    const int64_t offset = actual - sentTarget;
                     m_offsetWindowMin = std::min(m_offsetWindowMin, offset);
                     if (++m_offsetSamples >= 240)
                     {
@@ -1322,6 +1428,14 @@ namespace ps2x::gs
             float m_genJitterDelta[2] = {};
             uint64_t m_renderedTick = ~0ull;
             uint32_t m_presents = 1;
+            // Presenting through Metal (macOS).
+            bool m_metalPresent = false;
+            SDL_MetalView m_metalView = nullptr;
+            std::unique_ptr<MetalPresent> m_metal;
+            Vulkan::ImageHandle m_backbuffers[3];
+            uint32_t m_backIndex = 0;
+            std::mutex m_presentedMutex;
+            std::vector<std::pair<int64_t, int64_t>> m_presented; // (target refresh, on screen), host ns
             bool m_presentAtTime = false;
             int64_t m_presentTarget = 0; // host ns of the refresh the last present was aimed at
             int64_t m_presentTargets[3] = {}; // the last three presents' refreshes (ring)

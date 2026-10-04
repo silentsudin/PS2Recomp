@@ -658,6 +658,23 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     processGIFPacket(2u, data, sizeBytes);
 }
 
+namespace
+{
+    // IEEE half to float (the per-vertex motion is packed half2).
+    float halfToFloat(uint16_t h)
+    {
+        const uint32_t sign = (h >> 15) & 1u, exp = (h >> 10) & 0x1Fu, mant = h & 0x3FFu;
+        float v;
+        if (exp == 0)
+            v = std::ldexp(static_cast<float>(mant), -24);
+        else if (exp == 31)
+            v = mant ? NAN : INFINITY;
+        else
+            v = std::ldexp(static_cast<float>(mant | 0x400u), static_cast<int>(exp) - 25);
+        return sign ? -v : v;
+    }
+}
+
 void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -715,10 +732,27 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
             accumulateMotionStats();
             // Re-rendered frame generation: the same 3D moved on by part of a frame per shadow.
             const uint32_t shadows = std::min<uint32_t>(m_packetMirror->ShadowFrames(), 3u);
-            for (uint32_t i = 0; i < shadows; ++i)
+            // HUD vertices (the classifier's UI class) stay put in shadow frames.
+            const auto &vertexClasses = m_wide.vertexClasses();
+            m_shadowKeep.assign(vertexClasses.size(), 0);
+            for (size_t v = 0; v < vertexClasses.size(); ++v)
+                m_shadowKeep[v] = vertexClasses[v] == ps2x::gs::WideLayout::VertexClass::Ui;
+            // A whole object whose extrapolation is absurd (a mismatched object, a camera cut)
+            // stays where it is: its vertices' screen motion (packetMotion, half floats) is huge.
+            bool plausible = true;
+            for (uint32_t m : m_motionScratch)
+            {
+                const float dx = halfToFloat(static_cast<uint16_t>(m)), dy = halfToFloat(static_cast<uint16_t>(m >> 16));
+                if (std::fabs(dx) > 200.0f || std::fabs(dy) > 200.0f)
+                {
+                    plausible = false;
+                    break;
+                }
+            }
+            for (uint32_t i = 0; i < shadows && plausible; ++i)
             {
                 const double t = static_cast<double>(i + 1) / static_cast<double>(shadows + 1);
-                ps2x::gs::MotionTracker::packetReproject(data, sizeBytes & ~15u, motion, t, m_shadowScratch[i]);
+                ps2x::gs::MotionTracker::packetReproject(data, sizeBytes & ~15u, motion, t, m_shadowScratch[i], &m_shadowKeep);
                 m_packetMirror->SetShadowVariant(i, m_shadowScratch[i].data(), static_cast<uint32_t>(m_shadowScratch[i].size()));
             }
         }
