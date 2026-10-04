@@ -540,6 +540,7 @@ void GS::latchHostPresentationFrame(bool keepOnGpu, bool readback)
         }
         request = buildPresentationRequestUnlocked();
         m_wide.framePresented();
+        publishWideUnlocked();
     }
     request.keepOnGpu = keepOnGpu;
     request.readback = readback;
@@ -670,6 +671,7 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
             st.ofy[c] = m_ctx[c].xyoffset.ofy;
         }
         m_wide.transformPacket(pathIndex, m_wideScratch.data(), sizeBytes, st);
+        publishWideUnlocked();
         data = m_wideScratch.data();
     }
 
@@ -1876,32 +1878,29 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
     }
 }
 
+void GS::publishWideUnlocked()
+{
+    m_wideDriving.store(m_wide.active() && m_wide.driving(), std::memory_order_relaxed);
+    m_wide2D.store(m_wide.lastFrameWas2D(), std::memory_order_relaxed);
+    m_wideK.store(m_wide.horizontalScale(), std::memory_order_relaxed);
+}
+
 void GS::setWideLayout(float aspect, ps2x::gs::HudPlacement placement)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_wide.configure(aspect, placement);
+    publishWideUnlocked();
 }
 
-bool GS::lastFrameWas2D() const
-{
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    return m_wide.lastFrameWas2D();
-}
+bool GS::lastFrameWas2D() const { return m_wide2D.load(std::memory_order_relaxed); }
 
-bool GS::wideDriving() const
-{
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    return m_wide.active() && m_wide.driving();
-}
+bool GS::wideDriving() const { return m_wideDriving.load(std::memory_order_relaxed); }
 
-float GS::wideHorizontalScale() const
-{
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    return m_wide.horizontalScale();
-}
+float GS::wideHorizontalScale() const { return m_wideK.load(std::memory_order_relaxed); }
 
 void GS::markFrameStart()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_wide.frameStart();
+    publishWideUnlocked();
 }

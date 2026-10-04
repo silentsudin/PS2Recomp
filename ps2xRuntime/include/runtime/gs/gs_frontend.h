@@ -2,6 +2,7 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -202,6 +203,11 @@ private:
     GSContext m_ctx[2];
     GSPrimReg m_prim{};
     ps2x::gs::WideLayout m_wide;           // widescreen 2D placement (gs_wide_layout.h)
+    // m_wide's answers for other threads without the state lock (the game's camera hook asks on
+    // every camera build): published after each change, under the lock.
+    std::atomic<bool> m_wideDriving{false}, m_wide2D{false};
+    std::atomic<float> m_wideK{1.0f};
+    void publishWideUnlocked();
     std::vector<uint8_t> m_wideScratch;    // the packet being transformed
     GSPrimReg m_primRegister{};
     GSPrimReg m_prmodeRegister{};
