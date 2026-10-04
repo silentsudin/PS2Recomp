@@ -2191,7 +2191,9 @@ void PS2DebugPanel::initialize()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (!m_initialized)
     {
-        rlImGuiSetup(true);
+        // The runtime's presenter normally sets up ImGui (ps2_host_presenter.h).
+        if (!ImGui::GetCurrentContext())
+            rlImGuiSetup(true);
         m_initialized = true;
     }
 #endif
@@ -2202,7 +2204,7 @@ void PS2DebugPanel::shutdown()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (m_initialized)
     {
-        rlImGuiShutdown();
+        // The presenter shuts ImGui down (uiShutdown) after the app's shutdown hook.
         m_initialized = false;
     }
 #endif

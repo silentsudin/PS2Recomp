@@ -288,6 +288,10 @@ struct GSPresentationRequest
     GSFrameReg preferredSource{};
     uint32_t preferredDestFbp = 0;
     bool hasPreferredSource = false;
+    // A presenter that draws on the GPU (paraLLEl-GS + Vulkan presenter) keeps the picture there;
+    // `readback` still copies it to the CPU (test captures).
+    bool keepOnGpu = false;
+    bool readback = true;
 };
 
 struct PresentationFrame

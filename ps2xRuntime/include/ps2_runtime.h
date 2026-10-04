@@ -37,6 +37,7 @@
 #include "runtime/ps2_rom_device.h"
 #include "runtime/ps2_vfs.h"
 #include "ps2x/iop/iop_types.h"
+#include "runtime/ps2_host_presenter.h"
 
 namespace ps2x::iop
 {
@@ -335,6 +336,11 @@ public:
     bool zeroIopMemory(uint32_t address, size_t size);
     bool isIopMemoryRange(uint32_t address, size_t size) const;
 
+    // The window and presentation (ps2_host_presenter.h). Set before initialize(); without one,
+    // initialize() uses raylib unless RT_HEADLESS=1.
+    void setPresenter(std::unique_ptr<ps2x::HostPresenter> presenter) { m_presenter = std::move(presenter); }
+    ps2x::HostPresenter *presenter() { return m_presenter.get(); }
+
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,
                              DebugUiCallback drawCallback,
@@ -569,6 +575,7 @@ private:
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
+    std::unique_ptr<ps2x::HostPresenter> m_presenter;
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;

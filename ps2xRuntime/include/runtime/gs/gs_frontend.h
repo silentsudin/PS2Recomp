@@ -131,7 +131,9 @@ public:
     bool isDebugHistoryPaused() const;
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
-    void latchHostPresentationFrame();
+    // keepOnGpu: a GPU presenter shows the picture (the backend keeps it as an image); readback
+    // additionally copies it to the CPU like the default path (test captures).
+    void latchHostPresentationFrame(bool keepOnGpu = false, bool readback = true);
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,

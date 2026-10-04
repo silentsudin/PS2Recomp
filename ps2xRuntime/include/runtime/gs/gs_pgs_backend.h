@@ -13,6 +13,11 @@
 #include <memory>
 #include <string>
 
+namespace ps2x
+{
+    class HostPresenter;
+}
+
 namespace ps2x::gs
 {
     struct PgsOptions
@@ -21,6 +26,9 @@ namespace ps2x::gs
         std::string vulkanLibrary;
         // Directory for the Vulkan pipeline cache. Empty = no persistent cache.
         std::string pipelineCacheDir;
+        // A presenter from createPgsPresenter: the GS renders on its device and the picture goes
+        // straight to its swapchain. nullptr = a device of its own, pictures read back to the CPU.
+        HostPresenter *presenter = nullptr;
     };
 
     struct PgsDeviceInfo
@@ -50,4 +58,13 @@ namespace ps2x::gs
                                                       PgsControl **control = nullptr);
 
     bool pgsAvailable();
+
+    struct PgsPresenterOptions
+    {
+        std::string vulkanLibrary; // as PgsOptions
+        bool vsync = true;         // FIFO; false = mailbox (or immediate)
+    };
+    // A presenter (ps2_host_presenter.h) with an SDL3 window and a Vulkan swapchain whose device the
+    // GS backend shares (pass it in PgsOptions::presenter). nullptr (and `error`) if unavailable.
+    std::unique_ptr<HostPresenter> createPgsPresenter(const PgsPresenterOptions &options, std::string &error);
 }

@@ -139,6 +139,11 @@ else()
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
         )
         target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
+        if(PS2X_HOST_PLATFORM STREQUAL "SDL3")
+            # Platform backend for the Vulkan presenter's host UI.
+            target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp")
+            target_link_libraries(imgui PUBLIC SDL3::SDL3)
+        endif()
 
         FetchContent_Declare(
             rlImGui
@@ -423,6 +428,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/host/raylib_presenter.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_capture.cpp
@@ -541,6 +547,11 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+# The presenters draw the host UI: with the debug UI, the runtime itself links ImGui (and rlImGui).
+if(PS2X_ENABLE_DEBUG_UI AND TARGET rlImGui)
+    target_link_libraries(ps2_runtime PRIVATE rlImGui imgui)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+endif()
 
 # GPU GS: paraLLEl-GS (Vulkan compute). On macOS it runs on MoltenVK.
 if(APPLE)
@@ -549,7 +560,7 @@ else()
     set(PS2X_ENABLE_PGS_DEFAULT OFF)
 endif()
 option(PS2X_ENABLE_PGS "Build the paraLLEl-GS Vulkan GS backend" ${PS2X_ENABLE_PGS_DEFAULT})
-target_sources(ps2_runtime PRIVATE src/lib/gs/gs_pgs_backend.cpp)
+target_sources(ps2_runtime PRIVATE src/lib/gs/gs_pgs_backend.cpp src/lib/gs/gs_pgs_presenter.cpp)
 if(PS2X_ENABLE_PGS)
     set(PS2X_PGS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/parallel-gs")
     if(NOT EXISTS "${PS2X_PGS_DIR}/Granite/CMakeLists.txt")
@@ -565,6 +576,11 @@ if(PS2X_ENABLE_PGS)
     endif()
     target_link_libraries(ps2_runtime PRIVATE parallel-gs)
     target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_PGS=1)
+    if(PS2X_HOST_PLATFORM STREQUAL "SDL3")
+        # The Vulkan presenter: SDL3 window + swapchain on the GS's device.
+        target_compile_definitions(ps2_runtime PRIVATE PS2X_PGS_PRESENTER=1)
+        target_link_libraries(ps2_runtime PRIVATE SDL3::SDL3)
+    endif()
     message(STATUS "paraLLEl-GS Vulkan GS backend: enabled")
 endif()
 target_link_libraries(ps2EntryRunner

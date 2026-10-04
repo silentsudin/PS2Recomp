@@ -525,7 +525,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
-void GS::latchHostPresentationFrame()
+void GS::latchHostPresentationFrame(bool keepOnGpu, bool readback)
 {
     GSPresentationRequest request{};
     {
@@ -540,6 +540,8 @@ void GS::latchHostPresentationFrame()
         }
         request = buildPresentationRequestUnlocked();
     }
+    request.keepOnGpu = keepOnGpu;
+    request.readback = readback;
 
     PresentationFrame frame{};
     {
@@ -552,6 +554,8 @@ void GS::latchHostPresentationFrame()
         }
     }
 
+    if (keepOnGpu && !readback)
+        return; // shown straight from the GPU; the CPU copy stays as it was
     const bool hasFrame = static_cast<bool>(frame);
     const uint32_t displayFbp = frame.displayFbp;
     const uint32_t sourceFbp = frame.sourceFbp;

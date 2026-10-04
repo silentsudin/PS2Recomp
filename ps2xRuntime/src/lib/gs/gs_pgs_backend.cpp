@@ -9,6 +9,7 @@
 #include "device.hpp"
 #include "gs_interface.hpp"
 #include "thread_id.hpp"
+#include "gs_pgs_shared.h"
 
 #include <algorithm>
 #include <atomic>
@@ -84,27 +85,51 @@ namespace ps2x::gs
         class PgsBackend final : public GSRasterBackend, public GSPacketMirror, public PgsControl
         {
         public:
+            ~PgsBackend() override
+            {
+                if (!m_shared)
+                    return;
+                const auto lock = lockDevice();
+                m_iface.flush();
+                m_shared->flushLocked = nullptr;
+                m_shared->attached = false;
+                m_shared->scanout.reset();
+            }
+
             bool init(const PgsOptions &options, std::string &error)
             {
-                if (!options.vulkanLibrary.empty())
-                    setenv("GRANITE_VULKAN_LIBRARY", options.vulkanLibrary.c_str(), 1);
-
-                if (!Vulkan::Context::init_loader(nullptr))
+                if (PgsShared *shared = pgsShared(options.presenter))
                 {
-                    error = "could not load a Vulkan library (MoltenVK)";
-                    return false;
+                    // The presenter's device: draw into its swapchain, no readback per frame.
+                    m_shared = shared;
+                    m_dev = shared->device;
+                    m_mtx = &shared->mutex;
+                    shared->attached = true;
+                    shared->flushLocked = [this] { m_iface.flush(); };
                 }
-
-                m_context.set_num_thread_indices(1);
-                if (!m_context.init_instance_and_device(nullptr, 0, nullptr, 0,
-                                                        Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT))
+                else
                 {
-                    error = "Vulkan instance/device creation failed";
-                    return false;
-                }
+                    if (!options.vulkanLibrary.empty())
+                        setenv("GRANITE_VULKAN_LIBRARY", options.vulkanLibrary.c_str(), 1);
 
-                m_device.set_context(m_context);
-                m_device.init_frame_contexts(4);
+                    if (!Vulkan::Context::init_loader(nullptr))
+                    {
+                        error = "could not load a Vulkan library (MoltenVK)";
+                        return false;
+                    }
+
+                    m_context.set_num_thread_indices(1);
+                    if (!m_context.init_instance_and_device(nullptr, 0, nullptr, 0,
+                                                            Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT))
+                    {
+                        error = "Vulkan instance/device creation failed";
+                        return false;
+                    }
+
+                    m_dev->set_context(m_context);
+                    m_dev->init_frame_contexts(4);
+                }
+                const auto initLock = lockDevice();
 
                 ParallelGS::GSOptions gsOptions = {};
                 // The game draws 224-line fields. Super-sampling plus a high-resolution progressive
@@ -114,13 +139,13 @@ namespace ps2x::gs
                 m_progressive = !envEquals("RT_GS_PROGRESSIVE", "0");
                 gsOptions.super_sampling = superSamplingFromEnv(m_progressive ? 4u : 1u);
                 m_samples = static_cast<uint32_t>(gsOptions.super_sampling);
-                if (!m_iface.init(&m_device, gsOptions))
+                if (!m_iface.init(m_dev, gsOptions))
                 {
                     error = "paraLLEl-GS init failed (missing Vulkan features?)";
                     return false;
                 }
 
-                const auto &props = m_device.get_gpu_properties();
+                const auto &props = m_dev->get_gpu_properties();
                 m_info.name = props.deviceName;
                 m_info.vendorId = props.vendorID;
                 m_info.deviceId = props.deviceID;
@@ -262,9 +287,20 @@ namespace ps2x::gs
                     // Field phase of the buffer on display, from the guest's vblank timeline
                     // (see gs_display_phase.h).
                     vsync.phase = g_displayFieldPhase.load(std::memory_order_relaxed);
-                    vsync.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                    vsync.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
-                    vsync.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
+                    const bool onGpu = request.keepOnGpu && m_shared;
+                    if (onGpu)
+                    {
+                        // Sampled by the presenter; a readback transitions it and back.
+                        vsync.dst_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        vsync.dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+                        vsync.dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                    }
+                    else
+                    {
+                        vsync.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                        vsync.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
+                        vsync.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
+                    }
                     vsync.adapt_to_internal_horizontal_resolution = true;
                     // Road Trip renders 640x224 fields (INT=1, FFMD=1). Progressive mode scans out
                     // the super-sampled field at double height instead of bobbing between fields.
@@ -282,9 +318,21 @@ namespace ps2x::gs
                     {
                         w = scanout.image->get_width();
                         h = scanout.image->get_height();
-                        fence = submitReadbackLocked(*scanout.image);
+                        if (onGpu)
+                            m_shared->scanout = scanout.image;
+                        if (!onGpu || request.readback)
+                            fence = submitReadbackLocked(*scanout.image, onGpu);
                     }
-                    m_device.next_frame_context();
+                    // With a presenter, its swapchain frames advance the frame contexts.
+                    if (!m_shared)
+                        m_dev->next_frame_context();
+                }
+                if (onGpuOnly(request))
+                {
+                    PresentationFrame frame{};
+                    frame.width = w;
+                    frame.height = h;
+                    return frame;
                 }
 
                 PresentationFrame frame{};
@@ -305,16 +353,13 @@ namespace ps2x::gs
             // Granite logging an error per call from an unregistered thread.
             std::unique_lock<std::mutex> lockDevice() const
             {
-                static thread_local bool registered = false;
-                if (!registered)
-                {
-                    Util::register_thread_index(0);
-                    registered = true;
-                }
-                return std::unique_lock<std::mutex>(m_mutex);
+                pgsRegisterThread();
+                return std::unique_lock<std::mutex>(*m_mtx);
             }
             PgsDeviceInfo m_info;
-            Vulkan::Fence submitReadbackLocked(const Vulkan::Image &image)
+            bool onGpuOnly(const GSPresentationRequest &request) const { return request.keepOnGpu && m_shared && !request.readback; }
+
+            Vulkan::Fence submitReadbackLocked(const Vulkan::Image &image, bool sampledLayout)
             {
                 const uint32_t w = image.get_width();
                 const uint32_t h = image.get_height();
@@ -324,22 +369,30 @@ namespace ps2x::gs
                 info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
                 info.domain = Vulkan::BufferDomain::CachedHost;
                 if (!m_readback || m_readback->get_create_info().size < info.size)
-                    m_readback = m_device.create_buffer(info);
+                    m_readback = m_dev->create_buffer(info);
 
-                auto cmd = m_device.request_command_buffer();
+                auto cmd = m_dev->request_command_buffer();
+                if (sampledLayout)
+                    cmd->image_barrier(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT,
+                                       VK_ACCESS_2_TRANSFER_READ_BIT);
                 cmd->copy_image_to_buffer(*m_readback, image, 0, {}, {w, h, 1}, 0, 0,
                                           {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
+                if (sampledLayout)
+                    cmd->image_barrier(image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                       VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                       VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
                 cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                              VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
                 Vulkan::Fence fence;
-                m_device.submit(cmd, &fence);
+                m_dev->submit(cmd, &fence);
                 return fence;
             }
 
             PresentationFrame copyReadbackLocked(uint32_t w, uint32_t h)
             {
                 const auto *src = static_cast<const uint8_t *>(
-                    m_device.map_host_buffer(*m_readback, Vulkan::MEMORY_ACCESS_READ_BIT));
+                    m_dev->map_host_buffer(*m_readback, Vulkan::MEMORY_ACCESS_READ_BIT));
 
                 // The picture goes to the host at its native size (the high-resolution scanout is
                 // 1280x896 at 4x SSAA); only very large ones are box-filtered down.
@@ -380,7 +433,7 @@ namespace ps2x::gs
                         dst[x * 4u + 3u] = 0xFF;
                     }
                 }
-                m_device.unmap_host_buffer(*m_readback, Vulkan::MEMORY_ACCESS_READ_BIT);
+                m_dev->unmap_host_buffer(*m_readback, Vulkan::MEMORY_ACCESS_READ_BIT);
                 return frame;
             }
 
@@ -407,8 +460,10 @@ namespace ps2x::gs
                 m_gpuVramNewer = false;
             }
 
-            Vulkan::Context m_context;
+            Vulkan::Context m_context; // own device (no presenter) ...
             Vulkan::Device m_device;
+            Vulkan::Device *m_dev = &m_device; // ... or the presenter's
+            PgsShared *m_shared = nullptr;
             ParallelGS::GSInterface m_iface;
             Vulkan::BufferHandle m_readback;
 
@@ -417,10 +472,21 @@ namespace ps2x::gs
             uint32_t m_vramSize = 0u;
             bool m_gpuVramNewer = false;
             mutable std::mutex m_mutex;
+            std::mutex *m_mtx = &m_mutex;
         };
     }
 
     bool pgsAvailable() { return true; }
+
+    void pgsRegisterThread()
+    {
+        static thread_local bool registered = false;
+        if (!registered)
+        {
+            Util::register_thread_index(0);
+            registered = true;
+        }
+    }
 
     std::unique_ptr<GSRasterBackend> createPgsBackend(const PgsOptions &options, std::string &error,
                                                       PgsControl **control)
@@ -439,6 +505,12 @@ namespace ps2x::gs
 namespace ps2x::gs
 {
     bool pgsAvailable() { return false; }
+
+    std::unique_ptr<HostPresenter> createPgsPresenter(const PgsPresenterOptions &, std::string &error)
+    {
+        error = "built without paraLLEl-GS (PS2X_ENABLE_PGS=OFF)";
+        return nullptr;
+    }
 
     std::unique_ptr<GSRasterBackend> createPgsBackend(const PgsOptions &, std::string &error, PgsControl **)
     {
