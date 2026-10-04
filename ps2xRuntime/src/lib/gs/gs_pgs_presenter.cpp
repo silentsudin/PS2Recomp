@@ -10,6 +10,12 @@
 
 #include "gs_pgs_shared.h"
 #include "imgui_spirv.h"
+#include "post/post_spirv.h"
+
+// FidelityFX FSR 1 constants, computed on the CPU (post/ffx, MIT).
+#define A_CPU 1
+#include "post/ffx/ffx_a.h"
+#include "post/ffx/ffx_fsr1.h"
 
 #include "ps2_runtime.h"
 #include "runtime/ee_scheduler.h"
@@ -31,6 +37,7 @@
 #include "raylib.h" // ExportImage for screenshots
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
@@ -160,6 +167,24 @@ namespace ps2x::gs
                                                              sizeof(imgui_spirv::__glsl_shader_frag_spv), &vert, &frag);
                 if (!m_program)
                     return fail("Vulkan", "presenter shaders");
+                // Post-processing: a fullscreen triangle and one fragment shader per pass.
+                Vulkan::ResourceLayout fsVert = {};
+                fsVert.output_mask = 0x1;
+                auto post = [&](const uint32_t *code, size_t size, uint32_t push, uint32_t inputs) {
+                    Vulkan::ResourceLayout frag = {};
+                    frag.input_mask = inputs;
+                    frag.output_mask = 0x1;
+                    frag.push_constant_size = push;
+                    frag.sets[0].sampled_image_mask = 0x1;
+                    frag.sets[0].fp_mask = 0x1;
+                    return m_shared.device->request_program(post_spirv::fullscreen_vert, sizeof(post_spirv::fullscreen_vert),
+                                                            code, size, &fsVert, &frag);
+                };
+                m_fxaa = post(post_spirv::fxaa_frag, sizeof(post_spirv::fxaa_frag), 8, 0x1);
+                m_easu = post(post_spirv::fsr_easu_frag, sizeof(post_spirv::fsr_easu_frag), 80, 0);
+                m_rcas = post(post_spirv::fsr_rcas_frag, sizeof(post_spirv::fsr_rcas_frag), 32, 0);
+                if (!m_fxaa || !m_easu || !m_rcas)
+                    return fail("Vulkan", "post-processing shaders");
                 std::cout << "[presenter] Vulkan swapchain " << m_platform->get_surface_width() << "x"
                           << m_platform->get_surface_height() << (m_options.vsync ? " (vsync)" : "") << std::endl;
                 return true;
@@ -307,14 +332,111 @@ namespace ps2x::gs
 
             // The game picture, letterboxed to 4:3 (the PS2 always drives a 4:3 TV) or, with
             // widescreen, to the display aspect.
-            void drawGame(Vulkan::CommandBuffer &cmd, float fw, float fh)
+            // Where the picture goes on the swapchain: the letterbox rectangle (in whole pixels).
+            VkRect2D pictureRect(float fw, float fh) const
+            {
+                const float w = std::floor(std::min(fw, fh * m_pictureAspect)), h = std::floor(w / m_pictureAspect);
+                return {{static_cast<int32_t>((fw - w) * 0.5f), static_cast<int32_t>((fh - h) * 0.5f)},
+                        {static_cast<uint32_t>(w), static_cast<uint32_t>(h)}};
+            }
+
+            // Renders a fullscreen pass from `src` into `dst` (re-created at w x h when needed).
+            void offscreenPass(Vulkan::CommandBuffer &cmd, Vulkan::ImageHandle &dst, uint32_t w, uint32_t h,
+                               Vulkan::Program *program, const Vulkan::Image &src, const void *push, uint32_t pushSize)
+            {
+                if (!dst || dst->get_width() != w || dst->get_height() != h)
+                {
+                    auto info = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
+                    info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    dst = m_shared.device->create_image(info);
+                }
+                cmd.image_barrier(*dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                Vulkan::RenderPassInfo rp = {};
+                rp.num_color_attachments = 1;
+                rp.color_attachments[0] = &dst->get_view();
+                rp.store_attachments = 1;
+                cmd.begin_render_pass(rp);
+                cmd.set_program(program);
+                cmd.set_opaque_state();
+                cmd.set_depth_test(false, false);
+                cmd.set_cull_mode(VK_CULL_MODE_NONE);
+                cmd.set_texture(0, 0, src.get_view(), Vulkan::StockSampler::LinearClamp);
+                cmd.push_constants(push, 0, pushSize);
+                cmd.draw(3);
+                cmd.end_render_pass();
+                cmd.image_barrier(*dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            }
+
+            // Before the swapchain pass: anti-aliasing at the render resolution, then FSR 1 EASU to
+            // the picture's size on screen. Leaves the image the final pass draws in m_final.
+            void preparePicture(Vulkan::CommandBuffer &cmd, float fw, float fh)
             {
                 const Vulkan::ImageHandle &image = m_shared.attached ? m_shared.scanout : m_cpuFrame;
+                m_final = image.get();
+                m_finalRcas = false;
                 if (!image)
                     return;
-                const float kAspect = m_pictureAspect;
-                const float w = std::min(fw, fh * kAspect), h = w / kAspect;
-                const float x0 = (fw - w) * 0.5f, y0 = (fh - h) * 0.5f;
+                const uint32_t sw = image->get_width(), sh = image->get_height();
+                if (m_post.aa == PostProcess::AntiAliasing::Fxaa)
+                {
+                    const float rcp[2] = {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh)};
+                    offscreenPass(cmd, m_aaImage, sw, sh, m_fxaa, *m_final, rcp, sizeof(rcp));
+                    m_final = m_aaImage.get();
+                }
+                const VkRect2D rect = pictureRect(fw, fh);
+                if (m_post.scaling == PostProcess::Scaling::Fsr1 && rect.extent.width > sw)
+                {
+                    struct
+                    {
+                        AU1 con[16];
+                        uint32_t origin[4];
+                    } push = {};
+                    FsrEasuCon(push.con, push.con + 4, push.con + 8, push.con + 12, static_cast<AF1>(sw), static_cast<AF1>(sh),
+                               static_cast<AF1>(sw), static_cast<AF1>(sh), static_cast<AF1>(rect.extent.width),
+                               static_cast<AF1>(rect.extent.height));
+                    offscreenPass(cmd, m_upImage, rect.extent.width, rect.extent.height, m_easu, *m_final, &push, sizeof(push));
+                    m_final = m_upImage.get();
+                    m_finalRcas = true;
+                }
+            }
+
+            void drawGame(Vulkan::CommandBuffer &cmd, float fw, float fh)
+            {
+                if (!m_final)
+                    return;
+                const VkRect2D rect = pictureRect(fw, fh);
+                if (m_finalRcas)
+                {
+                    // FSR 1 RCAS, sharpening into the picture's rectangle on the swapchain.
+                    struct
+                    {
+                        AU1 con[4];
+                        uint32_t origin[4];
+                    } push = {};
+                    FsrRcasCon(push.con, (1.0f - std::clamp(m_post.sharpness, 0.0f, 1.0f)) * 2.0f);
+                    push.origin[0] = static_cast<uint32_t>(rect.offset.x);
+                    push.origin[1] = static_cast<uint32_t>(rect.offset.y);
+                    cmd.set_program(m_rcas);
+                    cmd.set_opaque_state();
+                    cmd.set_depth_test(false, false);
+                    cmd.set_cull_mode(VK_CULL_MODE_NONE);
+                    cmd.set_viewport({static_cast<float>(rect.offset.x), static_cast<float>(rect.offset.y),
+                                      static_cast<float>(rect.extent.width), static_cast<float>(rect.extent.height), 0.0f, 1.0f});
+                    cmd.set_scissor(rect);
+                    cmd.set_texture(0, 0, m_final->get_view(), Vulkan::StockSampler::NearestClamp);
+                    cmd.push_constants(&push, 0, sizeof(push));
+                    cmd.draw(3);
+                    cmd.set_viewport({0.0f, 0.0f, fw, fh, 0.0f, 1.0f});
+                    return;
+                }
+                const Vulkan::Image *image = m_final;
+                const float w = static_cast<float>(rect.extent.width), h = static_cast<float>(rect.extent.height);
+                const float x0 = static_cast<float>(rect.offset.x), y0 = static_cast<float>(rect.offset.y);
                 bindState(cmd, fw, fh);
                 cmd.set_blend_enable(false);
                 cmd.set_scissor({{0, 0}, {static_cast<uint32_t>(fw), static_cast<uint32_t>(fh)}});
@@ -329,6 +451,12 @@ namespace ps2x::gs
                 cmd.set_texture(0, 0, image->get_view(), Vulkan::StockSampler::LinearClamp);
                 cmd.draw_indexed(6);
             }
+
+        public:
+            bool supportsPostProcess() const override { return true; }
+            void setPostProcess(const PostProcess &post) override { m_post = post; }
+
+        private:
 
 #if defined(PS2X_PGS_PRESENTER_UI)
             void updateTextures(ImDrawData *dd)
@@ -443,6 +571,7 @@ namespace ps2x::gs
                 const Vulkan::Image &back = dev.get_swapchain_view().get_image();
                 const float fw = static_cast<float>(back.get_width()), fh = static_cast<float>(back.get_height());
                 auto cmd = dev.request_command_buffer();
+                preparePicture(*cmd, fw, fh);
                 auto rp = dev.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
                 rp.clear_color[0] = {};
                 cmd->begin_render_pass(rp);
@@ -501,6 +630,11 @@ namespace ps2x::gs
             PgsShared m_shared;
             Vulkan::WSI m_wsi; // after m_shared: destroyed first, with the device
             Vulkan::Program *m_program = nullptr;
+            Vulkan::Program *m_fxaa = nullptr, *m_easu = nullptr, *m_rcas = nullptr;
+            PostProcess m_post;
+            Vulkan::ImageHandle m_aaImage, m_upImage; // intermediate pictures
+            const Vulkan::Image *m_final = nullptr;   // what the final pass draws this frame
+            bool m_finalRcas = false;
             Vulkan::ImageHandle m_cpuFrame; // CPU GS: the uploaded picture
             std::unordered_map<uint64_t, Vulkan::ImageHandle> m_textures; // by ImTextureID
             uint64_t m_nextTexture = 0;

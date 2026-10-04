@@ -11,6 +11,7 @@
 //
 // Headless runs (RT_HEADLESS=1) use no presenter.
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -46,6 +47,19 @@ namespace ps2x
         // 2D-backed (title, menus; GS::lastFrameWas2D) are still shown 4:3, pillarboxed.
         void setDisplayAspect(float aspect) { m_displayAspect = aspect; }
         float displayAspect() const { return m_displayAspect; }
+
+        // Post-processing of the game picture (the Vulkan presenter): edge anti-aliasing at the
+        // render resolution, then scaling to the window.
+        struct PostProcess
+        {
+            enum class AntiAliasing : uint8_t { None, Fxaa };
+            enum class Scaling : uint8_t { Bilinear, Fsr1 };
+            AntiAliasing aa = AntiAliasing::None;
+            Scaling scaling = Scaling::Bilinear;
+            float sharpness = 0.5f; // FSR 1 RCAS, 0 (soft) .. 1 (sharpest)
+        };
+        virtual bool supportsPostProcess() const { return false; }
+        virtual void setPostProcess(const PostProcess &post) { (void)post; }
 
         // The SDL_Window of this presenter, or nullptr (raylib keeps its own).
         virtual void *sdlWindow() { return nullptr; }
