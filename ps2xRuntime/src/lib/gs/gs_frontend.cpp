@@ -522,6 +522,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     request.preferredSource = m_preferredDisplaySourceFrame;
     request.preferredDestFbp = m_preferredDisplayDestFbp;
     request.hasPreferredSource = m_hasPreferredDisplaySource;
+    request.progressiveFields = progressiveFields();
     return request;
 }
 

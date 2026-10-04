@@ -119,6 +119,12 @@ public:
     // The game started drawing a frame (its clear, sceGsClear-style, from the GS stubs).
     void markFrameStart();
 
+    // Progressive fields: the game draws 224-line fields, nudged half a line down on every other
+    // one (sceGsSetHalfOffset) for an interlaced TV. With this on, the game hook drops the nudge
+    // and the scanout shows each field as a whole progressive picture instead of deinterlacing.
+    void setProgressiveFields(bool on) { m_progressiveFields.store(on, std::memory_order_relaxed); }
+    bool progressiveFields() const { return m_progressiveFields.load(std::memory_order_relaxed); }
+
     // Temporal AA / upscaling: a sub-pixel camera jitter per frame (Halton 2,3), in frame-buffer
     // pixels, sized so it spans one pixel of the picture (fbPerPixel: frame-buffer pixels per
     // picture pixel). The game hook adds it to the player cameras (cameraJitter).
@@ -223,6 +229,7 @@ private:
     // every camera build): published after each change, under the lock.
     std::atomic<bool> m_wideDriving{false}, m_wide2D{false};
     std::atomic<bool> m_jitterOn{false};
+    std::atomic<bool> m_progressiveFields{false};
     std::atomic<float> m_jitterScaleX{0.5f}, m_jitterScaleY{0.25f};
     std::atomic<uint32_t> m_frameIndex{0};
     float m_snapJitter[4] = {}; // cur x, y, prev x, y (under m_stateMutex)

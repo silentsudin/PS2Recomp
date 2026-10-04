@@ -52,6 +52,7 @@
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
+#include <thread>
 #include <vector>
 
 namespace ps2x::gs
@@ -514,13 +515,17 @@ namespace ps2x::gs
                 }
                 const VkRect2D rect = pictureRect(fw, fh);
 #if defined(__APPLE__)
-                // Temporal needs the progressive picture (4x supersampling and up scan out full
-                // frames; below that the 224-line fields alternate every frame): spatial otherwise.
-                const bool progressive = sh >= 600;
+                // Temporal needs a progressive picture: progressive fields, or 4x supersampling and
+                // up (full frames). Interlaced fields below that alternate every frame: spatial.
+                const bool progressive = sh >= 600 || m_progressiveFields;
                 if (metalfxTemporal && progressive && m_metalfxTemporal && rect.extent.width > sw && m_shared.motion &&
                     m_shared.depth && m_shared.motion->get_width() == sw && m_shared.depth->get_width() == sw)
                 {
-                    upscaleMetalFxTemporal(cmdHandle, sw, sh, rect.extent.width, rect.extent.height);
+                    // Beyond the scaler's largest ratio (640x448 to a Retina window is about 3.5x),
+                    // it upscales as far as it can and the presentation scales the rest.
+                    const float k = std::min({m_metalfxTemporal->maxScale(), float(rect.extent.width) / float(sw),
+                                              float(rect.extent.height) / float(sh)});
+                    upscaleMetalFxTemporal(cmdHandle, sw, sh, uint32_t(float(sw) * k), uint32_t(float(sh) * k));
                     return;
                 }
                 if (metalfxTemporal)
@@ -551,6 +556,7 @@ namespace ps2x::gs
             // TAA needs the game's depth/motion and a jittered camera: switched on and off with it.
             void updateTemporal(PS2Runtime &runtime)
             {
+                m_progressiveFields = runtime.gsUnsynced().progressiveFields();
                 const bool on = m_post.aa == PostProcess::AntiAliasing::Taa ||
                                 m_post.scaling == PostProcess::Scaling::MetalFxTemporal;
                 if (!m_showMotion && !m_showDepth)
@@ -924,10 +930,14 @@ namespace ps2x::gs
                 const void *src = dev.map_host_buffer(*buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
                 std::memcpy(pixels.data(), src, pixels.size());
                 dev.unmap_host_buffer(*buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
-                for (size_t p = 3; p < pixels.size(); p += 4)
-                    pixels[p] = 0xFF;
-                Image image = {pixels.data(), static_cast<int>(w), static_cast<int>(h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-                ExportImage(image, m_capturePath.c_str());
+                // Encode the PNG off the render thread: it holds the device lock the GS thread
+                // needs, and a full-window encode takes long enough to stall the game (and audio).
+                std::thread([pixels = std::move(pixels), w, h, path = std::move(m_capturePath)]() mutable {
+                    for (size_t p = 3; p < pixels.size(); p += 4)
+                        pixels[p] = 0xFF;
+                    Image image = {pixels.data(), static_cast<int>(w), static_cast<int>(h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                    ExportImage(image, path.c_str());
+                }).detach();
                 m_capturePath.clear();
             }
 
@@ -950,6 +960,7 @@ namespace ps2x::gs
             Vulkan::Program *m_uiComposite = nullptr;
             Vulkan::ImageHandle m_rcasImage, m_uiImage;
             bool m_temporalValid = false;
+            bool m_progressiveFields = true; // GS::progressiveFields, read each frame
             bool m_showDepth = false, m_showMotion = false;
             Vulkan::Program *m_smaaEdges = nullptr, *m_smaaWeights = nullptr, *m_smaaBlend = nullptr;
             Vulkan::ImageHandle m_smaaArea, m_smaaSearch, m_smaaEdgeImage, m_smaaWeightImage;

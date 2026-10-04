@@ -288,6 +288,8 @@ struct GSPresentationRequest
     GSFrameReg preferredSource{};
     uint32_t preferredDestFbp = 0;
     bool hasPreferredSource = false;
+    // Show interlaced fields as whole progressive pictures (GS::progressiveFields).
+    bool progressiveFields = false;
     // A presenter that draws on the GPU (paraLLEl-GS + Vulkan presenter) keeps the picture there;
     // `readback` still copies it to the CPU (test captures).
     bool keepOnGpu = false;

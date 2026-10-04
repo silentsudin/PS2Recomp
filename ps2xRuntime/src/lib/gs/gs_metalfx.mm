@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "gs_metalfx.h"
 
 #import <Metal/Metal.h>
@@ -80,7 +81,11 @@ namespace ps2x::gs
                         desc.outputTextureFormat = MTLPixelFormatRGBA8Unorm;
                         m_scaler = [desc newTemporalScalerWithDevice:m_device];
                         if (!m_scaler)
+                        {
+                            std::fprintf(stderr, "[metalfx] temporal scaler %ux%u -> %ux%u unavailable\n", f.inW, f.inH, f.outW,
+                                         f.outH);
                             return false;
+                        }
                         m_inW = f.inW;
                         m_inH = f.inH;
                         m_outW = f.outW;
@@ -105,6 +110,13 @@ namespace ps2x::gs
                     [cb waitUntilCompleted];
                     return cb.status == MTLCommandBufferStatusCompleted;
                 }
+            }
+
+            float maxScale() const override
+            {
+                if (@available(macOS 14.4, *))
+                    return [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:m_device];
+                return 2.0f;
             }
 
         private:

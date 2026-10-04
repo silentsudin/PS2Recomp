@@ -37,6 +37,7 @@ namespace ps2x::gs
         uint32_t vendorId = 0; // PCI vendor (0x106B Apple, 0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel, 0x5143 Qualcomm, 0x13B5 Arm)
         uint32_t deviceId = 0;
         uint32_t apiVersion = 0;
+        uint32_t maxSuperSampling = 1; // samples per pixel this device supports: 4, 8 or 16
     };
 
     // Settings that can change while the game runs (any thread).

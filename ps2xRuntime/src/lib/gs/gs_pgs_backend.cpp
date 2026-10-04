@@ -138,7 +138,6 @@ namespace ps2x::gs
                 // keeps the plain field deinterlacer.
                 m_progressive = !envEquals("RT_GS_PROGRESSIVE", "0");
                 gsOptions.super_sampling = superSamplingFromEnv(m_progressive ? 4u : 1u);
-                m_samples = static_cast<uint32_t>(gsOptions.super_sampling);
                 if (!m_iface.init(m_dev, gsOptions))
                 {
                     error = "paraLLEl-GS init failed (missing Vulkan features?)";
@@ -150,7 +149,12 @@ namespace ps2x::gs
                 m_info.vendorId = props.vendorID;
                 m_info.deviceId = props.deviceID;
                 m_info.apiVersion = props.apiVersion;
-                std::cout << "[gs] paraLLEl-GS on " << props.deviceName << std::endl;
+                // The interface clamps the rate to what the device supports (8x and 16x need
+                // compute subgroup size control for 8/16-wide groups).
+                m_info.maxSuperSampling = static_cast<uint32_t>(m_iface.get_max_supported_super_sampling());
+                m_samples = std::min(static_cast<uint32_t>(gsOptions.super_sampling), m_info.maxSuperSampling);
+                std::cout << "[gs] paraLLEl-GS on " << props.deviceName << ", super-sampling " << m_samples << "x (max "
+                          << m_info.maxSuperSampling << "x)" << std::endl;
                 return true;
             }
 
@@ -164,7 +168,7 @@ namespace ps2x::gs
                 if (static_cast<uint32_t>(rate) == m_samples)
                     return;
                 m_iface.set_super_sampling_rate(rate, true, false);
-                m_samples = static_cast<uint32_t>(rate);
+                m_samples = std::min(static_cast<uint32_t>(rate), m_info.maxSuperSampling);
             }
 
             uint32_t superSampling() const override { return m_samples; }
@@ -310,11 +314,15 @@ namespace ps2x::gs
 
                     auto &priv = m_iface.get_priv_register_state();
                     setPrivReg(priv.pmode, request.pmode);
-                    setPrivReg(priv.smode2, request.smode2);
+                    // Progressive fields: the game no longer offsets every other field, so the
+                    // field is scanned out as a 224-line progressive (double-strike) picture: no
+                    // deinterlacing, no field-aware line shift, the same image every vblank.
+                    const uint64_t smode2 = request.progressiveFields ? (request.smode2 & ~0x3ull) : request.smode2;
+                    setPrivReg(priv.smode2, smode2);
                     setPrivReg(priv.dispfb1, request.dispfb1);
-                    setPrivReg(priv.display1, displayToHardware(request.display1, request.smode2));
+                    setPrivReg(priv.display1, displayToHardware(request.display1, smode2));
                     setPrivReg(priv.dispfb2, request.dispfb2);
-                    setPrivReg(priv.display2, displayToHardware(request.display2, request.smode2));
+                    setPrivReg(priv.display2, displayToHardware(request.display2, smode2));
                     setPrivReg(priv.bgcolor, request.bgcolor);
                     priv.smode1.CMOD = 2; // NTSC
                     priv.smode1.LC = 32;
@@ -346,6 +354,14 @@ namespace ps2x::gs
                         vsync.anti_blur = true;
                         // Needs at least 4 samples per pixel (paraLLEl-GS scans out 2x2 of them).
                         vsync.high_resolution_scanout = m_samples >= 4u;
+                        // Progressive fields: twice as many lines as columns from the samples
+                        // (2x/4x: 640x448, 8x/16x: 1280x896), so the picture keeps its detail
+                        // vertically too.
+                        if (request.progressiveFields)
+                        {
+                            vsync.progressive_field_scanout = true;
+                            vsync.high_resolution_scanout = m_samples >= 2u;
+                        }
                     }
 
                     if (onGpu && request.depthValid && m_shared->wantDepth.load(std::memory_order_relaxed))

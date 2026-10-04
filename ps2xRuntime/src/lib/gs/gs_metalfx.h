@@ -40,5 +40,8 @@ namespace ps2x::gs
             bool reset;                       // history is invalid (scene change)
         };
         virtual bool upscale(void *queue, const Frame &frame) = 0;
+        // The largest output / input size per axis the scaler accepts on this device (creating
+        // one for a larger ratio fails).
+        virtual float maxScale() const = 0;
     };
 }
