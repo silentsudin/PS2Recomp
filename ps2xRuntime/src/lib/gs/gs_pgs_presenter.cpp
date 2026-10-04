@@ -9,6 +9,7 @@
 #if defined(PS2X_HAVE_PGS) && defined(PS2X_PGS_PRESENTER)
 
 #include "gs_pgs_shared.h"
+#include "runtime/gs/gs_motion.h"
 #include "imgui_spirv.h"
 #if defined(__APPLE__)
 #include "gs_metalfx.h"
@@ -197,6 +198,17 @@ namespace ps2x::gs
                 m_smaaWeights = post(post_spirv::smaa_weights_frag, sizeof(post_spirv::smaa_weights_frag), 16, 0x1, 0x7);
                 m_smaaBlend = post(post_spirv::smaa_blend_frag, sizeof(post_spirv::smaa_blend_frag), 16, 0x1, 0x3);
                 m_depthView = post(post_spirv::depth_view_frag, sizeof(post_spirv::depth_view_frag), 4, 0x1);
+                m_motionView = post(post_spirv::motion_view_frag, sizeof(post_spirv::motion_view_frag), 4, 0x1);
+                m_taa = post(post_spirv::taa_frag, sizeof(post_spirv::taa_frag), 32, 0x1, 0x7);
+                m_depthNormalize = post(post_spirv::depth_normalize_frag, sizeof(post_spirv::depth_normalize_frag), 0, 0x1);
+                m_uiComposite = post(post_spirv::ui_composite_frag, sizeof(post_spirv::ui_composite_frag), 0, 0x1, 0x7);
+                if (const char *e = std::getenv("RT_SHOW_MOTION"); e && *e == '1')
+                {
+                    m_showMotion = true;
+                    m_shared.wantDepth = true;
+                    m_shared.wantMotion = true;
+                    MotionTracker::instance().setEnabled(true);
+                }
                 if (const char *e = std::getenv("RT_SHOW_DEPTH"); e && *e == '1')
                 {
                     m_showDepth = true;
@@ -221,7 +233,10 @@ namespace ps2x::gs
                     if (getDevice && m_getTexture && m_getQueue)
                         getDevice(m_wsi.get_context().get_gpu(), &mtlDevice);
                     if (mtlDevice)
+                    {
                         m_metalfx = MetalFxSpatial::create(mtlDevice);
+                        m_metalfxTemporal = MetalFxTemporal::create(mtlDevice);
+                    }
                     std::cout << "[presenter] MetalFX spatial "
                               << (m_metalfx ? "available"
                                             : !getDevice ? "unavailable (no MoltenVK Metal interop)"
@@ -306,6 +321,7 @@ namespace ps2x::gs
             void frame(PS2Runtime &runtime, const std::function<void()> &drawUi) override
             {
                 pumpEvents();
+                updateTemporal(runtime);
                 latch(runtime);
                 m_pictureAspect = pictureAspect(runtime, *this);
                 m_uiFrame = false;
@@ -411,11 +427,11 @@ namespace ps2x::gs
 
             void offscreenPass(Vulkan::CommandBuffer &cmd, Vulkan::ImageHandle &dst, uint32_t w, uint32_t h,
                                Vulkan::Program *program, const PassInput *inputs, uint32_t inputCount, const void *push,
-                               uint32_t pushSize, bool clear)
+                               uint32_t pushSize, bool clear, VkFormat format = VK_FORMAT_R8G8B8A8_UNORM)
             {
-                if (!dst || dst->get_width() != w || dst->get_height() != h)
+                if (!dst || dst->get_width() != w || dst->get_height() != h || dst->get_format() != format)
                 {
-                    auto info = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
+                    auto info = Vulkan::ImageCreateInfo::render_target(w, h, format);
                     info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
                     info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                     dst = m_shared.device->create_image(info);
@@ -436,7 +452,8 @@ namespace ps2x::gs
                 cmd.set_cull_mode(VK_CULL_MODE_NONE);
                 for (uint32_t i = 0; i < inputCount; ++i)
                     cmd.set_texture(0, i, inputs[i].image->get_view(), inputs[i].sampler);
-                cmd.push_constants(push, 0, pushSize);
+                if (pushSize)
+                    cmd.push_constants(push, 0, pushSize);
                 cmd.draw(3);
                 cmd.end_render_pass();
                 cmd.image_barrier(*dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -455,6 +472,14 @@ namespace ps2x::gs
                 if (!image)
                     return;
                 const uint32_t sw = image->get_width(), sh = image->get_height();
+                if (m_showMotion && m_shared.motion)
+                {
+                    const float scale = 1.0f / 32.0f; // 16 px of motion: fully red/green
+                    const PassInput mv[1] = {{m_shared.motion.get(), Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(cmd, m_aaImage, sw, sh, m_motionView, mv, 1, &scale, sizeof(scale), false);
+                    m_final = m_aaImage.get();
+                    return;
+                }
                 if (m_showDepth && m_shared.depth)
                 {
                     const float rcpMax = 1.0f / 16777216.0f;
@@ -463,7 +488,10 @@ namespace ps2x::gs
                     m_final = m_aaImage.get();
                     return;
                 }
-                if (m_post.aa == PostProcess::AntiAliasing::Smaa)
+                const bool metalfxTemporal = m_post.scaling == PostProcess::Scaling::MetalFxTemporal;
+                if (m_post.aa == PostProcess::AntiAliasing::Taa && !metalfxTemporal)
+                    temporalAntiAliasing(cmd, sw, sh);
+                else if (m_post.aa == PostProcess::AntiAliasing::Smaa)
                 {
                     const float metrics[4] = {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh), static_cast<float>(sw),
                                               static_cast<float>(sh)};
@@ -486,7 +514,19 @@ namespace ps2x::gs
                 }
                 const VkRect2D rect = pictureRect(fw, fh);
 #if defined(__APPLE__)
-                if (m_post.scaling == PostProcess::Scaling::MetalFxSpatial && m_metalfx && rect.extent.width > sw)
+                // Temporal needs the progressive picture (4x supersampling and up scan out full
+                // frames; below that the 224-line fields alternate every frame): spatial otherwise.
+                const bool progressive = sh >= 600;
+                if (metalfxTemporal && progressive && m_metalfxTemporal && rect.extent.width > sw && m_shared.motion &&
+                    m_shared.depth && m_shared.motion->get_width() == sw && m_shared.depth->get_width() == sw)
+                {
+                    upscaleMetalFxTemporal(cmdHandle, sw, sh, rect.extent.width, rect.extent.height);
+                    return;
+                }
+                if (metalfxTemporal)
+                    m_temporalValid = false; // a 2D screen: start the history again afterwards
+                if ((m_post.scaling == PostProcess::Scaling::MetalFxSpatial || (metalfxTemporal && !progressive)) && m_metalfx &&
+                    rect.extent.width > sw)
                 {
                     upscaleMetalFx(cmdHandle, sw, sh, rect.extent.width, rect.extent.height);
                     return;
@@ -506,6 +546,59 @@ namespace ps2x::gs
                     m_final = m_upImage.get();
                     m_finalRcas = true;
                 }
+            }
+
+            // TAA needs the game's depth/motion and a jittered camera: switched on and off with it.
+            void updateTemporal(PS2Runtime &runtime)
+            {
+                const bool on = m_post.aa == PostProcess::AntiAliasing::Taa ||
+                                m_post.scaling == PostProcess::Scaling::MetalFxTemporal;
+                if (!m_showMotion && !m_showDepth)
+                {
+                    m_shared.wantDepth = on;
+                    m_shared.wantMotion = on;
+                    MotionTracker::instance().setEnabled(on);
+                }
+                // Jitter across one picture pixel: the frame buffer is 640 x 224 (fields), the
+                // picture 2x or more of it.
+                const Vulkan::Image *pic = m_shared.scanout.get();
+                const float sx = pic ? 640.0f / static_cast<float>(pic->get_width()) : 0.5f;
+                const float sy = pic ? 224.0f / static_cast<float>(pic->get_height()) : 0.25f;
+                runtime.gsUnsynced().setTemporalJitter(on, sx, sy);
+                if (on)
+                    runtime.gsUnsynced().snapshotJitter(m_jitter[0], m_jitter[1], m_jitter[2], m_jitter[3]);
+                if (!on)
+                    m_taaValid = false;
+                // Any post-processing spares the UI (the GS marks where the HUD and 2D screens drew).
+                m_shared.wantUi = m_post.aa != PostProcess::AntiAliasing::None || m_post.scaling != PostProcess::Scaling::Bilinear;
+            }
+
+            void temporalAntiAliasing(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh)
+            {
+                if (!m_shared.motion || m_shared.motion->get_width() != sw || m_shared.motion->get_height() != sh)
+                {
+                    m_taaValid = false; // a 2D screen (no 3D motion): nothing to accumulate
+                    return;
+                }
+                Vulkan::ImageHandle &out = m_taaHistory[m_taaIndex];
+                const Vulkan::ImageHandle &history = m_taaHistory[m_taaIndex ^ 1];
+                const bool valid = m_taaValid && history && history->get_width() == sw && history->get_height() == sh;
+                struct
+                {
+                    float motionToUv[2];
+                    float jitterDelta[2];
+                    float rcpSize[2];
+                    float blend;
+                    float historyValid;
+                } push = {{1.0f / 640.0f, 1.0f / 224.0f}, {m_jitter[0] - m_jitter[2], m_jitter[1] - m_jitter[3]},
+                          {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh)}, 0.1f, valid ? 1.0f : 0.0f};
+                const PassInput inputs[3] = {{m_final, Vulkan::StockSampler::NearestClamp},
+                                             {valid ? history.get() : m_final, Vulkan::StockSampler::LinearClamp},
+                                             {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(cmd, out, sw, sh, m_taa, inputs, 3, &push, sizeof(push), false);
+                m_final = out.get();
+                m_taaIndex ^= 1;
+                m_taaValid = true;
             }
 
 #if defined(__APPLE__)
@@ -539,6 +632,84 @@ namespace ps2x::gs
                 cmd = dev.request_command_buffer();
             }
 #endif
+
+#if defined(__APPLE__)
+            // MetalFX temporal: depth normalised for it, then like the spatial scaler, with motion
+            // (pointing back to last frame, in input pixels) and this frame's jitter.
+            void upscaleMetalFxTemporal(Vulkan::CommandBufferHandle &cmd, uint32_t sw, uint32_t sh, uint32_t w, uint32_t h)
+            {
+                Vulkan::Device &dev = *m_shared.device;
+                const PassInput depthIn[1] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(*cmd, m_depthNorm, sw, sh, m_depthNormalize, depthIn, 1, nullptr, 0, false, VK_FORMAT_R32_SFLOAT);
+                if (!m_upImage || m_upImage->get_width() != w || m_upImage->get_height() != h ||
+                    !(m_upImage->get_create_info().usage & VK_IMAGE_USAGE_STORAGE_BIT))
+                {
+                    auto info = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
+                    info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+                    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    m_upImage = dev.create_image(info);
+                }
+                cmd->image_barrier(*m_upImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                Vulkan::Fence fence;
+                dev.submit(cmd, &fence);
+                fence->wait();
+                MetalFxTemporal::Frame f = {};
+                m_getTexture(m_final->get_image(), &f.color);
+                m_getTexture(m_depthNorm->get_image(), &f.depth);
+                m_getTexture(m_shared.motion->get_image(), &f.motion);
+                m_getTexture(m_upImage->get_image(), &f.output);
+                void *queue = nullptr;
+                m_getQueue(m_wsi.get_context().get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS], &queue);
+                const float px = static_cast<float>(sw) / 640.0f, py = static_cast<float>(sh) / 224.0f;
+                f.inW = sw;
+                f.inH = sh;
+                f.outW = w;
+                f.outH = h;
+                f.jitterX = m_jitter[0] * px;
+                f.jitterY = m_jitter[1] * py;
+                f.motionScaleX = -px; // ours: current minus previous, GS pixels
+                f.motionScaleY = -py;
+                f.reset = !m_temporalValid;
+                if (f.color && f.depth && f.motion && f.output && queue && m_metalfxTemporal->upscale(queue, f))
+                {
+                    m_final = m_upImage.get();
+                    m_temporalValid = true;
+                }
+                cmd = dev.request_command_buffer();
+            }
+#endif
+
+            // Puts the UI back as the game drew it over the post-processed picture: the processed
+            // image (finished at the picture's size on screen, RCAS included) is mixed with the
+            // original by the GS's UI mask.
+            void spareUi(Vulkan::CommandBuffer &cmd, float fw, float fh)
+            {
+                const Vulkan::ImageHandle &original = m_shared.attached ? m_shared.scanout : m_cpuFrame;
+                if (!m_final || !original || m_final == original.get() || !m_shared.ui ||
+                    m_shared.ui->get_width() != original->get_width() || m_shared.ui->get_height() != original->get_height())
+                    return;
+                const VkRect2D rect = pictureRect(fw, fh);
+                if (m_finalRcas)
+                {
+                    struct
+                    {
+                        AU1 con[4];
+                        uint32_t origin[4];
+                    } push = {};
+                    FsrRcasCon(push.con, (1.0f - std::clamp(m_post.sharpness, 0.0f, 1.0f)) * 2.0f);
+                    const PassInput in[1] = {{m_final, Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(cmd, m_rcasImage, rect.extent.width, rect.extent.height, m_rcas, in, 1, &push, sizeof(push), false);
+                    m_final = m_rcasImage.get();
+                    m_finalRcas = false;
+                }
+                const PassInput in[3] = {{m_final, Vulkan::StockSampler::LinearClamp},
+                                         {original.get(), Vulkan::StockSampler::LinearClamp},
+                                         {m_shared.ui.get(), Vulkan::StockSampler::LinearClamp}};
+                offscreenPass(cmd, m_uiImage, rect.extent.width, rect.extent.height, m_uiComposite, in, 3, nullptr, 0, false);
+                m_final = m_uiImage.get();
+            }
 
             void drawGame(Vulkan::CommandBuffer &cmd, float fw, float fh)
             {
@@ -707,6 +878,7 @@ namespace ps2x::gs
                 const float fw = static_cast<float>(back.get_width()), fh = static_cast<float>(back.get_height());
                 auto cmd = dev.request_command_buffer();
                 preparePicture(cmd, fw, fh);
+                spareUi(*cmd, fw, fh);
                 auto rp = dev.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
                 rp.clear_color[0] = {};
                 cmd->begin_render_pass(rp);
@@ -768,8 +940,17 @@ namespace ps2x::gs
             Vulkan::Program *m_fxaa = nullptr, *m_easu = nullptr, *m_rcas = nullptr;
             PostProcess m_post;
             Vulkan::ImageHandle m_aaImage, m_upImage; // intermediate pictures
-            Vulkan::Program *m_depthView = nullptr;
-            bool m_showDepth = false;
+            Vulkan::Program *m_depthView = nullptr, *m_motionView = nullptr, *m_taa = nullptr;
+            Vulkan::ImageHandle m_taaHistory[2];
+            uint32_t m_taaIndex = 0;
+            bool m_taaValid = false;
+            float m_jitter[4] = {}; // this frame's and last frame's camera jitter (GS pixels)
+            Vulkan::Program *m_depthNormalize = nullptr;
+            Vulkan::ImageHandle m_depthNorm;
+            Vulkan::Program *m_uiComposite = nullptr;
+            Vulkan::ImageHandle m_rcasImage, m_uiImage;
+            bool m_temporalValid = false;
+            bool m_showDepth = false, m_showMotion = false;
             Vulkan::Program *m_smaaEdges = nullptr, *m_smaaWeights = nullptr, *m_smaaBlend = nullptr;
             Vulkan::ImageHandle m_smaaArea, m_smaaSearch, m_smaaEdgeImage, m_smaaWeightImage;
             const Vulkan::Image *m_final = nullptr;   // what the final pass draws this frame
@@ -780,6 +961,7 @@ namespace ps2x::gs
             GetTexture m_getTexture = nullptr;
             GetQueue m_getQueue = nullptr;
             std::unique_ptr<MetalFxSpatial> m_metalfx;
+            std::unique_ptr<MetalFxTemporal> m_metalfxTemporal;
 #endif
             Vulkan::ImageHandle m_cpuFrame; // CPU GS: the uploaded picture
             std::unordered_map<uint64_t, Vulkan::ImageHandle> m_textures; // by ImTextureID

@@ -114,7 +114,22 @@ namespace ps2x::gs
         if (m_unitCount == 0)
             return;
         const uint32_t n = m_unitCount;
+        const uint32_t total = n + m_unitOverflow;
         m_unitCount = 0;
+        m_unitOverflow = 0;
+        // The class of this unit's vertices (setRecordClasses), decided below.
+        VertexClass cls = VertexClass::Scene;
+        struct Record
+        {
+            WideLayout *self;
+            uint32_t n;
+            VertexClass *cls;
+            ~Record()
+            {
+                if (self->m_recordClasses)
+                    self->m_classes.insert(self->m_classes.end(), n, *cls);
+            }
+        } record{this, total, &cls};
 
         float minX = 1e9f, maxX = -1e9f;
         for (uint32_t i = 0; i < n; ++i)
@@ -128,13 +143,18 @@ namespace ps2x::gs
         if (m_mode == Mode::Unknown)
             m_mode = pathIndex == 0 ? Mode::Driving : Mode::Screen2D;
         if (m_mode != Mode::Driving)
+        {
+            cls = VertexClass::Ui; // a 2D-backed screen: all of it is shown as drawn
             return;
+        }
         if (!m_hud && pathIndex >= 1 && !st.ctxt && st.tme)
         {
             m_hud = true;
             m_hudStarted = true;
         }
         // Full-screen sprites (the fade, the final post-pass) stretch with the 3D.
+        if (m_hud)
+            cls = (st.type == kSprite && width >= kFullScreen) ? VertexClass::Neutral : VertexClass::Ui;
         if (!m_hud || (st.type == kSprite && width >= kFullScreen) || !active())
             return;
 
@@ -173,11 +193,14 @@ namespace ps2x::gs
     {
         PrimState st = start;
         m_unitCount = 0;
+        m_classes.clear();
         // A unit is one sprite or point, or the run of vertices of one primitive type in a GIF tag.
         auto flush = [&] { flushUnit(pathIndex, st); };
         auto addVertex = [&](uint8_t *x, uint16_t) {
             if (m_unitCount < sizeof(m_unit) / sizeof(m_unit[0]))
                 m_unit[m_unitCount++] = {x, st.ctxt};
+            else
+                ++m_unitOverflow;
             if ((st.type == kSprite && m_unitCount == 2) || st.type == 0)
                 flush();
         };

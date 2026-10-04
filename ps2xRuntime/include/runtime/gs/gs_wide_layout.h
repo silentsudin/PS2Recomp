@@ -19,6 +19,7 @@
 // runs inside the GS frontend's packet processing (under its state lock).
 
 #include <cstdint>
+#include <vector>
 
 namespace ps2x::gs
 {
@@ -49,6 +50,13 @@ namespace ps2x::gs
         // GS::processGIFPacket: 0 = PATH1 (VU1), 1 = PATH2, 2 = PATH3. `state` is the GS state at
         // the start of the packet.
         void transformPacket(uint32_t pathIndex, uint8_t *data, uint32_t sizeBytes, const PrimState &state);
+
+        // What each vertex of the last transformed packet belongs to (in kick order), when
+        // requested: the scene (processed by AA/upscalers), the UI (HUD, 2D screens: shown as
+        // drawn), or neither (full-screen fades and post passes: leave the UI mask as it is).
+        enum class VertexClass : uint8_t { Scene, Ui, Neutral };
+        void setRecordClasses(bool on) { m_recordClasses = on; }
+        const std::vector<VertexClass> &vertexClasses() const { return m_classes; }
 
         // The game cleared the screen to start a frame (GS::markFrameStart, from its clear routine).
         void frameStart();
@@ -96,8 +104,11 @@ namespace ps2x::gs
         uint32_t m_clears = 0;
         uint32_t m_2DVotes = 0, m_driveVotes = 0;
         bool m_hudStarted = false;
+        bool m_recordClasses = false;
+        std::vector<VertexClass> m_classes;
         float m_dbgMinY = 0;   // clears since the last presented frame
         Vertex m_unit[2048];
         uint32_t m_unitCount = 0;
+        uint32_t m_unitOverflow = 0; // vertices beyond m_unit's room (still counted for the classes)
     };
 }

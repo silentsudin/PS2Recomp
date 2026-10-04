@@ -176,6 +176,12 @@ namespace ps2x::gs
                 m_iface.set_hacks(m_hacks);
             }
 
+            bool WantsVertexSideband() const override
+            {
+                return m_shared && (m_shared->wantMotion.load(std::memory_order_relaxed) ||
+                                    m_shared->wantUi.load(std::memory_order_relaxed));
+            }
+
             bool WantsDepthSnapshot() const override
             {
                 return m_shared && m_shared->wantDepth.load(std::memory_order_relaxed);
@@ -189,6 +195,24 @@ namespace ps2x::gs
             }
 
             // ---------------------------------------------------------------- GSPacketMirror
+            void MirrorGifPacketWithMotion(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes, const uint32_t *motion,
+                                           uint32_t motionCount) override
+            {
+                if (!data || sizeBytes < 16u || pathIndex > 3u)
+                    return;
+                const auto lock = lockDevice();
+                const bool wanted = WantsVertexSideband();
+                if (wanted != m_motionEnabled)
+                {
+                    m_iface.set_motion_enabled(wanted);
+                    m_motionEnabled = wanted;
+                }
+                if (wanted)
+                    m_iface.set_vertex_motion(motion, motionCount);
+                m_iface.gif_transfer(pathIndex, data, sizeBytes);
+                m_iface.set_vertex_motion(nullptr, 0);
+            }
+
             void MirrorGifPacket(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes) override
             {
                 if (!data || sizeBytes < 16u || pathIndex > 3u)
@@ -329,15 +353,22 @@ namespace ps2x::gs
                         vsync.scanout_depth = true;
                         vsync.depth_zbp = request.depthZbp;
                         vsync.depth_psm = 0x30u | (request.depthPsm & 0xFu); // PSMZ32/24/16/16S
+                        vsync.scanout_motion = m_shared->wantMotion.load(std::memory_order_relaxed);
                         static int dbg = 0;
                         if (std::getenv("RT_SHOW_DEPTH") && (dbg++ % 120) == 0)
                             std::fprintf(stderr, "[depth] zbp=%u psm=0x%x dispfb fbp=%u fbw=%u\n", request.depthZbp, vsync.depth_psm,
                                          unsigned(request.dispfb1 & 0x1FF), unsigned((request.dispfb1 >> 9) & 0x3F));
                     }
+                    if (onGpu && m_motionEnabled && m_shared->wantUi.load(std::memory_order_relaxed))
+                        vsync.scanout_ui = true;
                     m_iface.flush();
                     ParallelGS::ScanoutResult scanout = m_iface.vsync(vsync);
                     if (onGpu)
+                    {
                         m_shared->depth = scanout.depth;
+                        m_shared->motion = scanout.motion;
+                        m_shared->ui = scanout.ui;
+                    }
                     if (scanout.image)
                     {
                         w = scanout.image->get_width();
@@ -371,6 +402,7 @@ namespace ps2x::gs
             bool m_progressive = true;
             std::atomic<uint32_t> m_samples{1};
             ParallelGS::Hacks m_hacks = {}; // every hack set so far (set_hacks replaces them all)
+            bool m_motionEnabled = false;
 
             // The device has one thread index (set_num_thread_indices(1)) and every use holds
             // m_mutex, so each calling thread (EE, VU1, render) uses index 0. Registering it stops

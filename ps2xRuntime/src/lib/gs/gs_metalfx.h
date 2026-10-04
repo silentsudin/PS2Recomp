@@ -22,4 +22,23 @@ namespace ps2x::gs
         virtual bool upscale(void *queue, void *input, uint32_t inW, uint32_t inH, void *output, uint32_t outW,
                              uint32_t outH) = 0;
     };
+
+    // MetalFX temporal upscaling: colour, depth (R32F, 0..1, larger = nearer), motion (RG16F) and
+    // the camera jitter of this frame, accumulated over frames into `output`.
+    class MetalFxTemporal
+    {
+    public:
+        static std::unique_ptr<MetalFxTemporal> create(void *mtlDevice);
+        virtual ~MetalFxTemporal() = default;
+
+        struct Frame
+        {
+            void *color, *depth, *motion, *output;
+            uint32_t inW, inH, outW, outH;
+            float jitterX, jitterY;           // input pixels
+            float motionScaleX, motionScaleY; // motion texture units to input pixels, pointing to the previous frame
+            bool reset;                       // history is invalid (scene change)
+        };
+        virtual bool upscale(void *queue, const Frame &frame) = 0;
+    };
 }

@@ -13,6 +13,16 @@ public:
     virtual ~GSPacketMirror() = default;
     // pathIndex: 0 = PATH1, 1 = PATH2, 2 = PATH3.
     virtual void MirrorGifPacket(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes) = 0;
+    // The same, with each vertex's side data in kick order: screen motion (packed half2 dx, dy in
+    // GS pixels) or a UI class (gs_motion.h kVertexUi / kVertexNeutral). Backends that can't use
+    // it drop it.
+    virtual void MirrorGifPacketWithMotion(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes,
+                                           const uint32_t *motion, uint32_t motionCount)
+    {
+        (void)motion;
+        (void)motionCount;
+        MirrorGifPacket(pathIndex, data, sizeBytes);
+    }
     virtual void MirrorRegisterWrite(uint8_t regAddr, uint64_t value) = 0;
 };
 
@@ -37,6 +47,8 @@ public:
     // Depth for temporal upscalers: whether to keep each frame's 3D depth, and keeping it (called
     // when the frame's 3D is complete, before its HUD and post-processing overwrite Z).
     virtual bool WantsDepthSnapshot() const { return false; }
+    // Per-vertex side data (motion, UI classes) wanted at all (MirrorGifPacketWithMotion).
+    virtual bool WantsVertexSideband() const { return false; }
     virtual void SnapshotDepth(uint32_t zbp, uint32_t fbw)
     {
         (void)zbp;

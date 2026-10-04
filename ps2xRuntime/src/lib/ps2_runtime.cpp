@@ -18,6 +18,7 @@
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 #include "runtime/ps2_display_clock.h"
+#include "runtime/gs/gs_motion.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -588,6 +589,15 @@ bool PS2Runtime::syncCoreSubsystems()
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
+                                     // Motion vectors: tag this run's XGKICKs with the object's
+                                     // matrices (gs_motion.h).
+                                     if (const uint32_t motionId =
+                                             ps2x::gs::MotionTracker::instance().onMscal(startPC, m_memory.getVU1Data()))
+                                     {
+                                         uint8_t marker[32];
+                                         ps2x::gs::MotionTracker::makeMarker(motionId, marker);
+                                         m_memory.submitGifPacket(GifPathId::Path1, marker, sizeof(marker));
+                                     }
                                      m_vu1.state().dBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
@@ -766,6 +776,9 @@ bool PS2Runtime::initialize(const char *title)
         }
         m_audioBackend.setAudioReady(!headless && IsAudioDeviceReady());
 #endif
+        // Per-vertex motion (gs_motion.h): wanted by temporal upscalers; RT_MOTION_DEBUG=1 logs it.
+        if (const char *e = std::getenv("RT_MOTION_DEBUG"); e && *e == '1')
+            ps2x::gs::MotionTracker::instance().setEnabled(true);
         if (m_presenter)
             m_presenter->uiInit();
         if (m_debugUiInitCallback && !headless)

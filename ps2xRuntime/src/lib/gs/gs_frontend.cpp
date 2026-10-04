@@ -663,7 +663,17 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
-    if (m_wide.active() || m_backend->WantsDepthSnapshot())
+    // Motion vectors: a marker before a VU1 run names its object's matrices (gs_motion.h).
+    uint32_t markerId = 0;
+    if (pathIndex == 0 && ps2x::gs::MotionTracker::instance().enabled() &&
+        ps2x::gs::MotionTracker::readMarker(data, sizeBytes, markerId))
+    {
+        m_motionId = markerId;
+        return;
+    }
+
+    const bool sideband = m_backend->WantsVertexSideband();
+    if (m_wide.active() || m_backend->WantsDepthSnapshot() || sideband)
     {
         // Widescreen: narrow the HUD in a copy, which both the mirror and the parse below see.
         // (Without widescreen the copy is left as it is; the pass only finds the HUD phase.)
@@ -677,18 +687,48 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
             st.ofx[c] = m_ctx[c].xyoffset.ofx;
             st.ofy[c] = m_ctx[c].xyoffset.ofy;
         }
+        m_wide.setRecordClasses(sideband);
         m_wide.transformPacket(pathIndex, m_wideScratch.data(), sizeBytes, st);
         publishWideUnlocked();
         // The frame's 3D is complete before its HUD: keep its depth (HUD and post-pass overwrite Z).
         if (m_wide.consumeHudStart() && m_haveZbuf3D && m_backend->WantsDepthSnapshot())
         {
+            m_snapJitter[2] = m_snapJitter[0];
+            m_snapJitter[3] = m_snapJitter[1];
+            if (!cameraJitter(m_snapJitter[0], m_snapJitter[1]))
+                m_snapJitter[0] = m_snapJitter[1] = 0.0f;
             const uint32_t fbw = m_ctx[1].frame.fbw ? m_ctx[1].frame.fbw : m_ctx[0].frame.fbw;
             m_backend->SnapshotDepth(m_lastZbuf3D.zbp, fbw);
         }
         data = m_wideScratch.data();
     }
 
-    if (m_packetMirror)
+    if (m_packetMirror && sideband)
+    {
+        // Per-vertex side data: motion for the 3D (PATH1 with a motion context), UI classes from
+        // the classifier for the HUD and 2D screens.
+        ps2x::gs::MotionContext motion;
+        if (pathIndex == 0 && m_motionId && ps2x::gs::MotionTracker::instance().context(m_motionId, motion))
+        {
+            ps2x::gs::MotionTracker::packetMotion(data, sizeBytes & ~15u, motion, m_motionScratch);
+            accumulateMotionStats();
+        }
+        else
+            m_motionScratch.clear();
+        const auto &classes = m_wide.vertexClasses();
+        if (m_motionScratch.size() < classes.size())
+            m_motionScratch.resize(classes.size(), 0u);
+        for (size_t v = 0; v < classes.size(); ++v)
+        {
+            if (classes[v] == ps2x::gs::WideLayout::VertexClass::Ui)
+                m_motionScratch[v] = ps2x::gs::MotionTracker::kVertexUi;
+            else if (classes[v] == ps2x::gs::WideLayout::VertexClass::Neutral)
+                m_motionScratch[v] = ps2x::gs::MotionTracker::kVertexNeutral;
+        }
+        m_packetMirror->MirrorGifPacketWithMotion(pathIndex, data, sizeBytes & ~15u, m_motionScratch.data(),
+                                                  static_cast<uint32_t>(m_motionScratch.size()));
+    }
+    else if (m_packetMirror)
         m_packetMirror->MirrorGifPacket(pathIndex, data, sizeBytes & ~15u);
     m_curPath = pathIndex;
 
@@ -1918,8 +1958,83 @@ bool GS::wideDriving() const { return m_wideDriving.load(std::memory_order_relax
 
 float GS::wideHorizontalScale() const { return m_wideK.load(std::memory_order_relaxed); }
 
+void GS::accumulateMotionStats()
+{
+    // RT_MOTION_DEBUG=1: a histogram of how far on-screen 3D vertices move per frame, every second.
+    static const bool debug = [] { const char *e = std::getenv("RT_MOTION_DEBUG"); return e && *e == '1'; }();
+    if (!debug)
+        return;
+    for (uint32_t packed : m_motionScratch)
+    {
+        auto half = [](uint16_t h) {
+            const uint32_t e = (h >> 10) & 0x1F, m = h & 0x3FF;
+            const float v = e == 0 ? 0.0f : std::ldexp(1.0f + m / 1024.0f, static_cast<int>(e) - 15);
+            return (h & 0x8000) ? -v : v;
+        };
+        const float dx = half(static_cast<uint16_t>(packed)), dy = half(static_cast<uint16_t>(packed >> 16));
+        const float d = std::sqrt(dx * dx + dy * dy);
+        static const float edges[] = {0.25f, 1.0f, 4.0f, 16.0f, 64.0f};
+        int b = 0;
+        while (b < 5 && d >= edges[b])
+            ++b;
+        ++m_motionHist[b];
+        ++m_motionVerts;
+    }
+}
+
+void GS::setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY)
+{
+    m_jitterScaleX.store(fbPerPixelX, std::memory_order_relaxed);
+    m_jitterScaleY.store(fbPerPixelY, std::memory_order_relaxed);
+    m_jitterOn.store(on, std::memory_order_relaxed);
+}
+
+bool GS::cameraJitter(float &x, float &y) const
+{
+    if (!m_jitterOn.load(std::memory_order_relaxed))
+        return false;
+    auto halton = [](uint32_t i, uint32_t base) {
+        float f = 1.0f, r = 0.0f;
+        for (; i; i /= base)
+        {
+            f /= static_cast<float>(base);
+            r += f * static_cast<float>(i % base);
+        }
+        return r;
+    };
+    const uint32_t i = (m_frameIndex.load(std::memory_order_relaxed) % 8u) + 1u;
+    x = (halton(i, 2) - 0.5f) * m_jitterScaleX.load(std::memory_order_relaxed);
+    y = (halton(i, 3) - 0.5f) * m_jitterScaleY.load(std::memory_order_relaxed);
+    return true;
+}
+
+void GS::snapshotJitter(float &curX, float &curY, float &prevX, float &prevY) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    curX = m_snapJitter[0];
+    curY = m_snapJitter[1];
+    prevX = m_snapJitter[2];
+    prevY = m_snapJitter[3];
+}
+
 void GS::markFrameStart()
 {
+    m_frameIndex.fetch_add(1, std::memory_order_relaxed);
+    ps2x::gs::MotionTracker::instance().frameStart();
+    {
+        static const bool debug = [] { const char *e = std::getenv("RT_MOTION_DEBUG"); return e && *e == '1'; }();
+        static int frames = 0;
+        if (debug && ++frames % 60 == 0 && m_motionVerts)
+        {
+            const auto stats = ps2x::gs::MotionTracker::instance().lastFrameStats();
+            const double n = static_cast<double>(m_motionVerts) / 100.0;
+            std::fprintf(stderr, "[motion] %u objects, %llu verts: <.25px %.0f%% <1 %.0f%% <4 %.0f%% <16 %.0f%% <64 %.0f%% >=64 %.0f%%\n",
+                         stats.objects, static_cast<unsigned long long>(m_motionVerts), m_motionHist[0] / n, m_motionHist[1] / n,
+                         m_motionHist[2] / n, m_motionHist[3] / n, m_motionHist[4] / n, m_motionHist[5] / n);
+            m_motionVerts = 0;
+            std::fill(std::begin(m_motionHist), std::end(m_motionHist), 0ull);
+        }
+    }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_wide.frameStart();
     publishWideUnlocked();

@@ -52,8 +52,8 @@ namespace ps2x
         // render resolution, then scaling to the window.
         struct PostProcess
         {
-            enum class AntiAliasing : uint8_t { None, Fxaa, Smaa };
-            enum class Scaling : uint8_t { Bilinear, Fsr1, MetalFxSpatial };
+            enum class AntiAliasing : uint8_t { None, Fxaa, Smaa, Taa };
+            enum class Scaling : uint8_t { Bilinear, Fsr1, MetalFxSpatial, MetalFxTemporal };
             AntiAliasing aa = AntiAliasing::None;
             Scaling scaling = Scaling::Bilinear;
             float sharpness = 0.5f; // FSR 1 RCAS, 0 (soft) .. 1 (sharpest)

@@ -30,6 +30,12 @@ namespace ps2x::gs
         // The raw Z behind it (R32F, same size) when wantDepth is set (guarded by `mutex`).
         Vulkan::ImageHandle depth;
         std::atomic<bool> wantDepth{false};
+        // Per-pixel screen motion (RG16F, GS pixels; wantMotion needs wantDepth too).
+        Vulkan::ImageHandle motion;
+        std::atomic<bool> wantMotion{false};
+        // The UI mask (R8: 1 where the HUD / 2D screens drew), so post-processing spares the UI.
+        Vulkan::ImageHandle ui;
+        std::atomic<bool> wantUi{false};
         // A paraLLEl-GS backend renders on this device (otherwise the CPU GS: pictures are uploaded).
         bool attached = false;
         // Submits the GS's open command buffers (with `mutex` held). A frame context only advances
