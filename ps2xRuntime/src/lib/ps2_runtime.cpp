@@ -17,6 +17,7 @@
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#include "runtime/ps2_display_clock.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -2385,6 +2386,51 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+// Keeps the guest's vblanks in phase with the display when its refresh rate is a multiple of 60
+// (60, 120, 240 Hz): each game frame then starts at the same point of a refresh and is shown for
+// the same number of refreshes. A gentle phase-locked loop: each vblank (seen here, just after it
+// happened) is nudged towards a quarter of a refresh after a display refresh, which leaves most of
+// the refresh to draw and present the frame. RT_DISPLAY_LOCK=0 turns it off.
+void PS2Runtime::lockVBlankToDisplay()
+{
+    static const bool enabled = [] { const char *e = std::getenv("RT_DISPLAY_LOCK"); return !(e && *e == '0'); }();
+    int64_t lastRefresh = 0, period = 0;
+    if (!enabled || ps2_test::paused() || !ps2x::displayClockSample(lastRefresh, period))
+        return;
+    constexpr double kGuestPeriodNs = 16667000.0;
+    const double ratio = kGuestPeriodNs / static_cast<double>(period);
+    const double n = std::round(ratio);
+    if (n < 1.0 || std::fabs(ratio - n) > 0.02)
+        return; // e.g. 144 Hz: no whole number of refreshes per frame
+    // When the vblank was due on the host clock (the scheduler's timeline, not when we noticed it).
+    const int64_t now = m_eeScheduler->lastVBlankHostNs();
+    if (now == 0)
+        return;
+    double phase = std::fmod(static_cast<double>(now - lastRefresh) / static_cast<double>(period), 1.0);
+    if (phase < 0.0)
+        phase += 1.0;
+    double error = phase - 0.25;
+    if (error > 0.5)
+        error -= 1.0;
+    else if (error < -0.5)
+        error += 1.0;
+    m_eeScheduler->nudgeVBlank(static_cast<int64_t>(-error * static_cast<double>(period) * 0.1));
+    if (std::getenv("RT_DISPLAY_LOCK_DEBUG"))
+    {
+        static int count = 0;
+        static double sumAbs = 0.0, maxAbs = 0.0;
+        sumAbs += std::fabs(error);
+        maxAbs = std::max(maxAbs, std::fabs(error));
+        if (++count == 120)
+        {
+            std::fprintf(stderr, "[display-lock] refresh %.2f Hz, %d refreshes/frame, phase error mean %.3f max %.3f\n",
+                         1e9 / static_cast<double>(period), static_cast<int>(n), sumAbs / count, maxAbs);
+            count = 0;
+            sumAbs = maxAbs = 0.0;
+        }
+    }
+}
+
 void PS2Runtime::run()
 {
     ps2_test::startServerIfRequested(*this);
@@ -2505,7 +2551,10 @@ void PS2Runtime::run()
             while (m_memory.gs().vsyncTick.load(std::memory_order_acquire) == pacedTick &&
                    std::chrono::steady_clock::now() < deadline && !isStopRequested())
                 std::this_thread::sleep_for(std::chrono::microseconds(250));
-            pacedTick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            const uint64_t newTick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            if (newTick != pacedTick)
+                lockVBlankToDisplay();
+            pacedTick = newTick;
         }
 
         if (m_presenter->closeRequested())

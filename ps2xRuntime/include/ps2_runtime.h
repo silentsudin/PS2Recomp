@@ -576,6 +576,7 @@ private:
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
     std::unique_ptr<ps2x::HostPresenter> m_presenter;
+    void lockVBlankToDisplay();
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;

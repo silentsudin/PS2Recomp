@@ -430,6 +430,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
     src/lib/host/raylib_presenter.cpp
+    src/lib/host/display_clock_none.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_capture.cpp
@@ -548,6 +549,13 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(APPLE)
+    # The display's refresh clock (CVDisplayLink), for vblank phase locking.
+    enable_language(OBJCXX)
+    target_sources(ps2_runtime PRIVATE src/lib/host/display_clock_mac.mm)
+    target_link_libraries(ps2_runtime PRIVATE "-framework CoreVideo")
+endif()
+
 # The presenters draw the host UI: with the debug UI, the runtime itself links ImGui (and rlImGui).
 if(PS2X_ENABLE_DEBUG_UI AND TARGET rlImGui)
     target_link_libraries(ps2_runtime PRIVATE rlImGui imgui)

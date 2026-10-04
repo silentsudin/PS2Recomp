@@ -1869,11 +1869,15 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                m_lastVblankHostNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             scheduled.hostDeadline.time_since_epoch()).count(),
+                                         std::memory_order_relaxed);
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                const int64_t nudge = std::clamp<int64_t>(m_vblankNudgeNs.exchange(0, std::memory_order_relaxed), -200000, 200000);
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                              scheduled.hostDeadline + kVBlankPeriod + std::chrono::nanoseconds(nudge),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

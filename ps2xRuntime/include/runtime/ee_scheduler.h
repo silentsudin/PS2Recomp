@@ -334,6 +334,11 @@ public:
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+    // Moves the next vblank's host time by `ns` (clamped to +-200 us), to keep the guest's frames
+    // in phase with the display (see PS2Runtime::run). No effect in virtual time.
+    void nudgeVBlank(int64_t ns) noexcept { m_vblankNudgeNs.fetch_add(ns, std::memory_order_relaxed); }
+    // The host time the last vblank was scheduled for (steady_clock ns), 0 before the first.
+    [[nodiscard]] int64_t lastVBlankHostNs() const noexcept { return m_lastVblankHostNs.load(std::memory_order_relaxed); }
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
@@ -361,6 +366,9 @@ public:
     void publishSnapshot();
 
 private:
+    std::atomic<int64_t> m_vblankNudgeNs{0};
+    std::atomic<int64_t> m_lastVblankHostNs{0};
+
     struct ScheduledEvent
     {
         uint64_t deadlineCycle = 0;
