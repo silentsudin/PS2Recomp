@@ -53,7 +53,7 @@ namespace ps2x
         struct PostProcess
         {
             enum class AntiAliasing : uint8_t { None, Fxaa, Smaa };
-            enum class Scaling : uint8_t { Bilinear, Fsr1 };
+            enum class Scaling : uint8_t { Bilinear, Fsr1, MetalFxSpatial };
             AntiAliasing aa = AntiAliasing::None;
             Scaling scaling = Scaling::Bilinear;
             float sharpness = 0.5f; // FSR 1 RCAS, 0 (soft) .. 1 (sharpest)

@@ -581,6 +581,13 @@ if(PS2X_ENABLE_PGS)
         # The Vulkan presenter: SDL3 window + swapchain on the GS's device.
         target_compile_definitions(ps2_runtime PRIVATE PS2X_PGS_PRESENTER=1)
         target_link_libraries(ps2_runtime PRIVATE SDL3::SDL3)
+        if(APPLE)
+            # MetalFX spatial upscaling through MoltenVK's Metal objects.
+            enable_language(OBJCXX)
+            target_sources(ps2_runtime PRIVATE src/lib/gs/gs_metalfx.mm)
+            set_source_files_properties(src/lib/gs/gs_metalfx.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+            target_link_libraries(ps2_runtime PRIVATE "-framework Metal" "-framework MetalFX" "-framework Foundation")
+        endif()
     endif()
     message(STATUS "paraLLEl-GS Vulkan GS backend: enabled")
 endif()

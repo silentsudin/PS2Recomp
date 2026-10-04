@@ -10,6 +10,9 @@
 
 #include "gs_pgs_shared.h"
 #include "imgui_spirv.h"
+#if defined(__APPLE__)
+#include "gs_metalfx.h"
+#endif
 #include "post/post_spirv.h"
 
 // FidelityFX FSR 1 constants, computed on the CPU (post/ffx, MIT).
@@ -30,6 +33,10 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 
 #if defined(PS2X_ENABLE_DEBUG_UI)
 #include "imgui.h"
@@ -189,6 +196,34 @@ namespace ps2x::gs
                 m_smaaEdges = post(post_spirv::smaa_edges_frag, sizeof(post_spirv::smaa_edges_frag), 16, 0x1, 0x1);
                 m_smaaWeights = post(post_spirv::smaa_weights_frag, sizeof(post_spirv::smaa_weights_frag), 16, 0x1, 0x7);
                 m_smaaBlend = post(post_spirv::smaa_blend_frag, sizeof(post_spirv::smaa_blend_frag), 16, 0x1, 0x3);
+#if defined(__APPLE__)
+                // MetalFX through MoltenVK's Metal objects.
+                {
+                    // MoltenVK's own functions: from the library SDL loaded (they are not instance
+                    // commands, so vkGetInstanceProcAddr may not know them).
+                    void *lib = dlopen(m_options.vulkanLibrary.empty() ? "libMoltenVK.dylib" : m_options.vulkanLibrary.c_str(),
+                                       RTLD_NOW | RTLD_NOLOAD);
+                    auto sym = [&](const char *name) -> void * {
+                        void *f = lib ? dlsym(lib, name) : nullptr;
+                        return f ? f : reinterpret_cast<void *>(getProc(m_wsi.get_context().get_instance(), name));
+                    };
+                    using GetDevice = void (*)(VkPhysicalDevice, void **);
+                    auto getDevice = reinterpret_cast<GetDevice>(sym("vkGetMTLDeviceMVK"));
+                    m_getTexture = reinterpret_cast<GetTexture>(sym("vkGetMTLTextureMVK"));
+                    m_getQueue = reinterpret_cast<GetQueue>(sym("vkGetMTLCommandQueueMVK"));
+                    void *mtlDevice = nullptr;
+                    if (getDevice && m_getTexture && m_getQueue)
+                        getDevice(m_wsi.get_context().get_gpu(), &mtlDevice);
+                    if (mtlDevice)
+                        m_metalfx = MetalFxSpatial::create(mtlDevice);
+                    std::cout << "[presenter] MetalFX spatial "
+                              << (m_metalfx ? "available"
+                                            : !getDevice ? "unavailable (no MoltenVK Metal interop)"
+                                            : !mtlDevice ? "unavailable (no Metal device)"
+                                                         : "unavailable (not supported on this GPU/OS)")
+                              << std::endl;
+                }
+#endif
                 if (!m_fxaa || !m_easu || !m_rcas || !m_smaaEdges || !m_smaaWeights || !m_smaaBlend)
                     return fail("Vulkan", "post-processing shaders");
                 {
@@ -405,8 +440,9 @@ namespace ps2x::gs
 
             // Before the swapchain pass: anti-aliasing at the render resolution, then FSR 1 EASU to
             // the picture's size on screen. Leaves the image the final pass draws in m_final.
-            void preparePicture(Vulkan::CommandBuffer &cmd, float fw, float fh)
+            void preparePicture(Vulkan::CommandBufferHandle &cmdHandle, float fw, float fh)
             {
+                Vulkan::CommandBuffer &cmd = *cmdHandle;
                 const Vulkan::ImageHandle &image = m_shared.attached ? m_shared.scanout : m_cpuFrame;
                 m_final = image.get();
                 m_finalRcas = false;
@@ -435,6 +471,13 @@ namespace ps2x::gs
                     m_final = m_aaImage.get();
                 }
                 const VkRect2D rect = pictureRect(fw, fh);
+#if defined(__APPLE__)
+                if (m_post.scaling == PostProcess::Scaling::MetalFxSpatial && m_metalfx && rect.extent.width > sw)
+                {
+                    upscaleMetalFx(cmdHandle, sw, sh, rect.extent.width, rect.extent.height);
+                    return;
+                }
+#endif
                 if (m_post.scaling == PostProcess::Scaling::Fsr1 && rect.extent.width > sw)
                 {
                     struct
@@ -450,6 +493,38 @@ namespace ps2x::gs
                     m_finalRcas = true;
                 }
             }
+
+#if defined(__APPLE__)
+            // The passes so far go to the GPU and finish; MetalFX then scales m_final into the
+            // window-sized m_upImage on the same Metal queue; the frame continues in a new command
+            // buffer. (MoltenVK image layouts are no-ops in Metal, so the transition below only
+            // keeps Vulkan's bookkeeping consistent.)
+            void upscaleMetalFx(Vulkan::CommandBufferHandle &cmd, uint32_t sw, uint32_t sh, uint32_t w, uint32_t h)
+            {
+                Vulkan::Device &dev = *m_shared.device;
+                if (!m_upImage || m_upImage->get_width() != w || m_upImage->get_height() != h ||
+                    !(m_upImage->get_create_info().usage & VK_IMAGE_USAGE_STORAGE_BIT))
+                {
+                    auto info = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
+                    info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+                    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    m_upImage = dev.create_image(info);
+                }
+                cmd->image_barrier(*m_upImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                Vulkan::Fence fence;
+                dev.submit(cmd, &fence);
+                fence->wait();
+                void *in = nullptr, *out = nullptr, *queue = nullptr;
+                m_getTexture(m_final->get_image(), &in);
+                m_getTexture(m_upImage->get_image(), &out);
+                m_getQueue(m_wsi.get_context().get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS], &queue);
+                if (in && out && queue && m_metalfx->upscale(queue, in, sw, sh, out, w, h))
+                    m_final = m_upImage.get();
+                cmd = dev.request_command_buffer();
+            }
+#endif
 
             void drawGame(Vulkan::CommandBuffer &cmd, float fw, float fh)
             {
@@ -617,7 +692,7 @@ namespace ps2x::gs
                 const Vulkan::Image &back = dev.get_swapchain_view().get_image();
                 const float fw = static_cast<float>(back.get_width()), fh = static_cast<float>(back.get_height());
                 auto cmd = dev.request_command_buffer();
-                preparePicture(*cmd, fw, fh);
+                preparePicture(cmd, fw, fh);
                 auto rp = dev.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
                 rp.clear_color[0] = {};
                 cmd->begin_render_pass(rp);
@@ -683,6 +758,13 @@ namespace ps2x::gs
             Vulkan::ImageHandle m_smaaArea, m_smaaSearch, m_smaaEdgeImage, m_smaaWeightImage;
             const Vulkan::Image *m_final = nullptr;   // what the final pass draws this frame
             bool m_finalRcas = false;
+#if defined(__APPLE__)
+            using GetTexture = void (*)(VkImage, void **);
+            using GetQueue = void (*)(VkQueue, void **);
+            GetTexture m_getTexture = nullptr;
+            GetQueue m_getQueue = nullptr;
+            std::unique_ptr<MetalFxSpatial> m_metalfx;
+#endif
             Vulkan::ImageHandle m_cpuFrame; // CPU GS: the uploaded picture
             std::unordered_map<uint64_t, Vulkan::ImageHandle> m_textures; // by ImTextureID
             uint64_t m_nextTexture = 0;
