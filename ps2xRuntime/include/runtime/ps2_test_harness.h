@@ -54,6 +54,13 @@ namespace ps2_test
 
     // The vblank the game is at (for logs).
     uint64_t currentVblank();
+
+    // Pauses the game (a host menu is open): the game thread waits at the next vblank until
+    // resumed, so the picture holds and nothing advances. Ignored while a test client is attached.
+    void setPaused(bool paused);
+    bool paused();
+    // While paused: let `vblanks` frames through (e.g. so a changed picture setting shows), then hold again.
+    void stepPaused(uint32_t vblanks);
     // Adds a marker to the movie being recorded (any thread).
     void addMarker(const std::string &kind, const std::string &text = {});
     // True while a movie or script drives the pad.

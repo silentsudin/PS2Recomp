@@ -213,6 +213,11 @@ private:
     uint32_t m_trxdir = 3;
 
 
+    // RT_GS_BATCH_LOG=<file>: one line per run of similar draws (path, target, primitive,
+    // texture, screen bounding box) per frame, for telling HUD/2D from 3D.
+    uint32_t m_curPath = 2u;
+    void logBatchVertex(const GSVertex &vtx);
+
     static constexpr int kMaxVerts = 6;
     GSVertex m_vtxQueue[kMaxVerts];
     int m_vtxCount = 0;

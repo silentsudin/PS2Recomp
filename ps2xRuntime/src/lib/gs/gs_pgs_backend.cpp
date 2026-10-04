@@ -8,8 +8,10 @@
 #include "context.hpp"
 #include "device.hpp"
 #include "gs_interface.hpp"
+#include "thread_id.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -67,7 +69,19 @@ namespace ps2x::gs
             }
         }
 
-        class PgsBackend final : public GSRasterBackend, public GSPacketMirror
+        ParallelGS::SuperSampling superSamplingFromCount(uint32_t rate)
+        {
+            switch (rate)
+            {
+            case 2: return ParallelGS::SuperSampling::X2;
+            case 4: return ParallelGS::SuperSampling::X4;
+            case 8: return ParallelGS::SuperSampling::X8;
+            case 16: return ParallelGS::SuperSampling::X16;
+            default: return ParallelGS::SuperSampling::X1;
+            }
+        }
+
+        class PgsBackend final : public GSRasterBackend, public GSPacketMirror, public PgsControl
         {
         public:
             bool init(const PgsOptions &options, std::string &error)
@@ -99,6 +113,7 @@ namespace ps2x::gs
                 // keeps the plain field deinterlacer.
                 m_progressive = !envEquals("RT_GS_PROGRESSIVE", "0");
                 gsOptions.super_sampling = superSamplingFromEnv(m_progressive ? 4u : 1u);
+                m_samples = static_cast<uint32_t>(gsOptions.super_sampling);
                 if (!m_iface.init(&m_device, gsOptions))
                 {
                     error = "paraLLEl-GS init failed (missing Vulkan features?)";
@@ -106,8 +121,34 @@ namespace ps2x::gs
                 }
 
                 const auto &props = m_device.get_gpu_properties();
+                m_info.name = props.deviceName;
+                m_info.vendorId = props.vendorID;
+                m_info.deviceId = props.deviceID;
+                m_info.apiVersion = props.apiVersion;
                 std::cout << "[gs] paraLLEl-GS on " << props.deviceName << std::endl;
                 return true;
+            }
+
+            // ---------------------------------------------------------------- PgsControl
+            PgsDeviceInfo deviceInfo() const override { return m_info; }
+
+            void setSuperSampling(uint32_t samples) override
+            {
+                const auto lock = lockDevice();
+                const ParallelGS::SuperSampling rate = superSamplingFromCount(samples);
+                if (static_cast<uint32_t>(rate) == m_samples)
+                    return;
+                m_iface.set_super_sampling_rate(rate, true, false);
+                m_samples = static_cast<uint32_t>(rate);
+            }
+
+            uint32_t superSampling() const override { return m_samples; }
+
+            void setSharpTextures(bool on) override
+            {
+                const auto lock = lockDevice();
+                m_hacks.disable_mipmaps = on;
+                m_iface.set_hacks(m_hacks);
             }
 
             // ---------------------------------------------------------------- GSPacketMirror
@@ -115,14 +156,14 @@ namespace ps2x::gs
             {
                 if (!data || sizeBytes < 16u || pathIndex > 3u)
                     return;
-                std::lock_guard<std::mutex> lock(m_mutex);
+                const auto lock = lockDevice();
                 m_iface.gif_transfer(pathIndex, data, sizeBytes);
                 m_gpuVramNewer = true;
             }
 
             void MirrorRegisterWrite(uint8_t regAddr, uint64_t value) override
             {
-                std::lock_guard<std::mutex> lock(m_mutex);
+                const auto lock = lockDevice();
                 m_iface.write_register(static_cast<ParallelGS::RegisterAddr>(regAddr), value);
                 m_gpuVramNewer = true;
             }
@@ -136,13 +177,13 @@ namespace ps2x::gs
                 m_vramSize = vramSize;
                 m_shadow.Initialize(vram, vramSize);
                 // Seed the GPU copy with whatever the previous backend left in local memory.
-                std::lock_guard<std::mutex> lock(m_mutex);
+                const auto lock = lockDevice();
                 uploadWholeVramLocked();
             }
 
             void Reset() override
             {
-                std::lock_guard<std::mutex> lock(m_mutex);
+                const auto lock = lockDevice();
                 m_iface.reset_context_state();
                 m_shadow.Reset();
             }
@@ -185,7 +226,7 @@ namespace ps2x::gs
             {
                 pullVramFromGpu();
                 m_shadow.WriteVram(psm, base, bw, x, y, value);
-                std::lock_guard<std::mutex> lock(m_mutex);
+                const auto lock = lockDevice();
                 uploadWholeVramLocked();
             }
 
@@ -204,7 +245,7 @@ namespace ps2x::gs
                 Vulkan::Fence fence;
                 uint32_t w = 0, h = 0;
                 {
-                    std::lock_guard<std::mutex> lock(m_mutex);
+                    const auto lock = lockDevice();
 
                     auto &priv = m_iface.get_priv_register_state();
                     setPrivReg(priv.pmode, request.pmode);
@@ -231,7 +272,8 @@ namespace ps2x::gs
                     {
                         vsync.force_progressive = true;
                         vsync.anti_blur = true;
-                        vsync.high_resolution_scanout = true;
+                        // Needs at least 4 samples per pixel (paraLLEl-GS scans out 2x2 of them).
+                        vsync.high_resolution_scanout = m_samples >= 4u;
                     }
 
                     m_iface.flush();
@@ -249,12 +291,29 @@ namespace ps2x::gs
                 if (!fence)
                     return frame;
                 fence->wait();
-                std::lock_guard<std::mutex> lock(m_mutex);
+                const auto lock = lockDevice();
                 return copyReadbackLocked(w, h);
             }
 
         private:
             bool m_progressive = true;
+            std::atomic<uint32_t> m_samples{1};
+            ParallelGS::Hacks m_hacks = {}; // every hack set so far (set_hacks replaces them all)
+
+            // The device has one thread index (set_num_thread_indices(1)) and every use holds
+            // m_mutex, so each calling thread (EE, VU1, render) uses index 0. Registering it stops
+            // Granite logging an error per call from an unregistered thread.
+            std::unique_lock<std::mutex> lockDevice() const
+            {
+                static thread_local bool registered = false;
+                if (!registered)
+                {
+                    Util::register_thread_index(0);
+                    registered = true;
+                }
+                return std::unique_lock<std::mutex>(m_mutex);
+            }
+            PgsDeviceInfo m_info;
             Vulkan::Fence submitReadbackLocked(const Vulkan::Image &image)
             {
                 const uint32_t w = image.get_width();
@@ -327,7 +386,7 @@ namespace ps2x::gs
 
             void pullVramFromGpu()
             {
-                std::lock_guard<std::mutex> lock(m_mutex);
+                const auto lock = lockDevice();
                 if (!m_gpuVramNewer || !m_vram)
                     return;
                 m_iface.flush();
@@ -357,17 +416,20 @@ namespace ps2x::gs
             uint8_t *m_vram = nullptr;
             uint32_t m_vramSize = 0u;
             bool m_gpuVramNewer = false;
-            std::mutex m_mutex;
+            mutable std::mutex m_mutex;
         };
     }
 
     bool pgsAvailable() { return true; }
 
-    std::unique_ptr<GSRasterBackend> createPgsBackend(const PgsOptions &options, std::string &error)
+    std::unique_ptr<GSRasterBackend> createPgsBackend(const PgsOptions &options, std::string &error,
+                                                      PgsControl **control)
     {
         auto backend = std::make_unique<PgsBackend>();
         if (!backend->init(options, error))
             return nullptr;
+        if (control)
+            *control = backend.get();
         return backend;
     }
 }
@@ -378,7 +440,7 @@ namespace ps2x::gs
 {
     bool pgsAvailable() { return false; }
 
-    std::unique_ptr<GSRasterBackend> createPgsBackend(const PgsOptions &, std::string &error)
+    std::unique_ptr<GSRasterBackend> createPgsBackend(const PgsOptions &, std::string &error, PgsControl **)
     {
         error = "built without paraLLEl-GS (PS2X_ENABLE_PGS=OFF)";
         return nullptr;

@@ -92,6 +92,8 @@ namespace ps2_test
         uint64_t g_parkedAt = UINT64_MAX;   // vblank the game is parked at, or UINT64_MAX
         bool g_serverPadActive = false;
         Pads g_serverPads;
+        bool g_paused = false; // a host menu is open
+        uint32_t g_pausedSteps = 0; // frames to let through while paused
         // Vibration per port (any thread reads, the EE thread writes).
         std::mutex g_actMutex;
         ActuatorState g_actuators[kPadPorts];
@@ -348,6 +350,28 @@ namespace ps2_test
         }
     }
 
+    void setPaused(bool paused)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_paused == paused)
+            return;
+        g_paused = paused;
+        g_parkCv.notify_all();
+    }
+
+    void stepPaused(uint32_t vblanks)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_pausedSteps += vblanks;
+        g_parkCv.notify_all();
+    }
+
+    bool paused()
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        return g_paused;
+    }
+
     uint64_t currentVblank()
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -387,6 +411,19 @@ namespace ps2_test
                 g_parkCv.wait(lock, [&]
                               { return (g_attached && vblank < g_runTarget) || !g_serverEnabled || runtime.isStopRequested(); });
                 g_parkedAt = UINT64_MAX;
+            }
+            // A host menu is open: hold the game here (the render thread keeps showing the last
+            // picture and the menu) until it closes.
+            while (g_paused && !g_attached && !runtime.isStopRequested())
+            {
+                if (g_pausedSteps > 0)
+                {
+                    --g_pausedSteps;
+                    break;
+                }
+                // Wakes regularly as well, so closing the window while paused still stops the game.
+                g_parkCv.wait_for(lock, std::chrono::milliseconds(100),
+                                  [&] { return !g_paused || g_pausedSteps > 0 || g_attached || runtime.isStopRequested(); });
             }
             g_currentVblank = vblank;
             bool scripted = false;

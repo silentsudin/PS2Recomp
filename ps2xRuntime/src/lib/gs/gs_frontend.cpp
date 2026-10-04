@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_test_harness.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
@@ -652,6 +653,7 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
 
     if (m_packetMirror)
         m_packetMirror->MirrorGifPacket(pathIndex, data, sizeBytes & ~15u);
+    m_curPath = pathIndex;
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -1549,10 +1551,99 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     recordRegisterDebugEventUnlocked(regAddr, value);
 }
 
+namespace
+{
+    struct BatchLog
+    {
+        FILE *file = nullptr;
+        uint64_t vblank = UINT64_MAX;
+        bool open = false;
+        uint32_t path = 0, fbp = 0, tbp = 0, psm = 0, prim = 0;
+        bool fst = false, tme = false, ctxt = false;
+        uint32_t verts = 0;
+        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        double z0 = 0, z1 = 0;
+
+        void flush()
+        {
+            if (!open)
+                return;
+            std::fprintf(file, "%llu path=%u fbp=%u prim=%u fst=%d tme=%d ctx=%d tbp=%u psm=%u n=%u box=%.0f,%.0f,%.0f,%.0f z=%.0f..%.0f\n",
+                         static_cast<unsigned long long>(vblank), path, fbp, prim, fst, tme, ctxt, tbp, psm, verts, x0, y0,
+                         x1, y1, z0, z1);
+            open = false;
+        }
+    };
+
+    BatchLog *batchLog()
+    {
+        static BatchLog *log = []() -> BatchLog * {
+            const char *path = std::getenv("RT_GS_BATCH_LOG");
+            if (!path || !*path)
+                return nullptr;
+            auto *l = new BatchLog;
+            l->file = std::fopen(path, "w");
+            if (!l->file)
+                return nullptr;
+            // The last batch is written when the next one starts, or at exit.
+            std::atexit([] {
+                if (BatchLog *b = batchLog())
+                {
+                    b->flush();
+                    std::fclose(b->file);
+                }
+            });
+            return l;
+        }();
+        return log;
+    }
+}
+
+void GS::logBatchVertex(const GSVertex &vtx)
+{
+    BatchLog *log = batchLog();
+    if (!log)
+        return;
+    const uint64_t vblank = ps2_test::currentVblank();
+    const GSContext &ctx = m_ctx[m_prim.ctxt ? 1 : 0];
+    const float x = vtx.x - ctx.xyoffset.ofx / 16.0f;
+    const float y = vtx.y - ctx.xyoffset.ofy / 16.0f;
+    const bool same = log->open && log->vblank == vblank && log->path == m_curPath && log->fbp == ctx.frame.fbp &&
+                      log->prim == static_cast<uint32_t>(m_prim.type) && log->fst == m_prim.fst &&
+                      log->tme == m_prim.tme && log->ctxt == m_prim.ctxt && log->tbp == ctx.tex0.tbp0;
+    if (!same)
+    {
+        log->flush();
+        log->open = true;
+        log->vblank = vblank;
+        log->path = m_curPath;
+        log->fbp = ctx.frame.fbp;
+        log->prim = static_cast<uint32_t>(m_prim.type);
+        log->fst = m_prim.fst;
+        log->tme = m_prim.tme;
+        log->ctxt = m_prim.ctxt;
+        log->tbp = ctx.tex0.tbp0;
+        log->psm = ctx.tex0.psm;
+        log->verts = 0;
+        log->x0 = log->x1 = x;
+        log->y0 = log->y1 = y;
+        log->z0 = log->z1 = vtx.z;
+    }
+    ++log->verts;
+    log->x0 = std::min(log->x0, x);
+    log->x1 = std::max(log->x1, x);
+    log->y0 = std::min(log->y0, y);
+    log->y1 = std::max(log->y1, y);
+    log->z0 = std::min(log->z0, vtx.z);
+    log->z1 = std::max(log->z1, vtx.z);
+}
+
 void GS::vertexKick(bool drawing)
 {
     ++m_vtxCount;
     ++m_vtxIndex;
+    if (drawing)
+        logBatchVertex(m_vtxQueue[(m_vtxCount - 1) % kMaxVerts]);
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t debugIndex = s_debugGsVertexKickCount.fetch_add(1, std::memory_order_relaxed);

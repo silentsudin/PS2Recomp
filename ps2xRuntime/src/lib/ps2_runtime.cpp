@@ -2658,7 +2658,12 @@ void PS2Runtime::run()
         // Present once per guest vblank: wait for the next one (the EE scheduler times them on
         // the host clock). raylib's sleep-based limiter oversleeps on a busy machine and presents
         // fewer frames than the game draws. RT_HOST_FPS=<n> uses the limiter instead.
-        if (pacePresentationToVblank)
+        if (pacePresentationToVblank && ps2_test::paused())
+        {
+            // The game is paused under a host menu: no vblanks come, so pace the menu at ~60 Hz.
+            std::this_thread::sleep_for(std::chrono::microseconds(16000));
+        }
+        else if (pacePresentationToVblank)
         {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
             while (m_memory.gs().vsyncTick.load(std::memory_order_acquire) == pacedTick &&
