@@ -65,6 +65,12 @@ namespace ps2x::gs
         // Motion of each vertex (XYZ2/XYZF2/XYZ3/XYZF3, in kick order) of a PATH1 GIF packet, as
         // packed half2 (dx, dy) in GS pixels: current minus previous position.
         static void packetMotion(const uint8_t *data, uint32_t size, const MotionContext &ctx, std::vector<uint32_t> &out);
+        // Re-rendered frame generation: a copy of a PATH1 GIF packet with every vertex re-projected
+        // with the object's matrix moved on by t frames (C + t (C - C_prev): t = 0.5 is half a
+        // frame ahead), Z included, and perspective texture coordinates (PACKED ST/Q) rescaled
+        // for the new w. Vertices in the guard band are left as they are.
+        static void packetReproject(const uint8_t *data, uint32_t size, const MotionContext &ctx, double t,
+                                    std::vector<uint8_t> &out);
 
         struct Stats
         {

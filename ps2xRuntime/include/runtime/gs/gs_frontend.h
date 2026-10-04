@@ -230,6 +230,7 @@ private:
     std::atomic<bool> m_wideDriving{false}, m_wide2D{false};
     std::atomic<bool> m_jitterOn{false};
     std::atomic<bool> m_progressiveFields{false};
+    std::vector<uint8_t> m_shadowScratch[3]; // re-projected PATH1 packets for shadow frames
     std::atomic<float> m_jitterScaleX{0.5f}, m_jitterScaleY{0.25f};
     std::atomic<uint32_t> m_frameIndex{0};
     float m_snapJitter[4] = {}; // cur x, y, prev x, y (under m_stateMutex)

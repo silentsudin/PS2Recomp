@@ -24,6 +24,16 @@ public:
         MirrorGifPacket(pathIndex, data, sizeBytes);
     }
     virtual void MirrorRegisterWrite(uint8_t regAddr, uint64_t value) = 0;
+    // Re-rendered frame generation: how many shadow frames are rendered per guest frame, and,
+    // right before a MirrorGifPacket* call, that packet's version for shadow frame `index` (the
+    // 3D re-projected). Packets without a version go to the shadows as they are.
+    virtual uint32_t ShadowFrames() const { return 0; }
+    virtual void SetShadowVariant(uint32_t index, const uint8_t *data, uint32_t sizeBytes)
+    {
+        (void)index;
+        (void)data;
+        (void)sizeBytes;
+    }
 };
 
 class GSRasterBackend

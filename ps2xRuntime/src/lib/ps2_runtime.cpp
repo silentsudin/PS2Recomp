@@ -2406,7 +2406,10 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 // the refresh to draw and present the frame. RT_DISPLAY_LOCK=0 turns it off.
 void PS2Runtime::lockVBlankToDisplay()
 {
-    static const bool enabled = [] { const char *e = std::getenv("RT_DISPLAY_LOCK"); return !(e && *e == '0'); }();
+    // Off by default: with present-at-time pacing (the presenter puts every present on a fixed
+    // refresh grid) the lock measured no better in Town and could hold the presents at a bad phase
+    // in a race. RT_DISPLAY_LOCK=1 turns it on.
+    static const bool enabled = [] { const char *e = std::getenv("RT_DISPLAY_LOCK"); return e && *e == '1'; }();
     int64_t lastRefresh = 0, period = 0;
     if (!enabled || ps2_test::paused() || !ps2x::displayClockSample(lastRefresh, period))
         return;
@@ -2545,10 +2548,42 @@ void PS2Runtime::run()
             std::this_thread::sleep_for(std::chrono::microseconds(500));
             continue;
         }
-        m_presenter->frame(*this, [this] {
-            if (m_debugUiInitialized && m_debugUiDrawCallback)
-                m_debugUiDrawCallback(*this, m_debugUiUserData);
-        });
+        // Presents per guest frame: the frame generation factor. The presenter puts each present
+        // on a fixed grid of display refreshes (present-at-time), so every frame holds the same
+        // number of refreshes. RT_PRESENT_EVERY_REFRESH=1 presents on every refresh instead
+        // (repeats), which costs GS time: the presenter waits for swapchain images while holding
+        // the device lock.
+        uint32_t presents = 1;
+        int64_t refreshPeriodNs = 0;
+        if (pacePresentationToVblank && !ps2_test::paused())
+        {
+            static const bool everyRefresh = [] {
+                const char *e = std::getenv("RT_PRESENT_EVERY_REFRESH");
+                return e && *e == '1';
+            }();
+            int64_t lastRefresh = 0, period = 0;
+            if (everyRefresh && ps2x::displayClockSample(lastRefresh, period) && period > 0)
+            {
+                const double ratio = 16667000.0 / static_cast<double>(period), n = std::round(ratio);
+                if (n >= 1.0 && std::fabs(ratio - n) < 0.02)
+                    presents = static_cast<uint32_t>(n);
+                refreshPeriodNs = period;
+            }
+            presents = std::min<uint32_t>(std::max(presents, m_presenter->frameGenerationFactor()), 4u);
+        }
+        m_presenter->setPresentsPerFrame(presents);
+        // The presents are spread one refresh apart, waiting here rather than in the swapchain:
+        // the presenter waits for a free image while holding the device lock the GS thread needs.
+        const auto firstPresent = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < presents && !isStopRequested(); ++i)
+        {
+            if (i > 0 && refreshPeriodNs > 0)
+                std::this_thread::sleep_until(firstPresent + std::chrono::nanoseconds(refreshPeriodNs * i - 1000000));
+            m_presenter->frame(*this, [this] {
+                if (m_debugUiInitialized && m_debugUiDrawCallback)
+                    m_debugUiDrawCallback(*this, m_debugUiUserData);
+            });
+        }
 
         // Present once per guest vblank: wait for the next one (the EE scheduler times them on
         // the host clock). raylib's sleep-based limiter oversleeps on a busy machine and presents

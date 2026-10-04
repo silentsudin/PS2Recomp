@@ -3,6 +3,7 @@
 // to 4:3 and the host UI (Dear ImGui, drawn here through Granite with ImGui's own shaders), then
 // presents. Nothing is read back to the CPU except for test captures and screenshots.
 
+#include "runtime/ps2_display_clock.h"
 #include "runtime/gs/gs_pgs_backend.h"
 #include "runtime/ps2_host_presenter.h"
 
@@ -59,9 +60,60 @@ namespace ps2x::gs
 {
     namespace
     {
+        // Present-at-time (VK_GOOGLE_display_timing; MoltenVK turns it into Metal's presentAtTime):
+        // Granite presents through its device table, so its vkQueuePresentKHR is wrapped to add the
+        // desired time the presenter set for this present.
+        PFN_vkQueuePresentKHR g_realQueuePresent = nullptr;
+        uint64_t g_desiredPresentNs = 0; // host media time; 0 = as soon as possible (presenter thread)
+        uint64_t g_targetRefreshNs = 0;  // the refresh that present is aimed at
+        uint32_t g_presentTimingId = 0;
+        VkSwapchainKHR g_timedSwapchain = VK_NULL_HANDLE;
+        // Recent presents: id -> the refresh it was aimed at (feedback for the present lead).
+        struct TimedPresent
+        {
+            uint32_t id = 0;
+            int64_t target = 0;
+        };
+        TimedPresent g_timedPresents[16];
+
+        VKAPI_ATTR VkResult VKAPI_CALL queuePresentAtTime(VkQueue queue, const VkPresentInfoKHR *info)
+        {
+            const uint64_t desired = g_desiredPresentNs;
+            g_desiredPresentNs = 0;
+            if (!desired || !info || info->swapchainCount != 1)
+                return g_realQueuePresent(queue, info);
+            g_timedSwapchain = info->pSwapchains[0];
+            const VkPresentTimeGOOGLE time = {++g_presentTimingId, desired};
+            g_timedPresents[g_presentTimingId % 16] = {g_presentTimingId, static_cast<int64_t>(g_targetRefreshNs)};
+            VkPresentTimesInfoGOOGLE times = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, info->pNext, 1, &time};
+            VkPresentInfoKHR withTime = *info;
+            withTime.pNext = &times;
+            return g_realQueuePresent(queue, &withTime);
+        }
+
+        bool presentAtTimeWanted()
+        {
+#if defined(__APPLE__)
+            static const bool on = [] {
+                const char *e = std::getenv("RT_PRESENT_AT_TIME");
+                return !(e && *e == '0');
+            }();
+            return on;
+#else
+            return false;
+#endif
+        }
+
         class SdlPlatform final : public Vulkan::WSIPlatform
         {
         public:
+            std::vector<const char *> get_device_extensions() override
+            {
+                if (presentAtTimeWanted())
+                    return {"VK_KHR_swapchain", "VK_GOOGLE_display_timing"};
+                return {"VK_KHR_swapchain"};
+            }
+
             explicit SdlPlatform(SDL_Window *window) : m_window(window) {}
 
             VkSurfaceKHR create_surface(VkInstance instance, VkPhysicalDevice) override
@@ -150,6 +202,10 @@ namespace ps2x::gs
                 m_wsi.set_present_mode(m_options.vsync ? Vulkan::PresentMode::SyncToVBlank
                                                        : Vulkan::PresentMode::UnlockedMaybeTear);
                 m_wsi.set_backbuffer_format(Vulkan::BackbufferFormat::UNORM);
+                // begin_frame waits (VK_KHR_present_wait) until the present this many frames back is
+                // on screen, under the device lock the GS thread needs. At one present per display
+                // refresh, 1 makes that wait about a refresh long and the game misses frames.
+                m_wsi.set_present_wait_latency(2);
                 Vulkan::Context::SystemHandles handles = {};
                 // As the GS's own device: push descriptors, no descriptor buffers/heaps.
                 if (!m_wsi.init_context_from_platform(1, handles, Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT,
@@ -158,11 +214,18 @@ namespace ps2x::gs
                     return fail("Vulkan", "instance/device creation failed");
                 if (!m_wsi.init_device() || !m_wsi.init_surface_swapchain())
                     return fail("Vulkan", "swapchain creation failed");
+                if (presentAtTimeWanted())
+                {
+                    auto &table = const_cast<VolkDeviceTable &>(m_wsi.get_context().get_device_table());
+                    g_realQueuePresent = table.vkQueuePresentKHR;
+                    table.vkQueuePresentKHR = queuePresentAtTime;
+                    m_presentAtTime = true;
+                }
                 m_shared.device = &m_wsi.get_device();
                 // paraLLEl-GS advances a frame context on every flush, and the swapchain on every
                 // frame: with Granite's default of 2 the game thread waits for the GPU inside a
                 // flush. 4, as the GS's own device had.
-                m_shared.device->init_frame_contexts(4);
+                m_shared.device->init_frame_contexts(8);
 
                 Vulkan::ResourceLayout vert = {};
                 vert.input_mask = 0x7;
@@ -203,6 +266,10 @@ namespace ps2x::gs
                 m_taa = post(post_spirv::taa_frag, sizeof(post_spirv::taa_frag), 32, 0x1, 0x7);
                 m_depthNormalize = post(post_spirv::depth_normalize_frag, sizeof(post_spirv::depth_normalize_frag), 0, 0x1);
                 m_uiComposite = post(post_spirv::ui_composite_frag, sizeof(post_spirv::ui_composite_frag), 0, 0x1, 0x7);
+                m_frameGen = post(post_spirv::frame_gen_frag, sizeof(post_spirv::frame_gen_frag), 32, 0x1, 0xF);
+                m_copy = post(post_spirv::copy_frag, sizeof(post_spirv::copy_frag), 0, 0x1);
+                m_flicker = post(post_spirv::flicker_frag, sizeof(post_spirv::flicker_frag), 8, 0x1, 0xF);
+                m_flickerCut = post(post_spirv::flicker_cut_frag, sizeof(post_spirv::flicker_cut_frag), 0, 0x1, 0x3);
                 if (const char *e = std::getenv("RT_SHOW_MOTION"); e && *e == '1')
                 {
                     m_showMotion = true;
@@ -322,12 +389,15 @@ namespace ps2x::gs
             void frame(PS2Runtime &runtime, const std::function<void()> &drawUi) override
             {
                 pumpEvents();
+
                 updateTemporal(runtime);
                 latch(runtime);
                 m_pictureAspect = pictureAspect(runtime, *this);
+                m_frame2D = runtime.gsUnsynced().lastFrameWas2D();
                 m_uiFrame = false;
                 if (drawUi)
                     drawUi();
+                waitForDrawable();
                 render();
             }
 
@@ -467,8 +537,8 @@ namespace ps2x::gs
             void preparePicture(Vulkan::CommandBufferHandle &cmdHandle, float fw, float fh)
             {
                 Vulkan::CommandBuffer &cmd = *cmdHandle;
-                const Vulkan::ImageHandle &image = m_shared.attached ? m_shared.scanout : m_cpuFrame;
-                m_final = image.get();
+                const Vulkan::Image *image = sourceImage();
+                m_final = image;
                 m_finalRcas = false;
                 if (!image)
                     return;
@@ -490,7 +560,7 @@ namespace ps2x::gs
                     return;
                 }
                 const bool metalfxTemporal = m_post.scaling == PostProcess::Scaling::MetalFxTemporal;
-                if (m_post.aa == PostProcess::AntiAliasing::Taa && !metalfxTemporal)
+                if (m_post.aa == PostProcess::AntiAliasing::Taa && !metalfxTemporal && !m_noTemporal)
                     temporalAntiAliasing(cmd, sw, sh);
                 else if (m_post.aa == PostProcess::AntiAliasing::Smaa)
                 {
@@ -518,7 +588,7 @@ namespace ps2x::gs
                 // Temporal needs a progressive picture: progressive fields, or 4x supersampling and
                 // up (full frames). Interlaced fields below that alternate every frame: spatial.
                 const bool progressive = sh >= 600 || m_progressiveFields;
-                if (metalfxTemporal && progressive && m_metalfxTemporal && rect.extent.width > sw && m_shared.motion &&
+                if (metalfxTemporal && progressive && !m_noTemporal && m_metalfxTemporal && rect.extent.width > sw && m_shared.motion &&
                     m_shared.depth && m_shared.motion->get_width() == sw && m_shared.depth->get_width() == sw)
                 {
                     // Beyond the scaler's largest ratio (640x448 to a Retina window is about 3.5x),
@@ -528,9 +598,9 @@ namespace ps2x::gs
                     upscaleMetalFxTemporal(cmdHandle, sw, sh, uint32_t(float(sw) * k), uint32_t(float(sh) * k));
                     return;
                 }
-                if (metalfxTemporal)
+                if (metalfxTemporal && !m_noTemporal)
                     m_temporalValid = false; // a 2D screen: start the history again afterwards
-                if ((m_post.scaling == PostProcess::Scaling::MetalFxSpatial || (metalfxTemporal && !progressive)) && m_metalfx &&
+                if ((m_post.scaling == PostProcess::Scaling::MetalFxSpatial || (metalfxTemporal && (!progressive || m_noTemporal))) && m_metalfx &&
                     rect.extent.width > sw)
                 {
                     upscaleMetalFx(cmdHandle, sw, sh, rect.extent.width, rect.extent.height);
@@ -559,11 +629,13 @@ namespace ps2x::gs
                 m_progressiveFields = runtime.gsUnsynced().progressiveFields();
                 const bool on = m_post.aa == PostProcess::AntiAliasing::Taa ||
                                 m_post.scaling == PostProcess::Scaling::MetalFxTemporal;
+                const bool motion = on || m_fg.factor > 1; // frame generation needs motion and depth too
+                m_shared.wantShadows = m_fg.factor > 1 && m_fg.rerender ? m_fg.factor - 1 : 0u;
                 if (!m_showMotion && !m_showDepth)
                 {
-                    m_shared.wantDepth = on;
-                    m_shared.wantMotion = on;
-                    MotionTracker::instance().setEnabled(on);
+                    m_shared.wantDepth = motion;
+                    m_shared.wantMotion = motion;
+                    MotionTracker::instance().setEnabled(motion);
                 }
                 // Jitter across one picture pixel: the frame buffer is 640 x 224 (fields), the
                 // picture 2x or more of it.
@@ -575,8 +647,10 @@ namespace ps2x::gs
                     runtime.gsUnsynced().snapshotJitter(m_jitter[0], m_jitter[1], m_jitter[2], m_jitter[3]);
                 if (!on)
                     m_taaValid = false;
-                // Any post-processing spares the UI (the GS marks where the HUD and 2D screens drew).
-                m_shared.wantUi = m_post.aa != PostProcess::AntiAliasing::None || m_post.scaling != PostProcess::Scaling::Bilinear;
+                // Any post-processing (and frame generation) spares the UI (the GS marks where the HUD and 2D
+                // screens drew).
+                m_shared.wantUi = m_post.aa != PostProcess::AntiAliasing::None || m_post.scaling != PostProcess::Scaling::Bilinear ||
+                                  m_fg.factor > 1; // generated frames keep the current frame's HUD
             }
 
             void temporalAntiAliasing(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh)
@@ -687,13 +761,149 @@ namespace ps2x::gs
             }
 #endif
 
+            // The guest's picture: the scanout (or the CPU GS's upload), or with progressive fields
+            // the scanout with alternating pixels blended (blendFlicker).
+            const Vulkan::Image *sourceImage() const
+            {
+                if (m_sourceOverride)
+                    return m_sourceOverride;
+                if (m_flickerOut)
+                    return m_flickerOut.get();
+                const Vulkan::ImageHandle &raw = m_shared.attached ? m_shared.scanout : m_cpuFrame;
+                return raw.get();
+            }
+
+            // Progressive fields show every field whole, so effects that alternate two pictures
+            // and count on an interlaced TV to blend them would strobe (flicker.frag). Once per
+            // guest frame: the raw picture against the two before it.
+            void blendFlicker(Vulkan::CommandBuffer &cmd)
+            {
+                m_flickerOut.reset();
+                const Vulkan::ImageHandle &raw = m_shared.attached ? m_shared.scanout : m_cpuFrame;
+                if (!raw || !m_progressiveFields || m_showMotion || m_showDepth)
+                {
+                    m_flickerValid = 0;
+                    return;
+                }
+                const uint32_t w = raw->get_width(), h = raw->get_height();
+                Vulkan::ImageHandle &prev = m_flickerHist[m_flickerIndex], &before = m_flickerHist[m_flickerIndex ^ 1u];
+                const bool valid = m_flickerValid >= 1 && prev && prev->get_width() == w && prev->get_height() == h;
+                const bool haveBefore = valid && m_flickerValid >= 2 && before && before->get_width() == w &&
+                                        before->get_height() == h;
+                if (valid)
+                {
+                    const PassInput cutIn[2] = {{raw.get(), Vulkan::StockSampler::NearestClamp},
+                                                {prev.get(), Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(cmd, m_flickerCutImage, 1, 1, m_flickerCut, cutIn, 2, nullptr, 0, false);
+                    const float rcp[2] = {1.0f / static_cast<float>(w), 1.0f / static_cast<float>(h)};
+                    const PassInput in[4] = {{raw.get(), Vulkan::StockSampler::NearestClamp},
+                                             {prev.get(), Vulkan::StockSampler::NearestClamp},
+                                             {haveBefore ? before.get() : prev.get(), Vulkan::StockSampler::NearestClamp},
+                                             {m_flickerCutImage.get(), Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(cmd, m_flickerImage, w, h, m_flicker, in, 4, rcp, sizeof(rcp), false);
+                }
+                // The raw picture becomes "previous"; the old previous becomes "before last".
+                m_flickerIndex ^= 1u;
+                const PassInput copyIn[1] = {{raw.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(cmd, m_flickerHist[m_flickerIndex], w, h, m_copy, copyIn, 1, nullptr, 0, false);
+                m_flickerValid = std::min(m_flickerValid + 1u, 2u);
+                if (valid)
+                    m_flickerOut = m_flickerImage;
+            }
+
+            // Frame generation: the guest frame's picture is prepared once and kept (with the one
+            // before it); each display refresh shows it or a frame made between/after them.
+            void generatedPicture(Vulkan::CommandBufferHandle &cmd, float fw, float fh, bool fresh)
+            {
+                if (m_fg.rerender)
+                {
+                    // Re-rendered: the real frame, then the shadow GS's frames of the same guest
+                    // frame with the 3D moved on (gs_pgs_backend.cpp). 2D screens repeat the real one.
+                    if (fresh || !m_lastPicture)
+                    {
+                        preparePicture(cmd, fw, fh);
+                        m_lastPicture = m_final;
+                        m_lastRcas = m_finalRcas;
+                        m_realSerial = m_shared.presentSerial;
+                        return;
+                    }
+                    const uint32_t step = m_subframe * m_fg.factor / std::max(m_presents, m_fg.factor);
+                    const Vulkan::Image *raw = (m_shared.attached ? m_shared.scanout : m_cpuFrame).get();
+                    const Vulkan::Image *shadow = step >= 1 && step <= 3 ? m_shared.shadowScanout[step - 1].get() : nullptr;
+                    // Only this real frame's own shadow (the worker may still be on it).
+                    if (shadow && m_shared.shadowSerial[step - 1] != m_realSerial)
+                        shadow = nullptr;
+                    if (shadow && raw && !m_frame2D && shadow->get_width() == raw->get_width() &&
+                        shadow->get_height() == raw->get_height())
+                    {
+                        m_sourceOverride = shadow; // until the next render: spareUi composites from it too
+                        m_noTemporal = true;
+                        preparePicture(cmd, fw, fh);
+                        m_noTemporal = false;
+                    }
+                    else
+                    {
+                        m_final = m_lastPicture;
+                        m_finalRcas = m_lastRcas;
+                    }
+                    return;
+                }
+                if (fresh || !m_genHistory[m_genIndex])
+                {
+                    preparePicture(cmd, fw, fh);
+                    if (!m_final)
+                        return;
+                    m_genIndex ^= 1u;
+                    m_genPrevValid = static_cast<bool>(m_genHistory[m_genIndex ^ 1u]);
+                    const PassInput in[1] = {{m_final, Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(*cmd, m_genHistory[m_genIndex], m_final->get_width(), m_final->get_height(), m_copy, in, 1,
+                                  nullptr, 0, false);
+                    m_genRcas = m_finalRcas;
+                    m_genJitterDelta[0] = m_jitter[0] - m_jitter[2];
+                    m_genJitterDelta[1] = m_jitter[1] - m_jitter[3];
+                }
+                const Vulkan::Image *cur = m_genHistory[m_genIndex].get();
+                const Vulkan::Image *prev = m_genHistory[m_genIndex ^ 1u].get();
+                m_final = cur;
+                m_finalRcas = m_genRcas;
+                // The generated frame this present shows (presents beyond the factor repeat it).
+                const uint32_t step = m_subframe * m_fg.factor / std::max(m_presents, m_fg.factor);
+                const float k = static_cast<float>(m_fg.factor);
+                const float t = m_fg.extrapolate ? static_cast<float>(step) / k
+                                                 : static_cast<float>(std::min(step + 1u, m_fg.factor)) / k;
+                const bool haveMotion = m_shared.motion && m_shared.depth && m_shared.motion->get_width() == m_shared.depth->get_width();
+                const bool samePrev = prev && m_genPrevValid && prev->get_width() == cur->get_width() &&
+                                      prev->get_height() == cur->get_height();
+                const bool generate = haveMotion && (m_fg.extrapolate ? t > 0.0f : (t < 1.0f && samePrev));
+                if (!generate)
+                    return;
+                struct
+                {
+                    float motionToUv[2];
+                    float jitterDelta[2];
+                    float rcpMotionSize[2];
+                    float t;
+                    float mode;
+                } push = {{1.0f / 640.0f, 1.0f / 224.0f}, {m_genJitterDelta[0], m_genJitterDelta[1]},
+                          {1.0f / static_cast<float>(m_shared.motion->get_width()), 1.0f / static_cast<float>(m_shared.motion->get_height())},
+                          t, m_fg.extrapolate ? 1.0f : 0.0f};
+                const PassInput in[4] = {{samePrev ? prev : cur, Vulkan::StockSampler::LinearClamp},
+                                         {cur, Vulkan::StockSampler::LinearClamp},
+                                         {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp},
+                                         {m_shared.depth.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(*cmd, m_genImage, cur->get_width(), cur->get_height(), m_frameGen, in, 4, &push, sizeof(push), false);
+                m_final = m_genImage.get();
+                (void)fw;
+                (void)fh;
+            }
+
             // Puts the UI back as the game drew it over the post-processed picture: the processed
             // image (finished at the picture's size on screen, RCAS included) is mixed with the
             // original by the GS's UI mask.
             void spareUi(Vulkan::CommandBuffer &cmd, float fw, float fh)
             {
-                const Vulkan::ImageHandle &original = m_shared.attached ? m_shared.scanout : m_cpuFrame;
-                if (!m_final || !original || m_final == original.get() || !m_shared.ui ||
+                const Vulkan::Image *original = sourceImage();
+                if (!m_final || !original || m_final == original || !m_shared.ui ||
                     m_shared.ui->get_width() != original->get_width() || m_shared.ui->get_height() != original->get_height())
                     return;
                 const VkRect2D rect = pictureRect(fw, fh);
@@ -711,7 +921,7 @@ namespace ps2x::gs
                     m_finalRcas = false;
                 }
                 const PassInput in[3] = {{m_final, Vulkan::StockSampler::LinearClamp},
-                                         {original.get(), Vulkan::StockSampler::LinearClamp},
+                                         {original, Vulkan::StockSampler::LinearClamp},
                                          {m_shared.ui.get(), Vulkan::StockSampler::LinearClamp}};
                 offscreenPass(cmd, m_uiImage, rect.extent.width, rect.extent.height, m_uiComposite, in, 3, nullptr, 0, false);
                 m_final = m_uiImage.get();
@@ -767,6 +977,15 @@ namespace ps2x::gs
         public:
             bool supportsPostProcess() const override { return true; }
             void setPostProcess(const PostProcess &post) override { m_post = post; }
+            void setFrameGeneration(const FrameGeneration &fg) override
+            {
+                m_fg = fg;
+                m_fg.factor = std::clamp<uint32_t>(fg.factor, 1u, 4u);
+                // More presents in flight per guest frame: keep begin_frame's present-wait short.
+                m_wsi.set_present_wait_latency(m_fg.factor > 1 ? 3u : 2u);
+            }
+            uint32_t frameGenerationFactor() const override { return m_fg.factor; }
+            void setPresentsPerFrame(uint32_t n) override { m_presents = std::max(n, 1u); }
 
         private:
 
@@ -883,7 +1102,28 @@ namespace ps2x::gs
                 const Vulkan::Image &back = dev.get_swapchain_view().get_image();
                 const float fw = static_cast<float>(back.get_width()), fh = static_cast<float>(back.get_height());
                 auto cmd = dev.request_command_buffer();
-                preparePicture(cmd, fw, fh);
+                // A new guest frame, or another display refresh of the same one.
+                m_sourceOverride = nullptr;
+                const bool fresh = m_lastTick != m_renderedTick;
+                m_renderedTick = m_lastTick;
+                m_subframe = fresh ? 0u : m_subframe + 1u;
+                if (fresh)
+                    blendFlicker(*cmd);
+                if (m_fg.factor > 1)
+                    generatedPicture(cmd, fw, fh, fresh);
+                else if (fresh || !m_lastPicture)
+                {
+                    preparePicture(cmd, fw, fh);
+                    m_lastPicture = m_final;
+                    m_lastRcas = m_finalRcas;
+                }
+                else
+                {
+                    // Another refresh of the same guest frame: the same picture (TAA and MetalFX
+                    // history must see each guest frame once).
+                    m_final = m_lastPicture;
+                    m_finalRcas = m_lastRcas;
+                }
                 spareUi(*cmd, fw, fh);
                 auto rp = dev.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
                 rp.clear_color[0] = {};
@@ -893,7 +1133,116 @@ namespace ps2x::gs
                 dev.submit(cmd);
                 if (!m_capturePath.empty())
                     captureLocked(fw, fh);
+                schedulePresent();
                 m_wsi.end_frame();
+            }
+
+            // With present-at-time, presents wait in the queue for their refresh, so the swapchain's
+            // images (Metal keeps at most 3 drawables) can all be in flight at 120 presents per
+            // second, and acquiring the next one would block inside render(), under the device
+            // lock the GS thread needs (the game then drops to 30 fps). Wait here instead, outside
+            // the lock, until the present two back is on screen and its image is free again.
+            void waitForDrawable()
+            {
+                const int64_t due = m_presentTargets[(m_presentCount + 1) % 3]; // two presents back
+                if (!m_presentAtTime || !due)
+                    return;
+                const int64_t wait = due + 1000000 - ps2x::hostTimeNowNs();
+                if (wait > 0)
+                    std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<int64_t>(wait, 50000000)));
+            }
+
+            // Puts each present on a fixed grid of display refreshes: one every
+            // refresh-rate / present-rate refreshes (every 2nd at 60 fps on a 120 Hz panel), so
+            // every frame is on screen for the same time. Left alone, presents land anywhere in a
+            // refresh and frames alternate between 1 and 3 refreshes (judder).
+            void schedulePresent()
+            {
+                int64_t lastRefresh = 0, period = 0;
+                if (!m_presentAtTime || !ps2x::displayClockSampleHost(lastRefresh, period) || ps2_test::paused())
+                {
+                    m_presentTarget = 0;
+                    m_presentTargets[0] = m_presentTargets[1] = m_presentTargets[2] = 0;
+                    return;
+                }
+                const double presentRate = 60.0 * static_cast<double>(std::max(m_presents, 1u));
+                const int64_t step = period * std::max<int64_t>(1, std::llround(1e9 / static_cast<double>(period) / presentRate));
+                // The earliest refresh this frame can make: the GPU still has the frame's work to
+                // do and Core Animation needs it before that refresh. The lead adapts to what
+                // this machine needs (on-screen times from VK_GOOGLE_display_timing): two misses
+                // close together add 1 ms, every 30 frames on time take a quarter off (2 ms to one
+                // refresh). A fixed half refresh was too little for an 8x race on an M3 Max; a
+                // refresh and a half cost 8 ms of latency.
+                updatePresentLead(period);
+                const int64_t earliest = ps2x::hostTimeNowNs() + m_presentLead;
+                auto onGrid = [&](int64_t t) { return lastRefresh + ((t - lastRefresh + period - 1) / period) * period; };
+                int64_t target = m_presentTarget ? m_presentTarget + step : onGrid(earliest);
+                if (target < earliest || target > earliest + 2 * step)
+                    target = onGrid(earliest); // late (a frame was slow) or drifted: start the grid again
+                m_presentTarget = target;
+                m_presentTargets[m_presentCount++ % 3] = target;
+                // Half a refresh early: Metal shows it at the first refresh at or after this time.
+                g_desiredPresentNs = static_cast<uint64_t>(target - period / 2);
+                g_targetRefreshNs = static_cast<uint64_t>(target);
+            }
+
+            void updatePresentLead(int64_t period)
+            {
+                const int64_t minLead = 2000000, maxLead = period;
+                if (m_presentLead == 0)
+                    m_presentLead = period / 2;
+                if (!m_pastTiming && g_timedSwapchain)
+                    m_pastTiming = reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(
+                        vkGetDeviceProcAddr(m_wsi.get_context().get_device(), "vkGetPastPresentationTimingGOOGLE"));
+                if (!m_pastTiming || !g_timedSwapchain)
+                    return;
+                VkPastPresentationTimingGOOGLE past[16];
+                uint32_t count = 16;
+                const VkResult r = m_pastTiming(m_wsi.get_context().get_device(), g_timedSwapchain, &count, past);
+                if (r != VK_SUCCESS && r != VK_INCOMPLETE)
+                    return;
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    const TimedPresent &sent = g_timedPresents[past[i].presentID % 16];
+                    if (sent.id != past[i].presentID || !sent.target || !past[i].actualPresentTime)
+                        continue;
+                    // Metal's presented time sits a steady few ms after the display link's refresh
+                    // time; a miss shows up a whole refresh later than that offset.
+                    const int64_t offset = static_cast<int64_t>(past[i].actualPresentTime) - sent.target;
+                    m_offsetWindowMin = std::min(m_offsetWindowMin, offset);
+                    if (++m_offsetSamples >= 240)
+                    {
+                        m_presentOffset = m_offsetWindowMin;
+                        m_offsetWindowMin = INT64_MAX;
+                        m_offsetSamples = 0;
+                    }
+                    if (m_presentOffset == INT64_MAX)
+                        m_presentOffset = offset;
+                    if (offset > m_presentOffset + period / 2)
+                    {
+                        // Missed its refresh. A lone miss is usually a stall elsewhere (a slow
+                        // guest frame, the system); two within 60 presents mean the lead is short.
+                        if (m_presentsSinceMiss < 60)
+                            m_presentLead = std::min(m_presentLead + 1000000, maxLead);
+                        m_presentsSinceMiss = 0;
+                        m_presentsOnTime = 0;
+                    }
+                    else
+                    {
+                        m_presentsSinceMiss = std::min(m_presentsSinceMiss + 1, 1000u);
+                        if (++m_presentsOnTime >= 30)
+                        {
+                            m_presentLead = std::max(m_presentLead - 250000, minLead);
+                            m_presentsOnTime = 0;
+                        }
+                    }
+                }
+                if (std::getenv("RT_PRESENT_DEBUG"))
+                {
+                    static int n = 0;
+                    if ((n++ % 120) == 0)
+                        std::fprintf(stderr, "[present] lead %.2f ms\n", static_cast<double>(m_presentLead) / 1e6);
+                }
             }
 
             // Draws the frame again into an image and saves it as a PNG.
@@ -960,6 +1309,34 @@ namespace ps2x::gs
             Vulkan::Program *m_uiComposite = nullptr;
             Vulkan::ImageHandle m_rcasImage, m_uiImage;
             bool m_temporalValid = false;
+            // Interlace flicker blending.
+            Vulkan::Program *m_flicker = nullptr, *m_flickerCut = nullptr;
+            Vulkan::ImageHandle m_flickerHist[2], m_flickerImage, m_flickerOut, m_flickerCutImage;
+            uint32_t m_flickerIndex = 0, m_flickerValid = 0;
+            // Frame generation.
+            FrameGeneration m_fg;
+            Vulkan::Program *m_frameGen = nullptr, *m_copy = nullptr;
+            Vulkan::ImageHandle m_genHistory[2], m_genImage;
+            uint32_t m_genIndex = 0, m_subframe = 0;
+            bool m_genPrevValid = false, m_genRcas = false;
+            float m_genJitterDelta[2] = {};
+            uint64_t m_renderedTick = ~0ull;
+            uint32_t m_presents = 1;
+            bool m_presentAtTime = false;
+            int64_t m_presentTarget = 0; // host ns of the refresh the last present was aimed at
+            int64_t m_presentTargets[3] = {}; // the last three presents' refreshes (ring)
+            int64_t m_presentLead = 0;        // how far ahead of now a present is aimed (adaptive)
+            uint32_t m_presentsOnTime = 0, m_presentsSinceMiss = 1000;
+            PFN_vkGetPastPresentationTimingGOOGLE m_pastTiming = nullptr;
+            int64_t m_presentOffset = INT64_MAX, m_offsetWindowMin = INT64_MAX; // presented time - target refresh
+            uint32_t m_offsetSamples = 0;
+            uint32_t m_presentCount = 0;
+            const Vulkan::Image *m_lastPicture = nullptr; // the guest frame's picture, for repeats
+            bool m_lastRcas = false;
+            const Vulkan::Image *m_sourceOverride = nullptr; // a shadow frame shown instead of the scanout
+            bool m_noTemporal = false;                       // processing a shadow frame: no TAA/MetalFX history
+            bool m_frame2D = false;
+            uint64_t m_realSerial = 0; // PgsShared::presentSerial of the real frame on show
             bool m_progressiveFields = true; // GS::progressiveFields, read each frame
             bool m_showDepth = false, m_showMotion = false;
             Vulkan::Program *m_smaaEdges = nullptr, *m_smaaWeights = nullptr, *m_smaaBlend = nullptr;

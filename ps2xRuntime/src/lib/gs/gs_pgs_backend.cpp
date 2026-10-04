@@ -10,13 +10,17 @@
 #include "gs_interface.hpp"
 #include "thread_id.hpp"
 #include "gs_pgs_shared.h"
+#include "ThreadNaming.h"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <thread>
 
 namespace ps2x::gs
 {
@@ -87,6 +91,13 @@ namespace ps2x::gs
         public:
             ~PgsBackend() override
             {
+                {
+                    std::lock_guard<std::mutex> jobs(m_shadowJobMutex);
+                    m_shadowStop = true;
+                }
+                m_shadowJobCv.notify_all();
+                if (m_shadowWorker.joinable())
+                    m_shadowWorker.join();
                 if (!m_shared)
                     return;
                 const auto lock = lockDevice();
@@ -105,7 +116,14 @@ namespace ps2x::gs
                     m_dev = shared->device;
                     m_mtx = &shared->mutex;
                     shared->attached = true;
-                    shared->flushLocked = [this] { m_iface.flush(); };
+                    // Before each presenter frame (which advances the device's frame context and so
+                    // waits for every open command buffer): the real GS and its shadows.
+                    shared->flushLocked = [this] {
+                        m_iface.flush();
+                        for (auto &shadow : m_shadowIf)
+                            if (shadow)
+                                shadow->flush();
+                    };
                 }
                 else
                 {
@@ -144,6 +162,7 @@ namespace ps2x::gs
                     return false;
                 }
 
+
                 const auto &props = m_dev->get_gpu_properties();
                 m_info.name = props.deviceName;
                 m_info.vendorId = props.vendorID;
@@ -168,6 +187,9 @@ namespace ps2x::gs
                 if (static_cast<uint32_t>(rate) == m_samples)
                     return;
                 m_iface.set_super_sampling_rate(rate, true, false);
+                for (auto &shadow : m_shadowIf)
+                    if (shadow)
+                        shadow->set_super_sampling_rate(rate, true, false);
                 m_samples = std::min(static_cast<uint32_t>(rate), m_info.maxSuperSampling);
             }
 
@@ -178,6 +200,9 @@ namespace ps2x::gs
                 const auto lock = lockDevice();
                 m_hacks.disable_mipmaps = on;
                 m_iface.set_hacks(m_hacks);
+                for (auto &shadow : m_shadowIf)
+                    if (shadow)
+                        shadow->set_hacks(m_hacks);
             }
 
             bool WantsVertexSideband() const override
@@ -215,6 +240,7 @@ namespace ps2x::gs
                     m_iface.set_vertex_motion(motion, motionCount);
                 m_iface.gif_transfer(pathIndex, data, sizeBytes);
                 m_iface.set_vertex_motion(nullptr, 0);
+                recordShadowGifLocked(pathIndex, data, sizeBytes);
             }
 
             void MirrorGifPacket(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes) override
@@ -224,6 +250,18 @@ namespace ps2x::gs
                 const auto lock = lockDevice();
                 m_iface.gif_transfer(pathIndex, data, sizeBytes);
                 m_gpuVramNewer = true;
+                recordShadowGifLocked(pathIndex, data, sizeBytes);
+            }
+
+            uint32_t ShadowFrames() const override { return m_shadowCount; }
+
+            void SetShadowVariant(uint32_t index, const uint8_t *data, uint32_t sizeBytes) override
+            {
+                if (index < kMaxShadows)
+                {
+                    m_variant[index] = data;
+                    m_variantSize[index] = sizeBytes;
+                }
             }
 
             void MirrorRegisterWrite(uint8_t regAddr, uint64_t value) override
@@ -231,6 +269,15 @@ namespace ps2x::gs
                 const auto lock = lockDevice();
                 m_iface.write_register(static_cast<ParallelGS::RegisterAddr>(regAddr), value);
                 m_gpuVramNewer = true;
+                for (uint32_t i = 0; i < m_shadowCount; ++i)
+                {
+                    auto &out = m_shadowStream[i];
+                    out.push_back(1); // register write
+                    out.push_back(regAddr);
+                    const size_t at = out.size();
+                    out.resize(at + 8);
+                    std::memcpy(out.data() + at, &value, 8);
+                }
             }
 
             // ---------------------------------------------------------------- GSRasterBackend
@@ -384,6 +431,8 @@ namespace ps2x::gs
                         m_shared->depth = scanout.depth;
                         m_shared->motion = scanout.motion;
                         m_shared->ui = scanout.ui;
+                        // After the real frame's work: its shadows (re-rendered frames).
+                        presentShadowsLocked(priv, vsync);
                     }
                     if (scanout.image)
                     {
@@ -509,6 +558,193 @@ namespace ps2x::gs
                 return frame;
             }
 
+            // ---------------------------------------------------------------- shadow frames
+            // Re-rendered frame generation. Everything mirrored to the GS between two vsyncs is
+            // recorded per shadow (PATH1 3D packets in their re-projected version) and replayed
+            // into that shadow's own paraLLEl-GS after the real frame's vsync, so the shadow work
+            // queues behind the real frame instead of delaying it.
+            static constexpr uint32_t kMaxShadows = 3;
+
+            void recordShadowGifLocked(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes)
+            {
+                for (uint32_t i = 0; i < m_shadowCount; ++i)
+                {
+                    const uint8_t *src = m_variant[i] ? m_variant[i] : data;
+                    const uint32_t size = m_variant[i] ? m_variantSize[i] : sizeBytes;
+                    auto &out = m_shadowStream[i];
+                    out.push_back(0); // GIF packet
+                    out.push_back(static_cast<uint8_t>(pathIndex));
+                    const size_t at = out.size();
+                    out.resize(at + 4 + size);
+                    std::memcpy(out.data() + at, &size, 4);
+                    std::memcpy(out.data() + at + 4, src, size);
+                }
+                for (auto &v : m_variant)
+                    v = nullptr;
+            }
+
+            void presentShadowsLocked(const ParallelGS::PrivRegisterState &priv, const ParallelGS::VSyncInfo &realVsync)
+            {
+                ++m_shared->presentSerial;
+                const uint32_t want = std::min(m_shared->wantShadows.load(std::memory_order_relaxed), kMaxShadows);
+                if (want != m_shadowCount)
+                {
+                    // Start (or stop) at a frame boundary; a new shadow begins with the real VRAM.
+                    {
+                        std::lock_guard<std::mutex> jobs(m_shadowJobMutex);
+                        ++m_shadowGeneration; // the worker drops what it was replaying
+                        for (auto &job : m_shadowJobs)
+                        {
+                            job.stream.clear();
+                            job.pending = false;
+                        }
+                    }
+                    for (uint32_t i = 0; i < kMaxShadows; ++i)
+                    {
+                        m_shadowStream[i].clear();
+                        m_shared->shadowScanout[i].reset();
+                        m_shared->shadowSerial[i] = 0;
+                        if (i >= want)
+                            m_shadowIf[i].reset();
+                        else if (!m_shadowIf[i])
+                        {
+                            auto shadow = std::make_unique<ParallelGS::GSInterface>();
+                            ParallelGS::GSOptions options = {};
+                            options.super_sampling = superSamplingFromCount(m_samples);
+                            if (!shadow->init(m_dev, options))
+                                break;
+                            shadow->set_owns_frame_contexts(false);
+                            shadow->set_hacks(m_hacks);
+                            m_iface.flush();
+                            const void *real = m_iface.map_vram_read(0, m_vramSize);
+                            void *dst = shadow->map_vram_write(0, m_vramSize);
+                            if (real && dst)
+                            {
+                                std::memcpy(dst, real, m_vramSize);
+                                shadow->end_vram_write(0, m_vramSize);
+                            }
+                            m_shadowIf[i] = std::move(shadow);
+                        }
+                    }
+                    m_shadowCount = want;
+                    if (want && !m_shadowWorker.joinable())
+                        m_shadowWorker = std::thread([this] { shadowWorker(); });
+                    return;
+                }
+                if (!m_shadowCount)
+                    return;
+                // Hand this frame's recording to the worker (appended if it is still behind: a
+                // shadow must see every packet the real GS saw).
+                {
+                    std::lock_guard<std::mutex> jobs(m_shadowJobMutex);
+                    for (uint32_t i = 0; i < m_shadowCount; ++i)
+                    {
+                        ShadowJob &job = m_shadowJobs[i];
+                        job.stream.insert(job.stream.end(), m_shadowStream[i].begin(), m_shadowStream[i].end());
+                        m_shadowStream[i].clear();
+                        job.priv = priv;
+                        job.vsync = realVsync;
+                        job.vsync.scanout_depth = job.vsync.scanout_motion = job.vsync.scanout_ui = false;
+                        job.serial = m_shared->presentSerial;
+                        job.pending = true;
+                    }
+                }
+                m_shadowJobCv.notify_all();
+            }
+
+            // Replays shadow frames off the presenter thread, one packet per hold of the device
+            // lock, so the game's own GS work is never held up for long.
+            void shadowWorker()
+            {
+                ThreadNaming::SetCurrentThreadName("GsShadow");
+                std::vector<uint8_t> stream;
+                for (;;)
+                {
+                    uint32_t index = kMaxShadows, generation = 0;
+                    ParallelGS::PrivRegisterState priv;
+                    ParallelGS::VSyncInfo vsync;
+                    uint64_t serial = 0;
+                    {
+                        std::unique_lock<std::mutex> jobs(m_shadowJobMutex);
+                        m_shadowJobCv.wait(jobs, [&] {
+                            if (m_shadowStop)
+                                return true;
+                            for (const auto &job : m_shadowJobs)
+                                if (job.pending)
+                                    return true;
+                            return false;
+                        });
+                        if (m_shadowStop)
+                            return;
+                        for (uint32_t i = 0; i < kMaxShadows; ++i)
+                            if (m_shadowJobs[i].pending)
+                            {
+                                index = i;
+                                break;
+                            }
+                        ShadowJob &job = m_shadowJobs[index];
+                        stream.swap(job.stream);
+                        job.stream.clear();
+                        job.pending = false;
+                        priv = job.priv;
+                        vsync = job.vsync;
+                        serial = job.serial;
+                        generation = m_shadowGeneration;
+                    }
+                    auto current = [&] {
+                        std::lock_guard<std::mutex> jobs(m_shadowJobMutex);
+                        return generation == m_shadowGeneration;
+                    };
+                    // In slices of at most half a millisecond under the lock: per packet, the lock
+                    // changed hands hundreds of times a frame and the handovers held up the game.
+                    size_t at = 0;
+                    bool dropped = false;
+                    while (at + 2 <= stream.size() && !dropped)
+                    {
+                        const auto lock = lockDevice();
+                        if (!current() || !m_shadowIf[index])
+                        {
+                            dropped = true;
+                            break;
+                        }
+                        ParallelGS::GSInterface &shadow = *m_shadowIf[index];
+                        const auto sliceEnd = std::chrono::steady_clock::now() + std::chrono::microseconds(500);
+                        while (at + 2 <= stream.size())
+                        {
+                            const uint8_t kind = stream[at], arg = stream[at + 1];
+                            at += 2;
+                            if (kind == 0)
+                            {
+                                uint32_t size = 0;
+                                std::memcpy(&size, stream.data() + at, 4);
+                                shadow.gif_transfer(arg, stream.data() + at + 4, size);
+                                at += 4 + size;
+                            }
+                            else
+                            {
+                                uint64_t value = 0;
+                                std::memcpy(&value, stream.data() + at, 8);
+                                shadow.write_register(static_cast<ParallelGS::RegisterAddr>(arg), value);
+                                at += 8;
+                            }
+                            if (std::chrono::steady_clock::now() >= sliceEnd)
+                                break;
+                        }
+                    }
+                    stream.clear();
+                    if (dropped)
+                        continue;
+                    const auto lock = lockDevice();
+                    if (!current() || !m_shadowIf[index])
+                        continue;
+                    ParallelGS::GSInterface &shadow = *m_shadowIf[index];
+                    shadow.get_priv_register_state() = priv;
+                    shadow.flush();
+                    m_shared->shadowScanout[index] = shadow.vsync(vsync).image;
+                    m_shared->shadowSerial[index] = serial;
+                }
+            }
+
             void pullVramFromGpu()
             {
                 const auto lock = lockDevice();
@@ -537,6 +773,25 @@ namespace ps2x::gs
             Vulkan::Device *m_dev = &m_device; // ... or the presenter's
             PgsShared *m_shared = nullptr;
             ParallelGS::GSInterface m_iface;
+            std::unique_ptr<ParallelGS::GSInterface> m_shadowIf[kMaxShadows];
+            std::vector<uint8_t> m_shadowStream[kMaxShadows];
+            const uint8_t *m_variant[kMaxShadows] = {};
+            uint32_t m_variantSize[kMaxShadows] = {};
+            uint32_t m_shadowCount = 0;
+            struct ShadowJob
+            {
+                std::vector<uint8_t> stream;
+                ParallelGS::PrivRegisterState priv;
+                ParallelGS::VSyncInfo vsync;
+                uint64_t serial = 0;
+                bool pending = false;
+            };
+            ShadowJob m_shadowJobs[kMaxShadows];
+            std::mutex m_shadowJobMutex;
+            std::condition_variable m_shadowJobCv;
+            std::thread m_shadowWorker;
+            uint32_t m_shadowGeneration = 0;
+            bool m_shadowStop = false;
             Vulkan::BufferHandle m_readback;
 
             GSCpuBackend m_shadow; // transfer/readback logic over the shared local memory

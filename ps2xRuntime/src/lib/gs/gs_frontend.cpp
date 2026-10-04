@@ -713,6 +713,14 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
         {
             ps2x::gs::MotionTracker::packetMotion(data, sizeBytes & ~15u, motion, m_motionScratch);
             accumulateMotionStats();
+            // Re-rendered frame generation: the same 3D moved on by part of a frame per shadow.
+            const uint32_t shadows = std::min<uint32_t>(m_packetMirror->ShadowFrames(), 3u);
+            for (uint32_t i = 0; i < shadows; ++i)
+            {
+                const double t = static_cast<double>(i + 1) / static_cast<double>(shadows + 1);
+                ps2x::gs::MotionTracker::packetReproject(data, sizeBytes & ~15u, motion, t, m_shadowScratch[i]);
+                m_packetMirror->SetShadowVariant(i, m_shadowScratch[i].data(), static_cast<uint32_t>(m_shadowScratch[i].size()));
+            }
         }
         else
             m_motionScratch.clear();

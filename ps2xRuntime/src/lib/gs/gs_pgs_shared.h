@@ -36,6 +36,13 @@ namespace ps2x::gs
         // The UI mask (R8: 1 where the HUD / 2D screens drew), so post-processing spares the UI.
         Vulkan::ImageHandle ui;
         std::atomic<bool> wantUi{false};
+        // Re-rendered frame generation: shadow GS instances replay the frame with the 3D moved on by
+        // (i + 1) / (wantShadows + 1) of a frame; their pictures, scanned out with the real one.
+        std::atomic<uint32_t> wantShadows{0};
+        Vulkan::ImageHandle shadowScanout[3];
+        // Which real frame each shadow picture belongs to (presentSerial counts real scanouts).
+        uint64_t presentSerial = 0;
+        uint64_t shadowSerial[3] = {};
         // A paraLLEl-GS backend renders on this device (otherwise the CPU GS: pictures are uploaded).
         bool attached = false;
         // Submits the GS's open command buffers (with `mutex` held). A frame context only advances

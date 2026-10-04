@@ -51,3 +51,18 @@ bool ps2x::displayClockSample(int64_t &lastRefreshNs, int64_t &periodNs)
     lastRefreshNs = g_lastRefreshNs.load(std::memory_order_relaxed) + (steady - uptime);
     return started && g_lastRefreshNs.load(std::memory_order_relaxed) != 0 && periodNs != 0;
 }
+
+bool ps2x::displayClockSampleHost(int64_t &lastRefreshHostNs, int64_t &periodNs)
+{
+    static const bool started = start();
+    periodNs = g_periodNs.load(std::memory_order_relaxed);
+    lastRefreshHostNs = g_lastRefreshNs.load(std::memory_order_relaxed);
+    return started && lastRefreshHostNs != 0 && periodNs != 0;
+}
+
+int64_t ps2x::hostTimeNowNs()
+{
+    if (g_timebase.denom == 0)
+        mach_timebase_info(&g_timebase);
+    return static_cast<int64_t>(mach_absolute_time() * g_timebase.numer / g_timebase.denom);
+}

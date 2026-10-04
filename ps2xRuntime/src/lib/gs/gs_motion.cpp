@@ -1,5 +1,7 @@
 #include "runtime/gs/gs_motion.h"
 
+#include <algorithm>
+
 #include <cmath>
 #include <cstring>
 
@@ -333,6 +335,148 @@ namespace ps2x::gs
                             vertex(static_cast<uint16_t>(v), static_cast<uint16_t>(v >> 16), static_cast<uint32_t>((v >> 32) & 0xFFFFFF));
                         else if (desc == 0x5 || desc == 0xD)
                             vertex(static_cast<uint16_t>(v), static_cast<uint16_t>(v >> 16), static_cast<uint32_t>(v >> 32));
+                    }
+                if ((nloop * nreg) & 1)
+                    offset += 8;
+            }
+            else
+                offset += nloop * 16;
+        }
+    }
+
+    void MotionTracker::packetReproject(const uint8_t *data, uint32_t size, const MotionContext &ctx, double t,
+                                        std::vector<uint8_t> &out)
+    {
+        out.assign(data, data + size);
+        uint8_t *buf = out.data();
+        auto store64 = [](uint8_t *p, uint64_t v) { std::memcpy(p, &v, 8); };
+        // The vertex at (gx, gy, gz), moved on by t: false if it is left as it is. `ratio` is
+        // w / w' for the texture coordinates.
+        auto move = [&](uint16_t &gx, uint16_t &gy, uint32_t &gz, uint32_t zMax, double &ratio) {
+            const double X = gx / 16.0, Y = gy / 16.0, Z = static_cast<double>(gz);
+            if (std::fabs(X - 2048.0) > 1024.0 || std::fabs(Y - 2048.0) > 512.0)
+                return false;
+            const double *inv = ctx.curInv.m;
+            const double ww = inv[3] * X + inv[7] * Y + inv[11] * Z + inv[15];
+            if (std::fabs(ww) < 1e-20)
+                return false;
+            const double w = 1.0 / ww;
+            double obj[4];
+            for (int r = 0; r < 4; ++r)
+                obj[r] = (inv[r] * X + inv[4 + r] * Y + inv[8 + r] * Z + inv[12 + r]) * w;
+            const double *p = ctx.prev.m;
+            double prev[4];
+            for (int r = 0; r < 4; ++r)
+                prev[r] = p[r] * obj[0] + p[4 + r] * obj[1] + p[8 + r] * obj[2] + p[12 + r] * obj[3];
+            const double cur[4] = {X * w, Y * w, Z * w, w};
+            double moved[4];
+            for (int r = 0; r < 4; ++r)
+                moved[r] = cur[r] + t * (cur[r] - prev[r]);
+            if (!(std::fabs(moved[3]) > 1e-20) || (moved[3] > 0) != (w > 0))
+                return false;
+            const double nx = moved[0] / moved[3] * 16.0, ny = moved[1] / moved[3] * 16.0, nz = moved[2] / moved[3];
+            if (!std::isfinite(nx) || !std::isfinite(ny) || !std::isfinite(nz))
+                return false;
+            gx = static_cast<uint16_t>(std::clamp(std::lround(nx), 0l, 65535l));
+            gy = static_cast<uint16_t>(std::clamp(std::lround(ny), 0l, 65535l));
+            gz = static_cast<uint32_t>(std::clamp(nz, 0.0, static_cast<double>(zMax)));
+            ratio = w / moved[3];
+            return true;
+        };
+        auto scaleSt = [&](uint8_t *st, double ratio) {
+            // PACKED ST: S (bits 0..31), T (32..63), Q (64..95), floats.
+            for (int k = 0; k < 3; ++k)
+            {
+                float f;
+                std::memcpy(&f, st + 4 * k, 4);
+                f = static_cast<float>(f * ratio);
+                std::memcpy(st + 4 * k, &f, 4);
+            }
+        };
+
+        uint32_t offset = 0;
+        while (offset + 16 <= size)
+        {
+            const uint64_t tagLo = load64(buf + offset), tagHi = load64(buf + offset + 8);
+            offset += 16;
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
+            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 3);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
+            if (nreg == 0)
+                nreg = 16;
+            if (flg == 0)
+            {
+                for (uint32_t loop = 0; loop < nloop; ++loop)
+                {
+                    uint8_t *st = nullptr; // this vertex's ST (it comes before its XYZ)
+                    for (uint32_t r = 0; r < nreg; ++r)
+                    {
+                        if (offset + 16 > size)
+                            return;
+                        uint8_t *q = buf + offset;
+                        offset += 16;
+                        const uint8_t desc = static_cast<uint8_t>((tagHi >> (r * 4)) & 0xF);
+                        if (desc == 0x2)
+                            st = q;
+                        else if (desc == 0x4 || desc == 0xC || desc == 0x5 || desc == 0xD)
+                        {
+                            const bool fog = desc == 0x4 || desc == 0xC;
+                            const uint64_t lo = load64(q), hi = load64(q + 8);
+                            uint16_t gx = static_cast<uint16_t>(lo), gy = static_cast<uint16_t>(lo >> 32);
+                            uint32_t gz = fog ? static_cast<uint32_t>((hi >> 4) & 0xFFFFFF) : static_cast<uint32_t>(hi);
+                            double ratio = 1.0;
+                            if (move(gx, gy, gz, fog ? 0xFFFFFFu : 0xFFFFFFFFu, ratio))
+                            {
+                                store64(q, (lo & ~0x0000FFFF0000FFFFull) | gx | (static_cast<uint64_t>(gy) << 32));
+                                store64(q + 8, fog ? ((hi & ~(0xFFFFFFull << 4)) | (static_cast<uint64_t>(gz) << 4))
+                                                   : ((hi & ~0xFFFFFFFFull) | gz));
+                                if (st)
+                                    scaleSt(st, ratio);
+                            }
+                            st = nullptr;
+                        }
+                        else if (desc == 0xE)
+                        {
+                            const uint8_t reg = static_cast<uint8_t>(load64(q + 8));
+                            const uint64_t v = load64(q);
+                            if (reg == 0x04 || reg == 0x0C || reg == 0x05 || reg == 0x0D)
+                            {
+                                const bool fog = reg == 0x04 || reg == 0x0C;
+                                uint16_t gx = static_cast<uint16_t>(v), gy = static_cast<uint16_t>(v >> 16);
+                                uint32_t gz = fog ? static_cast<uint32_t>((v >> 32) & 0xFFFFFF) : static_cast<uint32_t>(v >> 32);
+                                double ratio = 1.0;
+                                if (move(gx, gy, gz, fog ? 0xFFFFFFu : 0xFFFFFFFFu, ratio))
+                                    store64(q, fog ? ((v & 0xFF00000000000000ull) | gx | (static_cast<uint64_t>(gy) << 16) |
+                                                      (static_cast<uint64_t>(gz) << 32))
+                                                   : (gx | (static_cast<uint64_t>(gy) << 16) | (static_cast<uint64_t>(gz) << 32)));
+                            }
+                        }
+                    }
+                }
+            }
+            else if (flg == 1)
+            {
+                // REGLIST: positions only (ST and Q are separate registers here).
+                for (uint32_t loop = 0; loop < nloop; ++loop)
+                    for (uint32_t r = 0; r < nreg; ++r)
+                    {
+                        if (offset + 8 > size)
+                            return;
+                        uint8_t *q = buf + offset;
+                        offset += 8;
+                        const uint8_t desc = static_cast<uint8_t>((tagHi >> (r * 4)) & 0xF);
+                        if (desc == 0x4 || desc == 0xC || desc == 0x5 || desc == 0xD)
+                        {
+                            const bool fog = desc == 0x4 || desc == 0xC;
+                            const uint64_t v = load64(q);
+                            uint16_t gx = static_cast<uint16_t>(v), gy = static_cast<uint16_t>(v >> 16);
+                            uint32_t gz = fog ? static_cast<uint32_t>((v >> 32) & 0xFFFFFF) : static_cast<uint32_t>(v >> 32);
+                            double ratio = 1.0;
+                            if (move(gx, gy, gz, fog ? 0xFFFFFFu : 0xFFFFFFFFu, ratio))
+                                store64(q, fog ? ((v & 0xFF00000000000000ull) | gx | (static_cast<uint64_t>(gy) << 16) |
+                                                  (static_cast<uint64_t>(gz) << 32))
+                                               : (gx | (static_cast<uint64_t>(gy) << 16) | (static_cast<uint64_t>(gz) << 32)));
+                        }
                     }
                 if ((nloop * nreg) & 1)
                     offset += 8;

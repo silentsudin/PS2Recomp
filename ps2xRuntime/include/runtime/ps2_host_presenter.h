@@ -61,6 +61,25 @@ namespace ps2x
         virtual bool supportsPostProcess() const { return false; }
         virtual void setPostProcess(const PostProcess &post) { (void)post; }
 
+        // Frame generation for displays faster than the game's 60 Hz: `factor` frames are
+        // presented per guest frame (2 at 120 Hz, 4 at 240 Hz), the real one first. 1 = off.
+        struct FrameGeneration
+        {
+            uint32_t factor = 1;
+            // Re-rendered (default): a shadow GS renders the frame again with every object moved
+            // on along its motion (no added latency, real geometry). Otherwise the picture is
+            // warped with the motion vectors: interpolated (one refresh of latency) or
+            // extrapolated (edge artefacts).
+            bool rerender = true;
+            bool extrapolate = false;
+        };
+        virtual void setFrameGeneration(const FrameGeneration &fg) { (void)fg; }
+        virtual uint32_t frameGenerationFactor() const { return 1; }
+        // Presents per guest frame, set by the run loop before each frame(): the display's
+        // refreshes per guest frame (2 at 120 Hz), so each present holds exactly one refresh. The
+        // extra presents repeat the picture (no reprocessing) or carry generated frames.
+        virtual void setPresentsPerFrame(uint32_t n) { (void)n; }
+
         // The SDL_Window of this presenter, or nullptr (raylib keeps its own).
         virtual void *sdlWindow() { return nullptr; }
 
