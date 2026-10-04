@@ -1,3 +1,4 @@
 [submodule "ps2xRuntime/third_party/parallel-gs"]
 	path = ps2xRuntime/third_party/parallel-gs
-	url = https://github.com/Arntzen-Software/parallel-gs.git
+	url = https://github.com/silentsudin/parallel-gs.git
+	branch = roadtrip
