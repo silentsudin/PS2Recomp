@@ -52,7 +52,7 @@ namespace ps2x
         // render resolution, then scaling to the window.
         struct PostProcess
         {
-            enum class AntiAliasing : uint8_t { None, Fxaa };
+            enum class AntiAliasing : uint8_t { None, Fxaa, Smaa };
             enum class Scaling : uint8_t { Bilinear, Fsr1 };
             AntiAliasing aa = AntiAliasing::None;
             Scaling scaling = Scaling::Bilinear;

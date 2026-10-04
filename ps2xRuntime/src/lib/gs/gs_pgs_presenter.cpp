@@ -16,6 +16,9 @@
 #define A_CPU 1
 #include "post/ffx/ffx_a.h"
 #include "post/ffx/ffx_fsr1.h"
+// SMAA's precomputed area and search textures (post/smaa, MIT).
+#include "post/smaa/AreaTex.h"
+#include "post/smaa/SearchTex.h"
 
 #include "ps2_runtime.h"
 #include "runtime/ee_scheduler.h"
@@ -170,21 +173,32 @@ namespace ps2x::gs
                 // Post-processing: a fullscreen triangle and one fragment shader per pass.
                 Vulkan::ResourceLayout fsVert = {};
                 fsVert.output_mask = 0x1;
-                auto post = [&](const uint32_t *code, size_t size, uint32_t push, uint32_t inputs) {
+                auto post = [&](const uint32_t *code, size_t size, uint32_t push, uint32_t inputs, uint32_t textures = 0x1) {
                     Vulkan::ResourceLayout frag = {};
                     frag.input_mask = inputs;
                     frag.output_mask = 0x1;
                     frag.push_constant_size = push;
-                    frag.sets[0].sampled_image_mask = 0x1;
-                    frag.sets[0].fp_mask = 0x1;
+                    frag.sets[0].sampled_image_mask = textures;
+                    frag.sets[0].fp_mask = textures;
                     return m_shared.device->request_program(post_spirv::fullscreen_vert, sizeof(post_spirv::fullscreen_vert),
                                                             code, size, &fsVert, &frag);
                 };
                 m_fxaa = post(post_spirv::fxaa_frag, sizeof(post_spirv::fxaa_frag), 8, 0x1);
                 m_easu = post(post_spirv::fsr_easu_frag, sizeof(post_spirv::fsr_easu_frag), 80, 0);
                 m_rcas = post(post_spirv::fsr_rcas_frag, sizeof(post_spirv::fsr_rcas_frag), 32, 0);
-                if (!m_fxaa || !m_easu || !m_rcas)
+                m_smaaEdges = post(post_spirv::smaa_edges_frag, sizeof(post_spirv::smaa_edges_frag), 16, 0x1, 0x1);
+                m_smaaWeights = post(post_spirv::smaa_weights_frag, sizeof(post_spirv::smaa_weights_frag), 16, 0x1, 0x7);
+                m_smaaBlend = post(post_spirv::smaa_blend_frag, sizeof(post_spirv::smaa_blend_frag), 16, 0x1, 0x3);
+                if (!m_fxaa || !m_easu || !m_rcas || !m_smaaEdges || !m_smaaWeights || !m_smaaBlend)
                     return fail("Vulkan", "post-processing shaders");
+                {
+                    auto area = Vulkan::ImageCreateInfo::immutable_2d_image(AREATEX_WIDTH, AREATEX_HEIGHT, VK_FORMAT_R8G8_UNORM);
+                    Vulkan::ImageInitialData areaData = {areaTexBytes, 0, 0};
+                    m_smaaArea = m_shared.device->create_image(area, &areaData);
+                    auto search = Vulkan::ImageCreateInfo::immutable_2d_image(SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, VK_FORMAT_R8_UNORM);
+                    Vulkan::ImageInitialData searchData = {searchTexBytes, 0, 0};
+                    m_smaaSearch = m_shared.device->create_image(search, &searchData);
+                }
                 std::cout << "[presenter] Vulkan swapchain " << m_platform->get_surface_width() << "x"
                           << m_platform->get_surface_height() << (m_options.vsync ? " (vsync)" : "") << std::endl;
                 return true;
@@ -341,8 +355,22 @@ namespace ps2x::gs
             }
 
             // Renders a fullscreen pass from `src` into `dst` (re-created at w x h when needed).
+            struct PassInput
+            {
+                const Vulkan::Image *image;
+                Vulkan::StockSampler sampler;
+            };
+
             void offscreenPass(Vulkan::CommandBuffer &cmd, Vulkan::ImageHandle &dst, uint32_t w, uint32_t h,
                                Vulkan::Program *program, const Vulkan::Image &src, const void *push, uint32_t pushSize)
+            {
+                const PassInput input[1] = {{&src, Vulkan::StockSampler::LinearClamp}};
+                offscreenPass(cmd, dst, w, h, program, input, 1, push, pushSize, false);
+            }
+
+            void offscreenPass(Vulkan::CommandBuffer &cmd, Vulkan::ImageHandle &dst, uint32_t w, uint32_t h,
+                               Vulkan::Program *program, const PassInput *inputs, uint32_t inputCount, const void *push,
+                               uint32_t pushSize, bool clear)
             {
                 if (!dst || dst->get_width() != w || dst->get_height() != h)
                 {
@@ -358,12 +386,15 @@ namespace ps2x::gs
                 rp.num_color_attachments = 1;
                 rp.color_attachments[0] = &dst->get_view();
                 rp.store_attachments = 1;
+                rp.clear_attachments = clear ? 1 : 0;
+                rp.clear_color[0] = {};
                 cmd.begin_render_pass(rp);
                 cmd.set_program(program);
                 cmd.set_opaque_state();
                 cmd.set_depth_test(false, false);
                 cmd.set_cull_mode(VK_CULL_MODE_NONE);
-                cmd.set_texture(0, 0, src.get_view(), Vulkan::StockSampler::LinearClamp);
+                for (uint32_t i = 0; i < inputCount; ++i)
+                    cmd.set_texture(0, i, inputs[i].image->get_view(), inputs[i].sampler);
                 cmd.push_constants(push, 0, pushSize);
                 cmd.draw(3);
                 cmd.end_render_pass();
@@ -382,7 +413,22 @@ namespace ps2x::gs
                 if (!image)
                     return;
                 const uint32_t sw = image->get_width(), sh = image->get_height();
-                if (m_post.aa == PostProcess::AntiAliasing::Fxaa)
+                if (m_post.aa == PostProcess::AntiAliasing::Smaa)
+                {
+                    const float metrics[4] = {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh), static_cast<float>(sw),
+                                              static_cast<float>(sh)};
+                    const PassInput edges[1] = {{m_final, Vulkan::StockSampler::LinearClamp}};
+                    offscreenPass(cmd, m_smaaEdgeImage, sw, sh, m_smaaEdges, edges, 1, metrics, sizeof(metrics), true);
+                    const PassInput weights[3] = {{m_smaaEdgeImage.get(), Vulkan::StockSampler::LinearClamp},
+                                                  {m_smaaArea.get(), Vulkan::StockSampler::LinearClamp},
+                                                  {m_smaaSearch.get(), Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(cmd, m_smaaWeightImage, sw, sh, m_smaaWeights, weights, 3, metrics, sizeof(metrics), true);
+                    const PassInput blend[2] = {{m_final, Vulkan::StockSampler::LinearClamp},
+                                                {m_smaaWeightImage.get(), Vulkan::StockSampler::LinearClamp}};
+                    offscreenPass(cmd, m_aaImage, sw, sh, m_smaaBlend, blend, 2, metrics, sizeof(metrics), false);
+                    m_final = m_aaImage.get();
+                }
+                else if (m_post.aa == PostProcess::AntiAliasing::Fxaa)
                 {
                     const float rcp[2] = {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh)};
                     offscreenPass(cmd, m_aaImage, sw, sh, m_fxaa, *m_final, rcp, sizeof(rcp));
@@ -633,6 +679,8 @@ namespace ps2x::gs
             Vulkan::Program *m_fxaa = nullptr, *m_easu = nullptr, *m_rcas = nullptr;
             PostProcess m_post;
             Vulkan::ImageHandle m_aaImage, m_upImage; // intermediate pictures
+            Vulkan::Program *m_smaaEdges = nullptr, *m_smaaWeights = nullptr, *m_smaaBlend = nullptr;
+            Vulkan::ImageHandle m_smaaArea, m_smaaSearch, m_smaaEdgeImage, m_smaaWeightImage;
             const Vulkan::Image *m_final = nullptr;   // what the final pass draws this frame
             bool m_finalRcas = false;
             Vulkan::ImageHandle m_cpuFrame; // CPU GS: the uploaded picture
