@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <deque>
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -95,6 +97,12 @@ namespace ps2x::gs
         public:
             ~PgsBackend() override
             {
+                if (m_cacheSaver.joinable())
+                {
+                    m_cacheStop = true;
+                    m_cacheSaver.join();
+                    savePipelineCache();
+                }
                 {
                     std::lock_guard<std::mutex> jobs(m_shadowJobMutex);
                     m_shadowStop = true;
@@ -152,6 +160,7 @@ namespace ps2x::gs
                     m_dev->init_frame_contexts(4);
                 }
                 const auto initLock = lockDevice();
+                loadPipelineCache(options.pipelineCacheDir);
 
                 ParallelGS::GSOptions gsOptions = {};
                 // The game draws 224-line fields. Super-sampling plus a high-resolution progressive
@@ -164,6 +173,20 @@ namespace ps2x::gs
                 {
                     error = "paraLLEl-GS init failed (missing Vulkan features?)";
                     return false;
+                }
+                // Large textures are decoded in part, guided by sampler feedback. On Adreno that path
+                // decodes them wrong (garbled tiles), so they are decoded whole there.
+                // RT_PGS_NO_FEEDBACK=1|0 forces it off|on.
+                const char *noFeedback = std::getenv("RT_PGS_NO_FEEDBACK");
+                const bool adreno = m_dev->get_gpu_properties().vendorID == 0x5143; // Qualcomm
+                // RT_PGS_TIMESTAMPS=1: GPU time per paraLLEl-GS stage, logged as [pgs-gpu].
+                m_timestamps = envEquals("RT_PGS_TIMESTAMPS", "1");
+                if ((noFeedback ? *noFeedback == '1' : adreno) || m_timestamps)
+                {
+                    ParallelGS::DebugMode mode;
+                    mode.disable_sampler_feedback = noFeedback ? *noFeedback == '1' : adreno;
+                    mode.timestamps = m_timestamps;
+                    m_iface.set_debug_mode(mode);
                 }
 
 
@@ -471,6 +494,20 @@ namespace ps2x::gs
                         vsync.scanout_ui = true;
                     m_iface.flush();
                     ParallelGS::ScanoutResult scanout = m_iface.vsync(vsync);
+                    if (m_timestamps && ++m_timestampFrames % 120 == 0)
+                    {
+                        static const char *names[] = {"sync", "copy", "palette", "upload", "setup", "binning", "shading", "readback", "vsync"};
+                        std::string line = "[pgs-gpu] ms per frame:";
+                        for (int t = 0; t < int(ParallelGS::TimestampType::Count); ++t)
+                        {
+                            const double total = m_iface.get_accumulated_timestamps(ParallelGS::TimestampType(t));
+                            char buf[48];
+                            std::snprintf(buf, sizeof(buf), " %s %.2f", names[t], (total - m_lastTimestamps[t]) * 1000.0 / 120.0);
+                            line += buf;
+                            m_lastTimestamps[t] = total;
+                        }
+                        std::fprintf(stderr, "%s\n", line.c_str());
+                    }
                     if (onGpu)
                     {
                         m_shared->depth = scanout.depth;
@@ -893,6 +930,54 @@ namespace ps2x::gs
                 }
             }
 
+            // Compiled pipelines persist across runs (Granite's own cache needs its filesystem layer,
+            // off in this build). Without it, Adreno recompiles every shader variant each launch,
+            // which takes minutes and stalls the GS. Saved as it grows, since apps are often killed.
+            void loadPipelineCache(const std::string &dir)
+            {
+                if (dir.empty())
+                    return;
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                m_cachePath = (std::filesystem::path(dir) / "pgs_pipelines.bin").string();
+                std::ifstream in(m_cachePath, std::ios::binary);
+                std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                m_dev->init_pipeline_cache(data.empty() ? nullptr : data.data(), data.size());
+                m_cacheSaved = data.size();
+                std::fprintf(stderr, "[gs] pipeline cache: %zu KB\n", data.size() >> 10);
+                m_cacheSaver = std::thread([this] {
+                    while (!m_cacheStop)
+                    {
+                        for (int i = 0; i < 100 && !m_cacheStop; ++i)
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        savePipelineCache();
+                    }
+                });
+            }
+
+            void savePipelineCache()
+            {
+                if (m_cachePath.empty())
+                    return;
+                const size_t size = m_dev->get_pipeline_cache_size();
+                if (!size || size == m_cacheSaved)
+                    return;
+                std::vector<uint8_t> data(size);
+                if (!m_dev->get_pipeline_cache_data(data.data(), size))
+                    return;
+                const std::string tmp = m_cachePath + ".tmp";
+                {
+                    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                    out.write(reinterpret_cast<const char *>(data.data()), std::streamsize(size));
+                    if (!out)
+                        return;
+                }
+                std::error_code ec;
+                std::filesystem::rename(tmp, m_cachePath, ec);
+                if (!ec)
+                    m_cacheSaved = size;
+            }
+
             void textureToolsLocked()
             {
                 if (!m_textures.active())
@@ -1082,6 +1167,13 @@ namespace ps2x::gs
             uint8_t *m_vram = nullptr;
             uint32_t m_vramSize = 0u;
             bool m_gpuVramNewer = false;
+            bool m_timestamps = false;
+            uint64_t m_timestampFrames = 0;
+            double m_lastTimestamps[16] = {};
+            std::string m_cachePath;
+            std::thread m_cacheSaver;
+            std::atomic<bool> m_cacheStop{false};
+            size_t m_cacheSaved = 0;
             std::chrono::steady_clock::time_point m_texturesServiced{};
             mutable std::mutex m_mutex;
             std::mutex *m_mtx = &m_mutex;

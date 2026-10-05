@@ -198,9 +198,12 @@ namespace ps2x::gs
                 if (const char *e = std::getenv("RT_METAL_PRESENT"); !(e && *e == '0'))
                     m_metalPresent = true;
 #endif
-                m_window = SDL_CreateWindow(title, width, height,
-                                            (m_metalPresent ? SDL_WINDOW_METAL : SDL_WINDOW_VULKAN) | SDL_WINDOW_RESIZABLE |
-                                                SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                SDL_WindowFlags flags = (m_metalPresent ? SDL_WINDOW_METAL : SDL_WINDOW_VULKAN) | SDL_WINDOW_RESIZABLE |
+                                        SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#if defined(__ANDROID__)
+                flags |= SDL_WINDOW_FULLSCREEN; // immersive: no status or navigation bar
+#endif
+                m_window = SDL_CreateWindow(title, width, height, flags);
                 if (!m_window)
                     return fail("SDL_CreateWindow", SDL_GetError());
 
@@ -1217,6 +1220,7 @@ namespace ps2x::gs
                     m_finalRcas = m_lastRcas;
                 }
                 spareUi(*cmd, fw, fh);
+#if defined(__APPLE__)
                 if (m_metalPresent)
                 {
                     cmd->image_barrier(back, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, 0,
@@ -1250,6 +1254,7 @@ namespace ps2x::gs
                                      });
                     return;
                 }
+#endif
                 auto rp = dev.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
                 rp.clear_color[0] = {};
                 cmd->begin_render_pass(rp);
@@ -1477,8 +1482,10 @@ namespace ps2x::gs
             uint32_t m_presents = 1;
             // Presenting through Metal (macOS).
             bool m_metalPresent = false;
+#if defined(__APPLE__)
             SDL_MetalView m_metalView = nullptr;
             std::unique_ptr<MetalPresent> m_metal;
+#endif
             Vulkan::ImageHandle m_backbuffers[3];
             uint32_t m_backIndex = 0;
             std::mutex m_presentedMutex;

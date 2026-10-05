@@ -148,7 +148,8 @@ namespace
     }
 }
 
-int main(int argc, char **argv)
+// Callable in-process too (ps2_vu1_recomp_lib, e.g. an app recompiling on a device that can't spawn it).
+int ps2x_vu1_recomp_main(int argc, char **argv)
 {
     std::string elfPath, imagePath, outPath;
     std::vector<uint32_t> entries;
@@ -512,3 +513,10 @@ int main(int argc, char **argv)
     std::cerr << "wrote " << outPath << "\n";
     return 0;
 }
+
+#ifndef PS2X_VU1_RECOMP_NO_MAIN
+int main(int argc, char **argv)
+{
+    return ps2x_vu1_recomp_main(argc, argv);
+}
+#endif

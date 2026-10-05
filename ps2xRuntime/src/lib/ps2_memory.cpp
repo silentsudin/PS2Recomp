@@ -2040,16 +2040,12 @@ void PS2Memory::startGifVif1Worker()
     if (const char *e = std::getenv("RT_GS_THREAD"); !(e && *e == '0'))
         m_gsThread = std::thread([this]
                                  {
-#if defined(__APPLE__)
-                                     pthread_setname_np("GsThread");
-#endif
+                                     ThreadNaming::SetCurrentThreadName("GsThread");
                                      ThreadNaming::SetCurrentThreadInteractive();
                                      gsThreadLoop(); });
     m_gifVif1Worker = std::thread([this]
                                   {
-#if defined(__APPLE__)
-                                      pthread_setname_np("GifVif1Worker");
-#endif
+                                      ThreadNaming::SetCurrentThreadName("GifVif1Worker");
                                       ThreadNaming::SetCurrentThreadInteractive();
                                       gifVif1WorkerLoop(); });
 }

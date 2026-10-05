@@ -79,7 +79,9 @@ else()
     set(PS2X_RAYLIB_TAG "5.5")
     set(PS2X_RLIMGUI_TAG "Raylib_5_5")
 
-    if(PS2X_IS_ANDROID)
+    # Android: raylib's NativeActivity platform, unless the app asks for SDL3 (SDLActivity, then
+    # raylib only plays audio and reads/writes images; SDL3, the Vulkan presenter and ImGui do the rest).
+    if(PS2X_IS_ANDROID AND NOT PS2X_HOST_PLATFORM STREQUAL "SDL3")
         set(PLATFORM "Android" CACHE STRING "" FORCE)
     elseif(PS2X_HOST_PLATFORM STREQUAL "SDL3")
         set(SDL_STATIC ON CACHE BOOL "" FORCE)
@@ -104,6 +106,9 @@ else()
         )
         FetchContent_MakeAvailable(SDL3)
         set(PLATFORM "SDL" CACHE STRING "" FORCE)
+        if(PS2X_IS_ANDROID)
+            set(OPENGL_VERSION "ES 3.0" CACHE STRING "" FORCE)
+        endif()
         set(PS2X_RAYLIB_TAG "6.0")
         set(PS2X_RLIMGUI_TAG "Raylib_6_0")
     endif()
@@ -116,7 +121,11 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
-    if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
+    set(PS2X_ANDROID_NATIVE_ACTIVITY OFF)
+    if(PS2X_IS_ANDROID AND NOT PS2X_HOST_PLATFORM STREQUAL "SDL3")
+        set(PS2X_ANDROID_NATIVE_ACTIVITY ON)
+    endif()
+    if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_ANDROID_NATIVE_ACTIVITY)
         FetchContent_Declare(
             imgui
             GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -565,7 +574,7 @@ if(PS2X_ENABLE_DEBUG_UI AND TARGET rlImGui)
 endif()
 
 # GPU GS: paraLLEl-GS (Vulkan compute). On macOS it runs on MoltenVK.
-if(APPLE)
+if(APPLE OR PS2X_IS_ANDROID)
     set(PS2X_ENABLE_PGS_DEFAULT ON)
 else()
     set(PS2X_ENABLE_PGS_DEFAULT OFF)
@@ -721,3 +730,7 @@ endif()
 # VU1 microcode static recompiler (build-time tool; generated code goes into the game library).
 add_executable(ps2_vu1_recomp EXCLUDE_FROM_ALL tools/vu1_recomp/vu1_recomp.cpp)
 target_link_libraries(ps2_vu1_recomp PRIVATE ps2_runtime)
+# The same, as a function (ps2x_vu1_recomp_main) for in-process use.
+add_library(ps2_vu1_recomp_lib STATIC EXCLUDE_FROM_ALL tools/vu1_recomp/vu1_recomp.cpp)
+target_compile_definitions(ps2_vu1_recomp_lib PRIVATE PS2X_VU1_RECOMP_NO_MAIN)
+target_link_libraries(ps2_vu1_recomp_lib PRIVATE ps2_runtime)

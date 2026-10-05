@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cstddef>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
@@ -91,6 +92,9 @@ namespace ps2_test
         uint64_t g_runTarget = 0;           // park when reaching this vblank
         uint64_t g_parkedAt = UINT64_MAX;   // vblank the game is parked at, or UINT64_MAX
         bool g_serverPadActive = false;
+        // RT_TEST_LIVE=1: the control socket without lockstep (the game runs in real time and the
+        // host menu pauses it), for driving the app's own UI on a device.
+        bool g_liveSocket = false;
         Pads g_serverPads;
         bool g_paused = false; // a host menu is open
         uint32_t g_pausedSteps = 0; // frames to let through while paused
@@ -404,7 +408,7 @@ namespace ps2_test
             g_currentVblank = vblank;
             // Lockstep: with a test server, park at the target vblank until the client asks for
             // more (or detaches). The game starts parked at vblank 1 so runs begin identically.
-            if (g_serverEnabled && (!g_attached || vblank >= g_runTarget))
+            if (g_serverEnabled && !g_liveSocket && (!g_attached || vblank >= g_runTarget))
             {
                 g_parkedAt = vblank;
                 g_serverCv.notify_all();
@@ -414,7 +418,7 @@ namespace ps2_test
             }
             // A host menu is open: hold the game here (the render thread keeps showing the last
             // picture and the menu) until it closes.
-            while (g_paused && !g_attached && !runtime.isStopRequested())
+            while (g_paused && (!g_attached || g_liveSocket) && !runtime.isStopRequested())
             {
                 if (g_pausedSteps > 0)
                 {
@@ -423,7 +427,8 @@ namespace ps2_test
                 }
                 // Wakes regularly as well, so closing the window while paused still stops the game.
                 g_parkCv.wait_for(lock, std::chrono::milliseconds(100),
-                                  [&] { return !g_paused || g_pausedSteps > 0 || g_attached || runtime.isStopRequested(); });
+                                  [&] { return !g_paused || g_pausedSteps > 0 || (g_attached && !g_liveSocket) ||
+                                               runtime.isStopRequested(); });
             }
             g_currentVblank = vblank;
             bool scripted = false;
@@ -565,6 +570,13 @@ namespace ps2_test
         std::string handle(PS2Runtime &runtime, const std::string &line)
         {
             const std::string cmd = jsonValue(line, "cmd");
+            if (cmd == "run" && g_liveSocket)
+            {
+                // Real time: just let that much time pass.
+                const uint64_t count = jsonNumber(line, "vblanks", 1);
+                std::this_thread::sleep_for(std::chrono::microseconds(count * 16667));
+                return "{\"ok\":true,\"vblank\":" + std::to_string(g_currentVblank) + "}";
+            }
             if (cmd == "run")
             {
                 const uint64_t count = jsonNumber(line, "vblanks", 1);
@@ -660,6 +672,27 @@ namespace ps2_test
                 {
                     g_captureRequested = false;
                     return "{\"ok\":false,\"error\":\"no frame\"}";
+                }
+                if (path == "-")
+                {
+                    // Inline (a host harness driving a device can't read the device's files).
+                    static const char *b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                    std::string enc;
+                    enc.reserve((g_capture.size() + 2) / 3 * 4);
+                    for (size_t i = 0; i < g_capture.size(); i += 3)
+                    {
+                        uint32_t v = uint32_t(g_capture[i]) << 16;
+                        if (i + 1 < g_capture.size())
+                            v |= uint32_t(g_capture[i + 1]) << 8;
+                        if (i + 2 < g_capture.size())
+                            v |= g_capture[i + 2];
+                        enc += b64[(v >> 18) & 63];
+                        enc += b64[(v >> 12) & 63];
+                        enc += i + 1 < g_capture.size() ? b64[(v >> 6) & 63] : '=';
+                        enc += i + 2 < g_capture.size() ? b64[v & 63] : '=';
+                    }
+                    return "{\"ok\":true,\"width\":" + std::to_string(g_captureWidth) + ",\"height\":" +
+                           std::to_string(g_captureHeight) + ",\"data\":\"" + enc + "\"}";
                 }
                 if (FILE *f = std::fopen(path.c_str(), "wb"))
                 {
@@ -827,9 +860,21 @@ namespace ps2_test
         const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
         sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
-        std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
-        ::unlink(path);
-        if (listener < 0 || ::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
+        socklen_t addrLen = sizeof(addr);
+        if (path[0] == '@')
+        {
+            // Abstract namespace (Linux, Android): no file; `adb forward tcp:N localabstract:<name>`
+            // reaches it from a host, so a harness can drive the game on a device.
+            const size_t n = std::min(std::strlen(path + 1), sizeof(addr.sun_path) - 1);
+            std::memcpy(addr.sun_path + 1, path + 1, n);
+            addrLen = socklen_t(offsetof(sockaddr_un, sun_path) + 1 + n);
+        }
+        else
+        {
+            std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+            ::unlink(path);
+        }
+        if (listener < 0 || ::bind(listener, reinterpret_cast<sockaddr *>(&addr), addrLen) != 0 ||
             ::listen(listener, 1) != 0)
         {
             std::fprintf(stderr, "[test] cannot listen on %s\n", path);
@@ -838,8 +883,10 @@ namespace ps2_test
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_serverEnabled = true;
+            const char *live = std::getenv("RT_TEST_LIVE");
+            g_liveSocket = live && *live == '1';
         }
-        std::fprintf(stderr, "[test] control socket %s\n", path);
+        std::fprintf(stderr, "[test] control socket %s%s\n", path, g_liveSocket ? " (live)" : "");
         startOrphanWatch();
         std::thread([&runtime, listener]
                     {
