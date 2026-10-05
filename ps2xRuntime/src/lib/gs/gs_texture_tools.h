@@ -28,6 +28,8 @@ namespace ps2x::gs
         // Empty strings switch dumping / the pack off. Any thread.
         void configure(const std::string &dumpDir, const std::string &packDir);
         bool active() const;
+        // Replacement images in the pack. Any thread.
+        size_t packSize() const;
 
         // A decoded texture read back by the GS (RGBA8, PS2 alpha: 0x80 = opaque). GS thread.
         void submit(uint64_t cacheKey, uint64_t stableKey, uint32_t width, uint32_t height, uint32_t psm,

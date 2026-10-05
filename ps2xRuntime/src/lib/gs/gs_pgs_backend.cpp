@@ -203,6 +203,24 @@ namespace ps2x::gs
                 m_textures.configure(dumpDir, packDir);
                 const auto lock = lockDevice();
                 m_iface.set_texture_readback(m_textures.active());
+                if (packDir != m_packDir)
+                {
+                    // Another pack (or none): the old one's images must not stay bound.
+                    m_packDir = packDir;
+                    m_iface.drop_texture_replacements();
+                    for (auto &shadow : m_shadowIf)
+                        if (shadow)
+                            shadow->drop_texture_replacements();
+                    m_hdImages.clear();
+                    m_predicted.clear();
+                    m_replaced.clear();
+                }
+            }
+
+            TexturePackStats texturePackStats() const override
+            {
+                const auto lock = lockDevice();
+                return {m_textures.packSize(), m_replaced.size()};
             }
 
             void setAnisotropy(uint32_t level) override
@@ -833,6 +851,7 @@ namespace ps2x::gs
                         continue;
                     // From now on every decode of this description binds the replacement (textures
                     // whose palette is reloaded every frame get a new cache key every frame).
+                    m_replaced.insert(r.contentKey);
                     m_iface.replace_cached_texture(r.cacheKey, image);
                     m_iface.set_texture_prediction(r.stableKey, image);
                     for (auto &shadow : m_shadowIf)
@@ -891,6 +910,8 @@ namespace ps2x::gs
             std::vector<ParallelGS::GSRenderer::TextureReadback> m_readbacks;
             std::vector<TextureTools::Replacement> m_replacements;
             std::unordered_map<uint64_t, Vulkan::ImageHandle> m_hdImages; // content key -> replacement image
+            std::unordered_set<uint64_t> m_replaced; // content keys of pack images in use
+            std::string m_packDir;
             std::unordered_map<uint64_t, std::pair<Vulkan::ImageHandle, uint32_t>> m_shadowReplacements;
             std::unordered_set<uint64_t> m_predicted; // stable keys with a prediction set
             struct ShadowJob

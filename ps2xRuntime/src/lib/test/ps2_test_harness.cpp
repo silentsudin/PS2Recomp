@@ -465,6 +465,8 @@ namespace ps2_test
 
     namespace
     {
+        CommandHandler g_commandHandler;
+
         std::string jsonValue(const std::string &line, const char *key)
         {
             const std::string needle = std::string("\"") + key + "\"";
@@ -747,6 +749,12 @@ namespace ps2_test
                 g_parkCv.notify_all();
                 return "{\"ok\":true}";
             }
+            if (g_commandHandler)
+            {
+                std::string reply = g_commandHandler(cmd, line);
+                if (!reply.empty())
+                    return reply;
+            }
             return "{\"ok\":false,\"error\":\"unknown command\"}";
         }
 
@@ -888,4 +896,8 @@ namespace ps2_test
         g_captureDone = true;
         g_serverCv.notify_all();
     }
+
+    void setCommandHandler(CommandHandler handler) { g_commandHandler = std::move(handler); }
+
+    std::string jsonField(const std::string &line, const char *key) { return jsonValue(line, key); }
 }

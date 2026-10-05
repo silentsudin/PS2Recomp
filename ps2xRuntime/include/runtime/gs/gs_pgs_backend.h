@@ -53,6 +53,13 @@ namespace ps2x::gs
         virtual void setSharpTextures(bool on) = 0;
         // Texture dumps and HD packs (gs_texture_tools.h): empty strings switch them off.
         virtual void setTextures(const std::string &dumpDir, const std::string &packDir) = 0;
+        // The active pack's size and how many of its images the game has used so far.
+        struct TexturePackStats
+        {
+            size_t packImages = 0;
+            size_t replaced = 0;
+        };
+        virtual TexturePackStats texturePackStats() const = 0;
         // Anisotropic filtering of texture-pack images (1 = trilinear only, up to 16).
         virtual void setAnisotropy(uint32_t level) = 0;
     };

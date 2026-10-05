@@ -17,6 +17,7 @@
 // pressed); sticks are 0..255 with 128 centred.
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -103,7 +104,15 @@ namespace ps2_test
     //   {"cmd":"audio"}                      sound since the last query: frames, rms, peak, hash,
     //                                        lr_diff (mean |left - right|)
     //   {"cmd":"quit"}
+    //   anything else goes to the app's command handler (setCommandHandler), if any
     void startServerIfRequested(PS2Runtime &runtime);
+
+    // The app's own test-socket commands: called (on the server thread, with the game parked
+    // between runs) with the command name and the whole JSON line; returns the JSON reply, or an
+    // empty string for a command it doesn't know. jsonField reads a top-level string or number.
+    using CommandHandler = std::function<std::string(const std::string &cmd, const std::string &line)>;
+    void setCommandHandler(CommandHandler handler);
+    std::string jsonField(const std::string &line, const char *key);
 
     // Render thread: a frame grab is waiting (latch the picture even if the vblank is unchanged),
     // and hands the latched picture (tightly packed RGBA) to it.

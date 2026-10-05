@@ -77,6 +77,7 @@ namespace ps2x::gs
             m_packDir = packDir;
             m_pack.clear();
             m_handedOut.clear();
+            m_ready.clear(); // outcomes for the previous pack
             if (!packDir.empty())
                 indexPack(packDir);
         }
@@ -95,6 +96,12 @@ namespace ps2x::gs
                 m_pack[key] = e.path().string();
         }
         std::fprintf(stderr, "[textures] pack %s: %zu replacements\n", dir.c_str(), m_pack.size());
+    }
+
+    size_t TextureTools::packSize() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_pack.size();
     }
 
     bool TextureTools::active() const
