@@ -314,6 +314,7 @@ namespace ps2x::gs
                     void *mtlDevice = nullptr;
                     if (getDevice && m_getTexture && m_getQueue)
                         getDevice(m_wsi.get_context().get_gpu(), &mtlDevice);
+                    m_mtlDevice = mtlDevice;
                     if (mtlDevice)
                     {
                         m_metalfx = MetalFxSpatial::create(mtlDevice);
@@ -582,8 +583,13 @@ namespace ps2x::gs
                     return;
                 }
                 const bool metalfxTemporal = m_post.scaling == PostProcess::Scaling::MetalFxTemporal;
-                if (m_post.aa == PostProcess::AntiAliasing::Taa && !metalfxTemporal && !m_noTemporal)
-                    temporalAntiAliasing(cmd, sw, sh);
+                if (m_post.aa == PostProcess::AntiAliasing::Taa && !metalfxTemporal)
+                {
+                    if (m_noTemporal)
+                        temporalAntiAliasingShadow(cmd, sw, sh);
+                    else
+                        temporalAntiAliasing(cmd, sw, sh);
+                }
                 else if (m_post.aa == PostProcess::AntiAliasing::Smaa)
                 {
                     const float metrics[4] = {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh), static_cast<float>(sw),
@@ -610,7 +616,7 @@ namespace ps2x::gs
                 // Temporal needs a progressive picture: progressive fields, or 4x supersampling and
                 // up (full frames). Interlaced fields below that alternate every frame: spatial.
                 const bool progressive = sh >= 600 || m_progressiveFields;
-                if (metalfxTemporal && progressive && !m_noTemporal && m_metalfxTemporal && rect.extent.width > sw && m_shared.motion &&
+                if (metalfxTemporal && progressive && m_metalfxTemporal && rect.extent.width > sw && m_shared.motion &&
                     m_shared.depth && m_shared.motion->get_width() == sw && m_shared.depth->get_width() == sw)
                 {
                     // Beyond the scaler's largest ratio (640x448 to a Retina window is about 3.5x),
@@ -620,9 +626,9 @@ namespace ps2x::gs
                     upscaleMetalFxTemporal(cmdHandle, sw, sh, uint32_t(float(sw) * k), uint32_t(float(sh) * k));
                     return;
                 }
-                if (metalfxTemporal && !m_noTemporal)
-                    m_temporalValid = false; // a 2D screen: start the history again afterwards
-                if ((m_post.scaling == PostProcess::Scaling::MetalFxSpatial || (metalfxTemporal && (!progressive || m_noTemporal))) && m_metalfx &&
+                if (metalfxTemporal)
+                    m_temporalValid = m_temporalValidShadow = false; // a 2D screen: start the histories again afterwards
+                if ((m_post.scaling == PostProcess::Scaling::MetalFxSpatial || (metalfxTemporal && !progressive)) && m_metalfx &&
                     rect.extent.width > sw)
                 {
                     upscaleMetalFx(cmdHandle, sw, sh, rect.extent.width, rect.extent.height);
@@ -675,6 +681,33 @@ namespace ps2x::gs
                                   m_fg.factor > 1; // generated frames keep the current frame's HUD
             }
 
+            // A shadow frame (frame generation, half a frame ahead) blended with the real frame's
+            // TAA result, reprojected half a frame with the real frame's motion; it does not become
+            // history (the real frames' history stays a sequence of real frames).
+            void temporalAntiAliasingShadow(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh)
+            {
+                const Vulkan::ImageHandle &history = m_taaHistory[m_taaIndex ^ 1]; // the real frame's output
+                if (!m_taaValid || !history || history->get_width() != sw || history->get_height() != sh || !m_shared.motion ||
+                    m_shared.motion->get_width() != sw || m_shared.motion->get_height() != sh)
+                    return;
+                struct
+                {
+                    float motionToUv[2];
+                    float jitterDelta[2];
+                    float rcpSize[2];
+                    float blend;
+                    float historyValid;
+                } push = {{0.5f / 640.0f, 0.5f / 224.0f}, {m_jitter[0] - m_jitter[2], m_jitter[1] - m_jitter[3]},
+                          {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh)}, 0.1f, 1.0f};
+                // Half the motion: a point at x in the shadow (frame N + 1/2) was at x - m/2 in
+                // frame N, whose TAA output is the history here.
+                const PassInput inputs[3] = {{m_final, Vulkan::StockSampler::NearestClamp},
+                                             {history.get(), Vulkan::StockSampler::LinearClamp},
+                                             {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(cmd, m_taaShadowImage, sw, sh, m_taa, inputs, 3, &push, sizeof(push), false);
+                m_final = m_taaShadowImage.get();
+            }
+
             void temporalAntiAliasing(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh)
             {
                 if (!m_shared.motion || m_shared.motion->get_width() != sw || m_shared.motion->get_height() != sh)
@@ -722,9 +755,9 @@ namespace ps2x::gs
                 cmd->image_barrier(*m_upImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-                Vulkan::Fence fence;
-                dev.submit(cmd, &fence);
-                fence->wait();
+                // Submitted (MoltenVK commits it to the Metal queue); MetalFX encodes after it on
+                // that queue, so no CPU wait under the device lock.
+                dev.submit(cmd);
                 void *in = nullptr, *out = nullptr, *queue = nullptr;
                 m_getTexture(m_final->get_image(), &in);
                 m_getTexture(m_upImage->get_image(), &out);
@@ -741,27 +774,36 @@ namespace ps2x::gs
             void upscaleMetalFxTemporal(Vulkan::CommandBufferHandle &cmd, uint32_t sw, uint32_t sh, uint32_t w, uint32_t h)
             {
                 Vulkan::Device &dev = *m_shared.device;
+                // Shadow frames (frame generation) have their own scaler and history: they arrive
+                // one guest frame apart, like the real ones, half a frame later.
+                if (m_noTemporal && !m_metalfxTemporalShadow && m_mtlDevice)
+                    m_metalfxTemporalShadow = MetalFxTemporal::create(m_mtlDevice);
+                MetalFxTemporal *scaler = m_noTemporal ? m_metalfxTemporalShadow.get() : m_metalfxTemporal.get();
+                Vulkan::ImageHandle &upImage = m_noTemporal ? m_upImageShadow : m_upImage;
+                bool &valid = m_noTemporal ? m_temporalValidShadow : m_temporalValid;
+                if (!scaler)
+                    return;
                 const PassInput depthIn[1] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp}};
                 offscreenPass(*cmd, m_depthNorm, sw, sh, m_depthNormalize, depthIn, 1, nullptr, 0, false, VK_FORMAT_R32_SFLOAT);
-                if (!m_upImage || m_upImage->get_width() != w || m_upImage->get_height() != h ||
-                    !(m_upImage->get_create_info().usage & VK_IMAGE_USAGE_STORAGE_BIT))
+                if (!upImage || upImage->get_width() != w || upImage->get_height() != h ||
+                    !(upImage->get_create_info().usage & VK_IMAGE_USAGE_STORAGE_BIT))
                 {
                     auto info = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
                     info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
                     info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-                    m_upImage = dev.create_image(info);
+                    upImage = dev.create_image(info);
                 }
-                cmd->image_barrier(*m_upImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                cmd->image_barrier(*upImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-                Vulkan::Fence fence;
-                dev.submit(cmd, &fence);
-                fence->wait();
+                // Submitted (MoltenVK commits it to the Metal queue); MetalFX encodes after it on
+                // that queue, so no CPU wait under the device lock.
+                dev.submit(cmd);
                 MetalFxTemporal::Frame f = {};
                 m_getTexture(m_final->get_image(), &f.color);
                 m_getTexture(m_depthNorm->get_image(), &f.depth);
                 m_getTexture(m_shared.motion->get_image(), &f.motion);
-                m_getTexture(m_upImage->get_image(), &f.output);
+                m_getTexture(upImage->get_image(), &f.output);
                 void *queue = nullptr;
                 m_getQueue(m_wsi.get_context().get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS], &queue);
                 const float px = static_cast<float>(sw) / 640.0f, py = static_cast<float>(sh) / 224.0f;
@@ -773,11 +815,11 @@ namespace ps2x::gs
                 f.jitterY = m_jitter[1] * py;
                 f.motionScaleX = -px; // ours: current minus previous, GS pixels
                 f.motionScaleY = -py;
-                f.reset = !m_temporalValid;
-                if (f.color && f.depth && f.motion && f.output && queue && m_metalfxTemporal->upscale(queue, f))
+                f.reset = !valid;
+                if (f.color && f.depth && f.motion && f.output && queue && scaler->upscale(queue, f))
                 {
-                    m_final = m_upImage.get();
-                    m_temporalValid = true;
+                    m_final = upImage.get();
+                    valid = true;
                 }
                 cmd = dev.request_command_buffer();
             }
@@ -1415,6 +1457,7 @@ namespace ps2x::gs
             Vulkan::Program *m_uiComposite = nullptr;
             Vulkan::ImageHandle m_rcasImage, m_uiImage;
             bool m_temporalValid = false;
+            Vulkan::ImageHandle m_taaShadowImage;
             // Interlace flicker blending.
             Vulkan::Program *m_flicker = nullptr, *m_flickerCut = nullptr;
             Vulkan::ImageHandle m_flickerHist[2], m_flickerImage, m_flickerOut, m_flickerCutImage;
@@ -1464,6 +1507,10 @@ namespace ps2x::gs
             GetQueue m_getQueue = nullptr;
             std::unique_ptr<MetalFxSpatial> m_metalfx;
             std::unique_ptr<MetalFxTemporal> m_metalfxTemporal;
+            std::unique_ptr<MetalFxTemporal> m_metalfxTemporalShadow; // frame generation's shadow frames
+            Vulkan::ImageHandle m_upImageShadow;
+            bool m_temporalValidShadow = false;
+            void *m_mtlDevice = nullptr;
 #endif
             Vulkan::ImageHandle m_cpuFrame; // CPU GS: the uploaded picture
             std::unordered_map<uint64_t, Vulkan::ImageHandle> m_textures; // by ImTextureID

@@ -44,9 +44,10 @@ namespace ps2x::gs
                     m_scaler.inputContentWidth = inW;
                     m_scaler.inputContentHeight = inH;
                     [m_scaler encodeToCommandBuffer:cb];
+                    // No CPU wait: the presenter's next Vulkan work goes to the same Metal queue
+                    // and runs after this command buffer.
                     [cb commit];
-                    [cb waitUntilCompleted];
-                    return cb.status == MTLCommandBufferStatusCompleted;
+                    return true;
                 }
             }
 
@@ -106,9 +107,10 @@ namespace ps2x::gs
                     m_scaler.depthReversed = YES;
                     m_scaler.reset = f.reset;
                     [m_scaler encodeToCommandBuffer:cb];
+                    // No CPU wait: the presenter's next Vulkan work goes to the same Metal queue
+                    // and runs after this command buffer.
                     [cb commit];
-                    [cb waitUntilCompleted];
-                    return cb.status == MTLCommandBufferStatusCompleted;
+                    return true;
                 }
             }
 
