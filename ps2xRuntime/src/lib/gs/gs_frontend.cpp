@@ -9,6 +9,10 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <map>
+#include <unistd.h>
+#include <mutex>
+#include <string>
 #include <sstream>
 
 namespace
@@ -1543,6 +1547,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_backend->BeginTransfer(command);
         }
         recordTransferDebugEventUnlocked();
+        surveyTransferUnlocked();
         break;
     }
     case GS_REG_HWREG:
@@ -1721,6 +1726,121 @@ namespace
     }
 }
 
+namespace
+{
+    // RT_GS_STATE_SURVEY=<file>: every distinct draw state (per primitive) and transfer, with counts
+    // and first/last vblank, rewritten every 600 vblanks and at exit. The feature spec for a
+    // renderer that only does what the game does (scripts/hwgs_survey.py summarises it).
+    struct StateSurvey
+    {
+        struct Entry
+        {
+            uint64_t count = 0, first = UINT64_MAX, last = 0;
+        };
+        std::string path;
+        std::mutex mutex;
+        std::map<std::string, Entry> draws, transfers;
+        uint64_t written = 0;
+
+        static void add(std::map<std::string, Entry> &m, const std::string &key, uint64_t vblank)
+        {
+            Entry &e = m[key];
+            ++e.count;
+            e.first = std::min(e.first, vblank);
+            e.last = std::max(e.last, vblank);
+        }
+
+        void write()
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            FILE *f = std::fopen(path.c_str(), "w");
+            if (!f)
+                return;
+            for (const auto *m : {&draws, &transfers})
+                for (const auto &[key, e] : *m)
+                    std::fprintf(f, "%s	%llu	%llu	%llu	%s\n", m == &draws ? "draw" : "xfer",
+                                 static_cast<unsigned long long>(e.count), static_cast<unsigned long long>(e.first),
+                                 static_cast<unsigned long long>(e.last), key.c_str());
+            std::fclose(f);
+        }
+    };
+
+    StateSurvey *stateSurvey()
+    {
+        static StateSurvey *survey = []() -> StateSurvey * {
+            const char *path = std::getenv("RT_GS_STATE_SURVEY");
+            if (!path || !*path)
+                return nullptr;
+            auto *s = new StateSurvey;
+            s->path = path;
+            // "%p" becomes the process id (one file per game in a parallel test run).
+            if (const size_t at = s->path.find("%p"); at != std::string::npos)
+                s->path.replace(at, 2, std::to_string(static_cast<long>(getpid())));
+            std::atexit([] { stateSurvey()->write(); });
+            return s;
+        }();
+        return survey;
+    }
+}
+
+void GS::surveyDrawUnlocked()
+{
+    StateSurvey *survey = stateSurvey();
+    if (!survey)
+        return;
+    const uint64_t vblank = ps2_test::currentVblank();
+    const GSContext &ctx = m_ctx[m_prim.ctxt ? 1 : 0];
+    char key[512];
+    int n = std::snprintf(key, sizeof(key),
+                          "path=%u ctx=%d prim=%u iip=%d tme=%d fge=%d abe=%d aa1=%d fst=%d fix=%d"
+                          " frame=psm%02x,msk%08x,fbp%u,fbw%u zbuf=psm%02x,zmsk%d,zbp%u"
+                          " test=%05llx alpha=%llx fba=%llu pabe=%d dthe=%llu colclamp=%llu",
+                          m_curPath, m_prim.ctxt, static_cast<unsigned>(m_prim.type), m_prim.iip, m_prim.tme,
+                          m_prim.fge, m_prim.abe, m_prim.aa1, m_prim.fst, m_prim.fix, ctx.frame.psm, ctx.frame.fbmsk,
+                          ctx.frame.fbp, ctx.frame.fbw, ctx.zbuf.psm, ctx.zbuf.zmask, ctx.zbuf.zbp,
+                          static_cast<unsigned long long>(ctx.test & 0x7FFFFull),
+                          static_cast<unsigned long long>(ctx.alpha & 0xFF000000FFull),
+                          static_cast<unsigned long long>(ctx.fba & 1u), m_pabe,
+                          static_cast<unsigned long long>(m_dthe & 1u), static_cast<unsigned long long>(m_colclamp & 1u));
+    if (m_prim.tme && n > 0 && n < static_cast<int>(sizeof(key)))
+    {
+        // Texture in the framebuffer/Z area (below block 0x1A40), and the frame buffer itself.
+        const bool self = ctx.tex0.tbp0 == ctx.frame.fbp * 32u;
+        std::snprintf(key + n, sizeof(key) - n,
+                      " tex=psm%02x,cpsm%02x,csm%u,tfx%u,tcc%u,%ux%u,fbarea%d,self%d tex1=%llx clamp=wms%llu,wmt%llu"
+                      " mip=%d texa=%u,%d,%u",
+                      ctx.tex0.psm, ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.tfx, ctx.tex0.tcc, 1u << ctx.tex0.tw,
+                      1u << ctx.tex0.th, ctx.tex0.tbp0 < 0x1A40u, self,
+                      static_cast<unsigned long long>(ctx.tex1 & 0xFFFFFFFFFull),
+                      static_cast<unsigned long long>(ctx.clamp & 3u), static_cast<unsigned long long>((ctx.clamp >> 2) & 3u),
+                      ctx.miptbp1 != 0, m_texa.ta0, m_texa.aem, m_texa.ta1);
+    }
+    {
+        std::lock_guard<std::mutex> lock(survey->mutex);
+        StateSurvey::add(survey->draws, key, vblank);
+    }
+    if (vblank >= survey->written + 600)
+    {
+        survey->written = vblank;
+        survey->write();
+    }
+}
+
+void GS::surveyTransferUnlocked()
+{
+    StateSurvey *survey = stateSurvey();
+    if (!survey)
+        return;
+    char key[256];
+    const bool local = m_trxdir == 2;
+    std::snprintf(key, sizeof(key), "dir=%u spsm=%02x dpsm=%02x size=%ux%u dst_fbarea=%d%s", m_trxdir, m_bitbltbuf.spsm,
+                  m_bitbltbuf.dpsm, m_trxreg.rrw, m_trxreg.rrh, m_bitbltbuf.dbp < 0x1A40u,
+                  local ? (" sbp=" + std::to_string(m_bitbltbuf.sbp) + " dbp=" + std::to_string(m_bitbltbuf.dbp)).c_str()
+                        : (m_trxdir == 1 ? (" sbp=" + std::to_string(m_bitbltbuf.sbp)).c_str() : ""));
+    std::lock_guard<std::mutex> lock(survey->mutex);
+    StateSurvey::add(survey->transfers, key, ps2_test::currentVblank());
+}
+
 void GS::logBatchVertex(const GSVertex &vtx)
 {
     BatchLog *log = batchLog();
@@ -1767,6 +1887,7 @@ void GS::vertexKick(bool drawing)
     if (drawing)
     {
         logBatchVertex(m_vtxQueue[(m_vtxCount - 1) % kMaxVerts]);
+        surveyDrawUnlocked();
         if (m_curPath == 0)
         {
             m_lastZbuf3D = m_ctx[m_prim.ctxt ? 1 : 0].zbuf;

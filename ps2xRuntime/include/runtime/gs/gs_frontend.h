@@ -267,6 +267,8 @@ private:
     // texture, screen bounding box) per frame, for telling HUD/2D from 3D.
     uint32_t m_curPath = 2u;
     void logBatchVertex(const GSVertex &vtx);
+    void surveyDrawUnlocked();
+    void surveyTransferUnlocked();
 
     static constexpr int kMaxVerts = 6;
     GSVertex m_vtxQueue[kMaxVerts];
