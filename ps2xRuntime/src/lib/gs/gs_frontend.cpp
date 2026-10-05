@@ -130,6 +130,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    ++m_drawStateSerial;
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
     m_primRegister = {};
@@ -1290,6 +1291,11 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         }
     });
 
+    // Everything but vertex data can change the draw state (buildDrawBatch rebuilds it).
+    if (regAddr != GS_REG_RGBAQ && regAddr != GS_REG_ST && regAddr != GS_REG_UV && regAddr != GS_REG_XYZ2 &&
+        regAddr != GS_REG_XYZ3 && regAddr != GS_REG_XYZF2 && regAddr != GS_REG_XYZF3 && regAddr != GS_REG_FOG)
+        ++m_drawStateSerial;
+
     switch (regAddr)
     {
     case GS_REG_PRIM:
@@ -1783,8 +1789,14 @@ namespace
     }
 }
 
+// Read once at load: the hooks below run per vertex.
+static const bool g_stateSurveyOn = std::getenv("RT_GS_STATE_SURVEY") != nullptr;
+static const bool g_batchLogOn = std::getenv("RT_GS_BATCH_LOG") != nullptr;
+
 void GS::surveyDrawUnlocked()
 {
+    if (!g_stateSurveyOn)
+        return;
     StateSurvey *survey = stateSurvey();
     if (!survey)
         return;
@@ -1843,6 +1855,8 @@ void GS::surveyTransferUnlocked()
 
 void GS::logBatchVertex(const GSVertex &vtx)
 {
+    if (!g_batchLogOn)
+        return;
     BatchLog *log = batchLog();
     if (!log)
         return;
@@ -1940,7 +1954,17 @@ void GS::vertexKick(bool drawing)
 
     if (drawing && m_backend && m_backendWantsPrimitives)
     {
-        GSPrimitiveBatch batch = buildDrawBatch(needed);
+        // The batch is a member: its draw state is rebuilt only after a state register changed.
+        GSPrimitiveBatch &batch = m_drawBatch;
+        if (m_drawBatchSerial != m_drawStateSerial || batch.stateSerial == 0)
+        {
+            batch = buildDrawBatch(needed);
+            m_drawBatchSerial = m_drawStateSerial;
+            batch.stateSerial = ++m_drawBatchSerialOut;
+        }
+        batch.vertexCount = static_cast<uint8_t>(std::min(needed, 3));
+        for (int i = 0; i < batch.vertexCount; ++i)
+            batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[i];
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);

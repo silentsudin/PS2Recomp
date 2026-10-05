@@ -12,6 +12,12 @@ layout(location = 0) in vec4 vColor;
 layout(location = 1) noperspective in vec3 vStq;
 layout(location = 2) noperspective in float vFog;
 
+// Per pipeline (one per combination the game uses): the feature flags below, the alpha test, and
+// which pass of the alpha test this is. Branches on them compile away.
+layout(constant_id = 0) const uint FLAGS = 0u;
+layout(constant_id = 1) const uint ATST = 1u;
+layout(constant_id = 2) const uint AMODE = 2u; // 0 = alpha test, 1 = keep only failing pixels, 2 = none
+
 layout(push_constant) uniform Push
 {
     layout(offset = 16) vec4 texNorm; // xy: texture size in texels (TW, TH); zw: 1 / the image's extent in texels
@@ -19,7 +25,7 @@ layout(push_constant) uniform Push
     vec4 fogColor; // rgb 0..255; w: texture alpha scale (255 decoded, 128 render target)
     vec4 lod;      // MXL, L, K, LCM
     vec4 texa;     // TA0, AEM, TA1, 1 = alpha from TEXA (a CT24 render target)
-    uvec4 mode;    // x: flags (below); y: ATST; z: AREF; w: 0 = alpha test, 1 = keep only failing pixels, 2 = none
+    uvec4 mode;    // z: AREF
     vec4 texOffset; // xy: where texel (0, 0) is in the image (a texture inside a render target)
 } push;
 
@@ -31,7 +37,7 @@ const uint F_TME = 1u, F_TCC = 8u, F_FGE = 16u, F_MIP = 1024u, F_LINEAR = 2048u,
 float wrapCoord(float c, uint mode, float size, float lo, float hi, bool linear)
 {
     if (mode == 0u) // REPEAT
-        return ((push.mode.x & F_REPEAT_IN_SHADER) != 0u) ? mod(c, size) : c;
+        return ((FLAGS & F_REPEAT_IN_SHADER) != 0u) ? mod(c, size) : c;
     if (mode == 1u) // CLAMP
         return linear ? clamp(c, 0.5, size - 0.5) : clamp(c, 0.0, size - 0.001);
     if (mode == 2u) // REGION_CLAMP
@@ -43,7 +49,7 @@ float wrapCoord(float c, uint mode, float size, float lo, float hi, bool linear)
 bool alphaPasses(float a)
 {
     float aref = float(push.mode.z);
-    switch (push.mode.y)
+    switch (ATST)
     {
     case 0u: return false;
     case 1u: return true;
@@ -59,17 +65,17 @@ bool alphaPasses(float a)
 void main()
 {
     // DATE: only where the frame buffer's alpha MSB equals DATM (alpha is kept as A/128).
-    if ((push.mode.x & F_DATE) != 0u)
+    if ((FLAGS & F_DATE) != 0u)
     {
         bool msb = texelFetch(uDest, ivec2(gl_FragCoord.xy), 0).a > 0.999;
-        if (msb != ((push.mode.x & F_DATM) != 0u))
+        if (msb != ((FLAGS & F_DATM) != 0u))
             discard;
     }
 
     vec4 f = floor(vColor * 255.0 + 0.5);
     vec3 rgb = f.rgb;
     float a = f.a;
-    uint flags = push.mode.x;
+    const uint flags = FLAGS;
 
     if ((flags & F_TME) != 0u)
     {
@@ -117,10 +123,10 @@ void main()
         rgb = floor((rgb * fog + push.fogColor.rgb * (255.0 - fog)) / 256.0);
     }
 
-    if (push.mode.w != 2u)
+    if (AMODE != 2u)
     {
         bool pass = alphaPasses(a);
-        if (pass == (push.mode.w == 1u))
+        if (pass == (AMODE == 1u))
             discard;
     }
 

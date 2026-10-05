@@ -254,6 +254,9 @@ struct GSPrimitiveBatch
     std::array<GSVertex, 3> vertices{};
     uint8_t vertexCount = 0;
     GSDrawState state{};
+    // Changes whenever a register that feeds `state` is written (0 = unknown): equal serials mean
+    // equal states, so backends can skip comparing them.
+    uint64_t stateSerial = 0;
 };
 
 struct GSTransferCommand

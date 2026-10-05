@@ -268,6 +268,9 @@ private:
     uint32_t m_curPath = 2u;
     void logBatchVertex(const GSVertex &vtx);
     void surveyDrawUnlocked();
+    // vertexKick's reusable batch (its state rebuilt when m_drawStateSerial moved on).
+    GSPrimitiveBatch m_drawBatch{};
+    uint64_t m_drawStateSerial = 1, m_drawBatchSerial = 0, m_drawBatchSerialOut = 0;
     void surveyTransferUnlocked();
 
     static constexpr int kMaxVerts = 6;

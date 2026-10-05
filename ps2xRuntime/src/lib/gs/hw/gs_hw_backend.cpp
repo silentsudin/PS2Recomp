@@ -31,6 +31,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -187,6 +188,7 @@ namespace ps2x::gs
                 const auto lock = lockDevice();
                 m_shared->flushLocked = nullptr;
                 m_shared->attached = false;
+                m_shared->scanoutRing = 0;
                 m_shared->scanout.reset();
             }
 
@@ -231,6 +233,7 @@ namespace ps2x::gs
                 frag.push_constant_size = sizeof(Push);
                 frag.sets[0].sampled_image_mask = 0x3;
                 frag.sets[0].fp_mask = 0x3;
+                frag.spec_constant_mask = 0x7; // flags, ATST, alpha-test pass (draw.frag)
                 m_drawProgram = m_dev->request_program(hw_spirv::draw_vert, sizeof(hw_spirv::draw_vert), hw_spirv::draw_frag,
                                                        sizeof(hw_spirv::draw_frag), &vert, &frag);
                 if (!m_drawProgram)
@@ -244,6 +247,7 @@ namespace ps2x::gs
                 m_white = m_dev->create_image(Vulkan::ImageCreateInfo::immutable_2d_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM), &init);
 
                 m_shared->attached = true;
+                m_shared->scanoutRing = 3; // m_scanout
                 m_shared->flushLocked = [] {};
                 const auto &props = m_dev->get_gpu_properties();
                 m_info.name = props.deviceName;
@@ -259,6 +263,8 @@ namespace ps2x::gs
             PgsDeviceInfo deviceInfo() const override { return m_info; }
             void setSuperSampling(uint32_t samples) override
             {
+                if (std::getenv("RT_GS_SCALE"))
+                    return; // the override wins over the setting
                 const uint32_t scale = samples >= 16 ? 4 : samples >= 4 ? 2 : 1;
                 if (scale != m_scale.load())
                 {
@@ -289,6 +295,46 @@ namespace ps2x::gs
                 ++m_epoch;
             }
 
+            // Whether two primitives draw with the same state, as far as record() reads it: the
+            // primitive type, shading, FST and XYOFFSET are applied to the vertices; texture state
+            // counts only with TME, fog colour with FGE, ALPHA with ABE, the Z buffer when Z is
+            // tested or written. Field by field: the frontend's structs carry garbage padding.
+            static bool sameDraw(const GSDrawState &a, const GSDrawState &b)
+            {
+                const GSContext &x = a.context, &y = b.context;
+                if (a.prim.tme != b.prim.tme || a.prim.abe != b.prim.abe || a.prim.fge != b.prim.fge)
+                    return false;
+                if (x.frame.fbp != y.frame.fbp || x.frame.fbw != y.frame.fbw || x.frame.psm != y.frame.psm ||
+                    x.frame.fbmsk != y.frame.fbmsk)
+                    return false;
+                if (x.scissor.x0 != y.scissor.x0 || x.scissor.x1 != y.scissor.x1 || x.scissor.y0 != y.scissor.y0 ||
+                    x.scissor.y1 != y.scissor.y1)
+                    return false;
+                if (x.test != y.test || x.fba != y.fba || x.zbuf.zmask != y.zbuf.zmask || a.pabe != b.pabe)
+                    return false;
+                const bool zte = (x.test >> 16) & 1u;
+                const bool depth = (zte && ((x.test >> 17) & 3u) != 1u) || !x.zbuf.zmask;
+                if (depth && (x.zbuf.zbp != y.zbuf.zbp || x.zbuf.psm != y.zbuf.psm))
+                    return false;
+                if (a.prim.abe && x.alpha != y.alpha)
+                    return false;
+                if (a.prim.fge && (a.fogR != b.fogR || a.fogG != b.fogG || a.fogB != b.fogB))
+                    return false;
+                if (a.prim.tme)
+                {
+                    const GSTex0Reg &t = x.tex0, &u = y.tex0;
+                    if (t.tbp0 != u.tbp0 || t.tbw != u.tbw || t.psm != u.psm || t.tw != u.tw || t.th != u.th ||
+                        t.tcc != u.tcc || t.tfx != u.tfx || t.cbp != u.cbp || t.cpsm != u.cpsm || t.csm != u.csm ||
+                        t.csa != u.csa)
+                        return false;
+                    if (x.tex1 != y.tex1 || x.clamp != y.clamp || x.miptbp1 != y.miptbp1 || x.miptbp2 != y.miptbp2)
+                        return false;
+                    if (a.texa.ta0 != b.texa.ta0 || a.texa.aem != b.texa.aem || a.texa.ta1 != b.texa.ta1)
+                        return false;
+                }
+                return true;
+            }
+
             void Submit(const GSPrimitiveBatch &batch) override
             {
                 const GSDrawState &state = batch.state;
@@ -301,55 +347,29 @@ namespace ps2x::gs
                 const uint32_t needed = type == GS_PRIM_SPRITE ? 2u : 3u;
                 if (batch.vertexCount < needed)
                     return;
+                m_gsThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
 
                 // A new batch when the state or the texture contents changed (decided and resolved
-                // without the frame lock: decoding a texture takes the device lock).
-                bool fresh;
-                {
-                    std::lock_guard<std::mutex> lock(m_frameMutex);
-                    fresh = !m_haveCurrent || m_currentEpoch != m_epoch ||
-                            std::memcmp(&m_current.state, &state, sizeof(state)) != 0;
-                    static const bool stats = std::getenv("RT_HWGS_STATS") != nullptr;
-                    if (stats && fresh && m_haveCurrent)
-                    {
-                        if (m_currentEpoch != m_epoch)
-                            ++m_breakEpoch;
-                        else
-                        {
-                            const auto *x = reinterpret_cast<const uint8_t *>(&m_current.state);
-                            const auto *y = reinterpret_cast<const uint8_t *>(&state);
-                            size_t i = 0;
-                            while (i < sizeof(state) && x[i] == y[i])
-                                ++i;
-                            ++m_breakAt[i];
-                        }
-                    }
-                    if (fresh && m_open)
-                        closeBatch();
-                }
+                // without the frame lock: decoding a texture takes the device lock; m_current is the
+                // GS thread's own).
+                const uint64_t epoch = m_epoch.load(std::memory_order_relaxed);
+                // The frontend numbers its draw states: the same serial is the same state.
+                const bool sameSerial = batch.stateSerial != 0 && batch.stateSerial == m_currentSerial;
+                const bool fresh = !m_haveCurrent || m_currentEpoch != epoch || (!sameSerial && !sameDraw(m_current.state, state));
+                m_currentSerial = batch.stateSerial;
+                static const bool stats = std::getenv("RT_HWGS_STATS") != nullptr;
+                if (stats && fresh && m_haveCurrent && m_currentEpoch != epoch)
+                    ++m_breakEpoch;
                 if (fresh)
                 {
+                    // The previous batch's staged vertices go out first, and it ends.
+                    publish(true);
                     m_current = Batch{};
-                    // memcpy, not assignment: batches are compared with memcmp, padding included.
-                    std::memcpy(&m_current.state, &state, sizeof(state));
+                    m_current.state = state;
                     if (state.prim.tme)
                         resolveTexture(m_current);
                     m_haveCurrent = true;
-                    m_currentEpoch = m_epoch;
-                }
-
-                bool flush = false;
-                std::unique_lock<std::mutex> lock(m_frameMutex);
-                if (!m_open)
-                {
-                    // A buffer flip (the other frame buffer) or a long run: record what's pending.
-                    flush = !m_batches.empty() && (m_batches.back().state.context.frame.fbp != state.context.frame.fbp ||
-                                                   m_vertices.size() > 200000u || m_batches.size() > 4000u);
-                    Batch b = m_current;
-                    b.firstVertex = static_cast<uint32_t>(m_vertices.size());
-                    b.vertexCount = 0;
-                    m_batches.push_back(std::move(b));
-                    m_open = true;
+                    m_currentEpoch = epoch;
                 }
 
                 const GSContext &ctx = state.context;
@@ -389,18 +409,47 @@ namespace ps2x::gs
                     v2.x = v1.x, v2.s = v1.s; // top-right
                     v3.y = v1.y, v3.t = v1.t; // bottom-left
                     const HwVertex quad[6] = {v0, v2, v3, v2, v1, v3};
-                    m_vertices.insert(m_vertices.end(), quad, quad + 6);
-                    m_batches.back().vertexCount += 6;
+                    m_stage.insert(m_stage.end(), quad, quad + 6);
                 }
                 else
                 {
                     // Flat shading takes the colour of the last vertex.
                     const GSVertex &flat = batch.vertices[2];
                     for (int i = 0; i < 3; ++i)
-                        m_vertices.push_back(convert(batch.vertices[i], state.prim.iip ? batch.vertices[i] : flat));
-                    m_batches.back().vertexCount += 3;
+                        m_stage.push_back(convert(batch.vertices[i], state.prim.iip ? batch.vertices[i] : flat));
                 }
-                lock.unlock();
+                if (m_stage.size() >= 1536u)
+                    publish(false);
+            }
+
+            // GS thread: hands the staged vertices of the current batch to the shared lists (one lock
+            // per batch change or 1536 vertices, not per primitive); `end` closes the batch. Opening
+            // a batch for another frame buffer (a buffer flip) or after a long run records what's pending.
+            void publish(bool end)
+            {
+                bool flush = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_frameMutex);
+                    if (!m_stage.empty())
+                    {
+                        if (!m_open)
+                        {
+                            flush = !m_batches.empty() &&
+                                    (m_batches.back().state.context.frame.fbp != m_current.state.context.frame.fbp ||
+                                     m_vertices.size() > 200000u || m_batches.size() > 4000u);
+                            Batch b = m_current;
+                            b.firstVertex = static_cast<uint32_t>(m_vertices.size());
+                            b.vertexCount = 0;
+                            m_batches.push_back(std::move(b));
+                            m_open = true;
+                        }
+                        m_vertices.insert(m_vertices.end(), m_stage.begin(), m_stage.end());
+                        m_batches.back().vertexCount += static_cast<uint32_t>(m_stage.size());
+                        m_stage.clear();
+                    }
+                    if (end && m_open)
+                        closeBatch();
+                }
                 if (flush)
                     flushPending();
             }
@@ -410,33 +459,32 @@ namespace ps2x::gs
             void flushPending()
             {
                 const auto device = lockDevice();
-                std::vector<Batch> batches;
-                std::vector<HwVertex> vertices;
+                // The pending lists go to the recorder; the GS thread continues in the spare ones
+                // (cleared, capacity kept: no reallocation every frame).
+                std::vector<Batch> &batches = m_recordBatches;
+                std::vector<HwVertex> &vertices = m_recordVertices;
                 {
                     std::lock_guard<std::mutex> lock(m_frameMutex);
-                    if (m_open)
+                    batches.swap(m_batches);
+                    vertices.swap(m_vertices);
+                    if (m_open && !batches.empty())
                     {
-                        // Keep the open batch's last vertices with it: move the whole open batch.
-                        Batch open = m_batches.back();
-                        m_batches.pop_back();
-                        batches.swap(m_batches);
-                        std::vector<HwVertex> tail(m_vertices.begin() + open.firstVertex, m_vertices.end());
-                        vertices.swap(m_vertices);
+                        // The open batch continues: move it and its vertices to the fresh lists.
+                        Batch open = std::move(batches.back());
+                        batches.pop_back();
+                        m_vertices.assign(vertices.begin() + open.firstVertex, vertices.end());
+                        vertices.resize(open.firstVertex);
                         open.firstVertex = 0;
                         m_batches.push_back(std::move(open));
-                        m_vertices = std::move(tail);
-                    }
-                    else
-                    {
-                        batches.swap(m_batches);
-                        vertices.swap(m_vertices);
                     }
                 }
                 if (batches.empty())
                     return;
                 auto cmd = m_dev->request_command_buffer();
                 record(*cmd, batches, vertices);
-                m_dev->submit(cmd);
+                batches.clear();
+                vertices.clear();
+                submitRecorded(cmd);
                 // A device of its own: a frame context per flush (waits for the one a few flushes
                 // back), so the GPU can't fall behind and resources are recycled.
                 if (m_own)
@@ -445,51 +493,100 @@ namespace ps2x::gs
 
             void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
             {
-                // The game reloads the CLUT with every TEX0, mostly with the same colours: only a
+                // The game reloads the CLUT with every TEX0, mostly from the same place with the same
+                // colours: skip the reload when the source and its page are unchanged, and only a
                 // real change starts new batches.
+                const uint64_t source = mix(mix(mix(0, tex0.cbp | (static_cast<uint64_t>(tex0.cpsm) << 16) |
+                                                         (static_cast<uint64_t>(tex0.csm) << 24) |
+                                                         (static_cast<uint64_t>(tex0.csa) << 32) |
+                                                         (static_cast<uint64_t>(tex0.psm) << 40) |
+                                                         (static_cast<uint64_t>(tex0.cld) << 48)),
+                                                texclut.cbw | (texclut.cou << 8) | (static_cast<uint32_t>(texclut.cov) << 16)),
+                                            m_pageVersion[(tex0.cbp / 32u) % kPages]);
+                if (source == m_lastClutSource && tex0.cld != 0u)
+                    return;
+                m_lastClutSource = source;
                 const auto before = m_clut;
                 loadClut(tex0, texclut);
                 if (m_clut == before)
                     return;
-                std::lock_guard<std::mutex> lock(m_frameMutex);
-                if (m_open)
-                    closeBatch();
+                publish(true);
                 ++m_epoch;
             }
 
+            // Writes into local memory: the destination pages are hashed before and after, and only a
+            // real change counts (new page versions, new batches, textures decoded again). The game
+            // uploads its palettes and some textures again every frame, mostly with the same bytes.
             void BeginTransfer(const GSTransferCommand &command) override
             {
-                std::lock_guard<std::mutex> lock(m_frameMutex);
-                if (m_open)
-                    closeBatch();
+                finishUpload(); // an upload cut short by the next transfer
                 if (command.direction == 0u || command.direction == 2u)
                 {
                     uint32_t first, last;
                     pageRange(command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, command.trxpos.dsax,
                               command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh, first, last);
-                    for (uint32_t p = first; p <= last; ++p)
-                        ++m_pageVersion[p % kPages];
+                    m_upload = {true, first, std::min(last, first + kPages - 1u), hashPages(first, last)};
                     if (command.direction == 2u)
                     {
+                        uint32_t sfirst, slast;
                         pageRange(command.bitbltbuf.sbp, command.bitbltbuf.sbw, command.bitbltbuf.spsm, command.trxpos.ssax,
-                                  command.trxpos.ssay, command.trxreg.rrw, command.trxreg.rrh, first, last);
-                        if (findTargetForPages(first, last))
+                                  command.trxpos.ssay, command.trxreg.rrw, command.trxreg.rrh, sfirst, slast);
+                        if (findTargetForPages(sfirst, slast))
                             unsupported("local-to-local copy out of a render target");
                     }
                 }
                 else if (command.direction == 1u)
                     unsupported("local-to-host readback (render targets aren't written back)");
                 m_cpu.BeginTransfer(command);
-                ++m_epoch;
+                m_pageCache.Invalidate();
+                if (command.direction == 2u) // the CPU GS copies at once
+                    finishUpload();
             }
 
             void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
             {
                 m_cpu.UploadImage(data, sizeBytes);
                 m_pageCache.Invalidate();
+                const GSTransferSnapshot t = m_cpu.GetTransferSnapshot();
+                if (m_upload.active && t.copiedPixels >= t.totalPixels)
+                    finishUpload();
             }
 
-            void Flush() override {}
+            uint64_t hashPages(uint32_t first, uint32_t last) const
+            {
+                if (!m_vram)
+                    return 0;
+                uint64_t h = 0x9E3779B97F4A7C15ull;
+                for (uint32_t p = first; p <= last && p < first + kPages; ++p)
+                {
+                    const auto *w = reinterpret_cast<const uint64_t *>(m_vram + (p % kPages) * 8192u);
+                    for (uint32_t i = 0; i < 1024u; ++i)
+                        h = (h ^ w[i]) * 0x100000001B3ull + (h >> 29);
+                }
+                return h;
+            }
+
+            void finishUpload()
+            {
+                if (!m_upload.active)
+                    return;
+                m_upload.active = false;
+                if (hashPages(m_upload.first, m_upload.last) == m_upload.hash)
+                    return;
+                publish(true);
+                std::lock_guard<std::mutex> lock(m_frameMutex);
+                for (uint32_t p = m_upload.first; p <= m_upload.last; ++p)
+                    ++m_pageVersion[p % kPages];
+                ++m_epoch;
+            }
+
+            // FINISH (the end of a frame's drawing, GS thread) publishes the staged vertices; the other
+            // callers (presentation) are on other threads and leave them to the GS thread.
+            void Flush() override
+            {
+                if (std::this_thread::get_id() == m_gsThread.load(std::memory_order_relaxed))
+                    publish(false);
+            }
             void TextureFlush() override {}
             void Sync(GSSyncReason) override {}
 
@@ -524,8 +621,8 @@ namespace ps2x::gs
                 uint32_t outW = 0, outH = 0;
                 {
                     const auto lock = lockDevice();
-                    std::vector<Batch> batches;
-                    std::vector<HwVertex> vertices;
+                    std::vector<Batch> &batches = m_recordBatches;
+                    std::vector<HwVertex> &vertices = m_recordVertices;
                     {
                         std::lock_guard<std::mutex> frameLock(m_frameMutex);
                         if (m_open)
@@ -542,6 +639,8 @@ namespace ps2x::gs
                                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
                     record(*cmd, batches, vertices);
+                    batches.clear();
+                    vertices.clear();
                     const Vulkan::Image *scan = scanout(*cmd, request);
                     if (scan)
                     {
@@ -552,7 +651,12 @@ namespace ps2x::gs
                     }
                     if (scan && request.readback)
                         readbackCopy(*cmd, *scan);
-                    m_dev->submit(cmd, request.readback && scan ? &fence : nullptr);
+                    {
+                        Vulkan::Fence used;
+                        submitRecorded(cmd, &used);
+                        if (request.readback && scan)
+                            fence = used;
+                    }
                     if (m_own)
                         m_dev->next_frame_context();
                 }
@@ -564,14 +668,7 @@ namespace ps2x::gs
                                  m_stats.batches / n, m_stats.dateBatches / n, m_stats.vertices / n, m_stats.passes / n,
                                  m_stats.snapshots / n, m_stats.decodes / n);
                     m_stats = {};
-                    std::fprintf(stderr, "[hwgs] batch breaks: epoch %llu;", static_cast<unsigned long long>(m_breakEpoch));
-                    for (auto &[at, n] : m_breakAt)
-                        std::fprintf(stderr, " @%zu:%llu", at, static_cast<unsigned long long>(n));
-                    std::fprintf(stderr, " (prim @%zu, texa @%zu, fog @%zu, context.tex0 @%zu, context.frame @%zu)\n",
-                                 offsetof(GSDrawState, prim), offsetof(GSDrawState, texa), offsetof(GSDrawState, fogR),
-                                 offsetof(GSDrawState, context) + offsetof(GSContext, tex0),
-                                 offsetof(GSDrawState, context) + offsetof(GSContext, frame));
-                    m_breakAt.clear();
+                    std::fprintf(stderr, "[hwgs] batches broken by texture/CLUT changes: %.0f per present\n", m_breakEpoch / n);
                     m_breakEpoch = 0;
                 }
                 PresentationFrame frame{};
@@ -1004,10 +1101,53 @@ namespace ps2x::gs
                 return true;
             }
 
+            // The recording's vertices, uploaded once into a slot of a ring of persistent buffers
+            // (Granite's vertex pool has 4 KB blocks: most batches got a buffer of their own, created
+            // and destroyed every frame). A slot is reused once its last submit has finished.
+            const Vulkan::Buffer *uploadVertices(const std::vector<HwVertex> &vertices)
+            {
+                if (vertices.empty())
+                    return nullptr;
+                m_vboSlot = (m_vboSlot + 1u) % kVboRing;
+                VboSlot &slot = m_vbo[m_vboSlot];
+                if (slot.fence)
+                {
+                    slot.fence->wait();
+                    slot.fence.reset();
+                }
+                const size_t bytes = vertices.size() * sizeof(HwVertex);
+                if (!slot.buffer || slot.buffer->get_create_info().size < bytes)
+                {
+                    Vulkan::BufferCreateInfo info = {};
+                    info.size = std::max<size_t>(bytes + bytes / 2, 1u << 20);
+                    info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+                    info.domain = Vulkan::BufferDomain::Host;
+                    slot.buffer = m_dev->create_buffer(info);
+                }
+                void *dst = m_dev->map_host_buffer(*slot.buffer, Vulkan::MEMORY_ACCESS_WRITE_BIT);
+                std::memcpy(dst, vertices.data(), bytes);
+                m_dev->unmap_host_buffer(*slot.buffer, Vulkan::MEMORY_ACCESS_WRITE_BIT);
+                return slot.buffer.get();
+            }
+
+            // The fence of the submit that used the current vertex slot.
+            void submitRecorded(Vulkan::CommandBufferHandle &cmd, Vulkan::Fence *extra = nullptr)
+            {
+                Vulkan::Fence fence;
+                m_dev->submit(cmd, &fence);
+                if (m_vboUsed)
+                    m_vbo[m_vboSlot].fence = fence;
+                m_vboUsed = false;
+                if (extra)
+                    *extra = fence;
+            }
+
             void record(Vulkan::CommandBuffer &cmd, const std::vector<Batch> &batches, const std::vector<HwVertex> &vertices)
             {
                 ++m_frame;
                 bool passOpen = false;
+                const Vulkan::Buffer *vbo = uploadVertices(vertices);
+                m_vboUsed = vbo != nullptr;
                 m_stats.batches += batches.size();
                 m_stats.vertices += vertices.size();
                 for (const Batch &b : batches)
@@ -1224,12 +1364,14 @@ namespace ps2x::gs
                     if (ctx.fba & 1u)
                         unsupported("FBA");
 
-                    auto *dst = static_cast<HwVertex *>(cmd.allocate_vertex_data(0, b.vertexCount * sizeof(HwVertex), sizeof(HwVertex)));
-                    std::memcpy(dst, vertices.data() + b.firstVertex, b.vertexCount * sizeof(HwVertex));
-
+                    cmd.set_vertex_binding(0, *vbo, 0, sizeof(HwVertex));
                     cmd.set_color_write_mask(mask);
+                    cmd.set_specialization_constant_mask(0x7);
+                    cmd.set_specialization_constant(0, p.mode[0]);
+                    cmd.set_specialization_constant(1, p.mode[1]);
+                    cmd.set_specialization_constant(2, p.mode[3]);
                     cmd.push_constants(&p, 0, sizeof(p));
-                    cmd.draw(b.vertexCount);
+                    cmd.draw(b.vertexCount, 1, b.firstVertex);
 
                     // Pixels failing the alpha test still update what AFAIL lets them.
                     if (ate && afail != 0u && p.mode[1] != 1u)
@@ -1245,8 +1387,9 @@ namespace ps2x::gs
                             cmd.set_depth_test(depthImage != nullptr, false);
                         }
                         cmd.set_color_write_mask(mask);
+                        cmd.set_specialization_constant(2, p.mode[3]);
                         cmd.push_constants(&p, 0, sizeof(p));
-                        cmd.draw(b.vertexCount);
+                        cmd.draw(b.vertexCount, 1, b.firstVertex);
                     }
                 }
                 endPass(cmd, passOpen);
@@ -1385,14 +1528,26 @@ namespace ps2x::gs
             GSMem::TexturePageCache m_pageCache;
             std::array<uint16_t, 512> m_clut{};
             std::array<uint32_t, 2> m_clutCbp{};
+            uint64_t m_lastClutSource = 0;
+            struct PendingUpload
+            {
+                bool active = false;
+                uint32_t first = 0, last = 0;
+                uint64_t hash = 0;
+            } m_upload; // GS thread
             std::array<uint32_t, kPages> m_pageVersion{};
 
             // GS thread -> Present (m_frameMutex).
             std::mutex m_frameMutex;
             std::vector<Batch> m_batches;
             std::vector<HwVertex> m_vertices;
+            std::vector<HwVertex> m_stage; // GS thread: the current batch's vertices not yet published
+            std::atomic<std::thread::id> m_gsThread{};
+            // Recording side (device lock): swapped with the two above, capacity kept.
+            std::vector<Batch> m_recordBatches;
+            std::vector<HwVertex> m_recordVertices;
             bool m_open = false;
-            uint64_t m_epoch = 1;
+            std::atomic<uint64_t> m_epoch{1};
             struct PageSpan
             {
                 uint32_t first, second, fbw;
@@ -1410,12 +1565,12 @@ namespace ps2x::gs
             {
                 uint64_t batches = 0, vertices = 0, passes = 0, snapshots = 0, decodes = 0, presents = 0, dateBatches = 0;
             } m_stats;
-            std::map<size_t, uint64_t> m_breakAt;
             uint64_t m_breakEpoch = 0;
             uint64_t m_lastEviction = 0;
             // GS thread: the state (and resolved texture) of the newest batch.
             Batch m_current;
             bool m_haveCurrent = false;
+            uint64_t m_currentSerial = 0;
             uint64_t m_currentEpoch = 0;
             mutable std::mutex m_targetPagesMutex;
 
@@ -1426,6 +1581,14 @@ namespace ps2x::gs
             Vulkan::ImageHandle m_scanout[3];
             uint32_t m_scanoutIndex = 0;
             Vulkan::BufferHandle m_readback;
+            static constexpr uint32_t kVboRing = 8;
+            struct VboSlot
+            {
+                Vulkan::BufferHandle buffer;
+                Vulkan::Fence fence;
+            } m_vbo[kVboRing];
+            uint32_t m_vboSlot = 0;
+            bool m_vboUsed = false;
         };
     }
 
