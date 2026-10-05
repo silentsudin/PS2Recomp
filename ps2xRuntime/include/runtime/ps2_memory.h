@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include "gs/ps2_gif_arbiter.h"
@@ -489,6 +490,9 @@ public:
     std::thread m_gsThread;
     std::condition_variable m_gsWorkCv;
     std::condition_variable m_gsIdleCv;
+    // What the threads in syncGifVif1() wait for (under m_gifVif1Mutex): completions are only
+    // signalled once the lowest target is reached.
+    std::multiset<uint64_t> m_vifWaitTargets, m_gsWaitTargets;
     std::deque<std::vector<GifArbiterPacket>> m_gsQueue;
     std::vector<GifArbiterPacket> m_gsPending; // worker-owned, not yet handed over
     std::atomic<uint64_t> m_gsSubmitted{0};

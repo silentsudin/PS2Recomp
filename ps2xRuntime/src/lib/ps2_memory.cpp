@@ -2024,11 +2024,17 @@ void PS2Memory::gifVif1WorkerLoop()
         m_gifVif1BusyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       std::chrono::steady_clock::now() - busyStart).count()),
                                   std::memory_order_relaxed);
+        bool wake;
         {
             std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
-            m_gifVif1Completed.fetch_add(1, std::memory_order_release);
+            const uint64_t done = m_gifVif1Completed.fetch_add(1, std::memory_order_release) + 1;
+            wake = !m_vifWaitTargets.empty() && done >= *m_vifWaitTargets.begin();
         }
-        m_gifVif1IdleCv.notify_all();
+        // A wake is a futex syscall: only when a waiter's target is reached (targets kept under the
+        // same lock). The EE waits here on every GS access, so waking per batch cost a fifth of the
+        // GS thread on Android.
+        if (wake)
+            m_gifVif1IdleCv.notify_all();
     }
 }
 
@@ -2089,12 +2095,21 @@ void PS2Memory::syncGifVif1()
         }
     } reportBlocked{*this, waitStart};
     std::unique_lock<std::mutex> lock(m_gifVif1Mutex);
-    m_gifVif1IdleCv.wait(lock, [&]
-                         { return m_gifVif1Completed.load(std::memory_order_acquire) >= target; });
+    {
+        const auto it = m_vifWaitTargets.insert(target);
+        m_gifVif1IdleCv.wait(lock, [&]
+                             { return m_gifVif1Completed.load(std::memory_order_acquire) >= target; });
+        m_vifWaitTargets.erase(it);
+    }
     // The worker handed its GIF output to the GS thread before completing; wait for that too.
     const uint64_t gsTarget = m_gsSubmitted.load(std::memory_order_acquire);
-    m_gsIdleCv.wait(lock, [&]
-                    { return m_gsCompleted.load(std::memory_order_acquire) >= gsTarget; });
+    if (m_gsCompleted.load(std::memory_order_acquire) < gsTarget)
+    {
+        const auto it = m_gsWaitTargets.insert(gsTarget);
+        m_gsIdleCv.wait(lock, [&]
+                        { return m_gsCompleted.load(std::memory_order_acquire) >= gsTarget; });
+        m_gsWaitTargets.erase(it);
+    }
 }
 
 void PS2Memory::drainGif()
@@ -2147,15 +2162,18 @@ void PS2Memory::gsThreadLoop()
         }
         const auto busyStart = std::chrono::steady_clock::now();
         m_gifArbiter->process(batch);
+        m_gifArbiter->recycle(std::move(batch));
         m_gsBusyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - busyStart).count()),
                              std::memory_order_relaxed);
+        bool wake;
         {
             std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
-            m_gsCompleted.fetch_add(1, std::memory_order_release);
+            const uint64_t done = m_gsCompleted.fetch_add(1, std::memory_order_release) + 1;
+            wake = !m_gsWaitTargets.empty() && done >= *m_gsWaitTargets.begin();
         }
-        m_gifVif1IdleCv.notify_all();
-        m_gsIdleCv.notify_all();
+        if (wake)
+            m_gsIdleCv.notify_all();
     }
 }
 

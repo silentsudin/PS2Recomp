@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <vector>
 
 enum class GifPathId : uint8_t
@@ -40,12 +41,18 @@ public:
     // them to the GS later, possibly from another thread.
     void drainInto(std::vector<GifArbiterPacket> &out);
     void process(const std::vector<GifArbiterPacket> &packets) const;
+    // Processed packets' buffers back for reuse (any thread): submit() takes from them instead of
+    // allocating a buffer per packet.
+    void recycle(std::vector<GifArbiterPacket> &&packets);
     bool empty() const { return m_queue.empty(); }
 
 private:
     ProcessPacketFn m_processFn;
     ProcessPathPacketFn m_processPathFn;
     std::vector<GifArbiterPacket> m_queue;
+    std::vector<std::vector<uint8_t>> m_free;     // submit()'s own
+    std::mutex m_poolMutex;
+    std::vector<std::vector<uint8_t>> m_returned; // from recycle(), under m_poolMutex
 
     void sortQueue();
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);

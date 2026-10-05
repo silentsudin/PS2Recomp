@@ -28,9 +28,28 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
+    if (m_free.empty())
+    {
+        std::lock_guard<std::mutex> lock(m_poolMutex);
+        m_free.swap(m_returned);
+    }
+    if (!m_free.empty())
+    {
+        pkt.data = std::move(m_free.back());
+        m_free.pop_back();
+    }
     pkt.data.resize(sizeBytes);
     std::memcpy(pkt.data.data(), data, sizeBytes);
     m_queue.push_back(std::move(pkt));
+}
+
+void GifArbiter::recycle(std::vector<GifArbiterPacket> &&packets)
+{
+    std::lock_guard<std::mutex> lock(m_poolMutex);
+    for (auto &pkt : packets)
+        if (m_returned.size() < 4096u && pkt.data.capacity() != 0u)
+            m_returned.push_back(std::move(pkt.data));
+    packets.clear();
 }
 
 void GifArbiter::sortQueue()
