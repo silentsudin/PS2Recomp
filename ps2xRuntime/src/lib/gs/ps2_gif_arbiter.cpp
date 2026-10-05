@@ -54,19 +54,30 @@ void GifArbiter::recycle(std::vector<GifArbiterPacket> &&packets)
 
 void GifArbiter::sortQueue()
 {
-    std::stable_sort(m_queue.begin(), m_queue.end(),
-                     [](const GifArbiterPacket &a, const GifArbiterPacket &b)
-                     {
-                         // DIRECTHL cannot preempt PATH3 IMAGE transfers.
-                         if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
-                         {
-                             if (a.path3Image && b.path2DirectHl)
-                                 return true;
-                             if (a.path2DirectHl && b.path3Image)
-                                 return false;
-                         }
-                         return pathPriority(a.pathId) < pathPriority(b.pathId);
-                     });
+    auto before = [](const GifArbiterPacket &a, const GifArbiterPacket &b)
+    {
+        // DIRECTHL cannot preempt PATH3 IMAGE transfers.
+        if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
+        {
+            if (a.path3Image && b.path2DirectHl)
+                return true;
+            if (a.path2DirectHl && b.path3Image)
+                return false;
+        }
+        return pathPriority(a.pathId) < pathPriority(b.pathId);
+    };
+    // Usually in order already (one path at a time): std::stable_sort would still allocate a
+    // temporary buffer each call, which after every VU1 program was a tenth of the VU1 thread's
+    // time on Android (malloc's lock). Small queues are insertion-sorted in place (stable).
+    if (std::is_sorted(m_queue.begin(), m_queue.end(), before))
+        return;
+    if (m_queue.size() <= 64)
+    {
+        for (auto it = m_queue.begin() + 1; it != m_queue.end(); ++it)
+            std::rotate(std::upper_bound(m_queue.begin(), it, *it, before), it, it + 1);
+        return;
+    }
+    std::stable_sort(m_queue.begin(), m_queue.end(), before);
 }
 
 void GifArbiter::process(const std::vector<GifArbiterPacket> &packets) const
