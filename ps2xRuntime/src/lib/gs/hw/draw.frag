@@ -7,6 +7,12 @@
 layout(set = 0, binding = 0) uniform sampler2D uTex;
 // The render target as it was before this draw (destination alpha test).
 layout(set = 0, binding = 1) uniform sampler2D uDest;
+// Texture packs: another palette of a replaced texture, as an affine map of the pack image's
+// colour (rows r, g, b, a, then the offset; 0..255, PS2 alpha).
+layout(set = 0, binding = 2) uniform Recolor
+{
+    vec4 rows[5];
+} uRecolor;
 
 layout(location = 0) in vec4 vColor;
 layout(location = 1) noperspective in vec3 vStq;
@@ -32,7 +38,7 @@ layout(push_constant) uniform Push
 layout(location = 0) out vec4 outColor;
 
 const uint F_TME = 1u, F_TCC = 8u, F_FGE = 16u, F_MIP = 1024u, F_LINEAR = 2048u, F_REPEAT_IN_SHADER = 4096u, F_DATE = 8192u,
-           F_DATM = 16384u;
+           F_DATM = 16384u, F_REPLACED = 32768u, F_RECOLOR = 65536u;
 
 float wrapCoord(float c, uint mode, float size, float lo, float hi, bool linear)
 {
@@ -82,15 +88,38 @@ void main()
         vec2 st = vStq.xy / vStq.z;
         vec2 texel = st * push.texNorm.xy;
         bool linear = (flags & F_LINEAR) != 0u;
-        texel.x = wrapCoord(texel.x, (flags >> 5) & 3u, push.texNorm.x, push.region.x, push.region.y, linear);
-        texel.y = wrapCoord(texel.y, (flags >> 7) & 3u, push.texNorm.y, push.region.z, push.region.w, linear);
-        float lod = 0.0;
-        if ((flags & F_MIP) != 0u)
+        vec4 t;
+        if ((flags & F_REPLACED) != 0u)
         {
-            lod = push.lod.w != 0.0 ? push.lod.z : log2(1.0 / abs(vStq.z)) * exp2(push.lod.y) + push.lod.z;
-            lod = clamp(lod, 0.0, push.lod.x);
+            // A texture-pack image for the texture's rect (texOffset = -its origin, texNorm.zw =
+            // 1 / its size): filtered by the hardware with implicit derivatives (mips, anisotropy).
+            uint ws = (flags >> 5) & 3u, wt = (flags >> 7) & 3u;
+            if (ws == 1u)
+                texel.x = clamp(texel.x, 0.0, push.texNorm.x);
+            else if (ws == 2u)
+                texel.x = clamp(texel.x, push.region.x, push.region.y + 1.0);
+            if (wt == 1u)
+                texel.y = clamp(texel.y, 0.0, push.texNorm.y);
+            else if (wt == 2u)
+                texel.y = clamp(texel.y, push.region.z, push.region.w + 1.0);
+            vec4 c = texture(uTex, (texel + push.texOffset.xy) * push.texNorm.zw) * 255.0;
+            if ((flags & F_RECOLOR) != 0u)
+                c = clamp(vec4(dot(uRecolor.rows[0], c), dot(uRecolor.rows[1], c), dot(uRecolor.rows[2], c),
+                               dot(uRecolor.rows[3], c)) + uRecolor.rows[4], vec4(0.0), vec4(255.0));
+            t = roundEven(c) / vec4(255.0, 255.0, 255.0, push.fogColor.w);
         }
-        vec4 t = textureLod(uTex, (texel + push.texOffset.xy) * push.texNorm.zw, lod);
+        else
+        {
+            texel.x = wrapCoord(texel.x, (flags >> 5) & 3u, push.texNorm.x, push.region.x, push.region.y, linear);
+            texel.y = wrapCoord(texel.y, (flags >> 7) & 3u, push.texNorm.y, push.region.z, push.region.w, linear);
+            float lod = 0.0;
+            if ((flags & F_MIP) != 0u)
+            {
+                lod = push.lod.w != 0.0 ? push.lod.z : log2(1.0 / abs(vStq.z)) * exp2(push.lod.y) + push.lod.z;
+                lod = clamp(lod, 0.0, push.lod.x);
+            }
+            t = textureLod(uTex, (texel + push.texOffset.xy) * push.texNorm.zw, lod);
+        }
         vec3 ct = floor(t.rgb * 255.0 + 0.5);
         float at = floor(t.a * push.fogColor.w + 0.5);
         if (push.texa.w != 0.0)

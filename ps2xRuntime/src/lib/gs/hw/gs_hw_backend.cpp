@@ -19,6 +19,7 @@
 #include "../gs_pgs_shared.h"
 #include "../post/post_spirv.h"
 #include "hw_spirv.h"
+#include "gs_hw_textures.h"
 
 #include "context.hpp"
 #include "device.hpp"
@@ -74,6 +75,8 @@ namespace ps2x::gs
             F_REPEAT_IN_SHADER = 4096u,
             F_DATE = 8192u,
             F_DATM = 16384u,
+            F_REPLACED = 32768u, // a texture-pack image (gs_hw_textures.h)
+            F_RECOLOR = 65536u,  // ... recoloured for another palette
         };
 
         // Page geometry of a pixel format: page width/height in pixels.
@@ -160,6 +163,12 @@ namespace ps2x::gs
             bool fromTarget = false;     // texture read from a render target
             uint32_t targetFbp = 0;
             float texOffsetX = 0, texOffsetY = 0;
+            // Texture packs: the replacement image, the part of the texture it stands for (texels)
+            // and, for another palette, its recolour map.
+            Vulkan::ImageHandle replacement;
+            float rect[4] = {};
+            bool recolor = false;
+            float recolorMap[20] = {};
         };
 
         struct Target
@@ -233,6 +242,7 @@ namespace ps2x::gs
                 frag.push_constant_size = sizeof(Push);
                 frag.sets[0].sampled_image_mask = 0x3;
                 frag.sets[0].fp_mask = 0x3;
+                frag.sets[0].uniform_buffer_mask = 0x4; // the recolour map (texture packs)
                 frag.spec_constant_mask = 0x7; // flags, ATST, alpha-test pass (draw.frag)
                 m_drawProgram = m_dev->request_program(hw_spirv::draw_vert, sizeof(hw_spirv::draw_vert), hw_spirv::draw_frag,
                                                        sizeof(hw_spirv::draw_frag), &vert, &frag);
@@ -245,6 +255,13 @@ namespace ps2x::gs
                 const uint32_t white = 0xFFFFFFFFu;
                 Vulkan::ImageInitialData init = {&white, 0, 0};
                 m_white = m_dev->create_image(Vulkan::ImageCreateInfo::immutable_2d_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM), &init);
+                // The recolour map draws without one bind (unused by their pipelines).
+                Vulkan::BufferCreateInfo ubo = {};
+                ubo.size = 20 * sizeof(float);
+                ubo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+                ubo.domain = Vulkan::BufferDomain::Device;
+                const float zero[20] = {};
+                m_noRecolor = m_dev->create_buffer(ubo, zero);
 
                 m_shared->attached = true;
                 m_shared->scanoutRing = 3; // m_scanout
@@ -274,9 +291,15 @@ namespace ps2x::gs
             }
             uint32_t superSampling() const override { return m_scale * m_scale; }
             void setSharpTextures(bool) override {}
-            void setTextures(const std::string &, const std::string &) override {}
-            TexturePackStats texturePackStats() const override { return {}; }
-            void setAnisotropy(uint32_t) override {}
+            void setTextures(const std::string &dumpDir, const std::string &packDir) override
+            {
+                m_packs.configure(dumpDir, packDir);
+            }
+            TexturePackStats texturePackStats() const override
+            {
+                return {m_packs.packSize(), m_packs.replacedCount()};
+            }
+            void setAnisotropy(uint32_t level) override { m_anisotropy = std::clamp<uint32_t>(level, 1u, 16u); }
 
             // ---------------------------------------------------------------- GSRasterBackend
             bool WantsPrimitives() const override { return true; }
@@ -520,6 +543,12 @@ namespace ps2x::gs
             void BeginTransfer(const GSTransferCommand &command) override
             {
                 finishUpload(); // an upload cut short by the next transfer
+                // Texture packs: the images the game uploads, by base address (a texture is named
+                // by the whole upload it is drawn from, as paraLLEl-GS does).
+                if (command.direction == 0u && command.trxpos.dsax == 0u && command.trxpos.dsay == 0u)
+                    m_uploads[command.bitbltbuf.dbp] = {command.bitbltbuf.dpsm, command.trxreg.rrw, command.trxreg.rrh};
+                else if (command.direction == 2u)
+                    m_uploads.erase(command.bitbltbuf.dbp);
                 if (command.direction == 0u || command.direction == 2u)
                 {
                     uint32_t first, last;
@@ -632,6 +661,7 @@ namespace ps2x::gs
                     }
                     if (m_rescale.exchange(false))
                         m_targets.clear(), m_depths.clear();
+                    servicePacks();
                     m_yScale = request.progressiveFields ? 2u : 1u;
                     auto cmd = m_dev->request_command_buffer();
                     // The presenter may still be sampling an older scanout image.
@@ -748,7 +778,162 @@ namespace ps2x::gs
                         unsupported("texture starting mid-page inside a render target");
                     return;
                 }
+                // Headless (no presents for a while): settings, results and new pack images are
+                // serviced here, as paraLLEl-GS does on its GIF path.
+                if (m_packs.serviceDue())
+                {
+                    const auto lock = lockDevice();
+                    servicePacks();
+                }
                 b.texture = decodedTexture(b.state);
+                if (m_packs.active())
+                    resolvePack(b);
+            }
+
+            // ---------------------------------------------------------------- texture dumps and packs
+            // Device lock held.
+            void servicePacks()
+            {
+                if (m_packs.service(*m_dev))
+                {
+                    // Another pack, or evicted images: every texture goes to the tools again (the
+                    // decoded textures stay), and new batches look their replacements up again.
+                    m_resubmit = true;
+                    ++m_epoch;
+                }
+            }
+
+            // The part of a texture paraLLEl-GS decodes along one axis (gs_util.cpp
+            // compute_effective_texture_extent): dumps and packs name textures by those pixels.
+            static void effectiveExtent(uint32_t size, uint32_t mode, uint32_t lo, uint32_t hi, uint32_t levels,
+                                        uint32_t &base, uint32_t &extent)
+            {
+                base = 0;
+                extent = size;
+                if (mode == 2u) // REGION_CLAMP
+                {
+                    lo = std::min(lo, hi);
+                    extent = std::max(hi, lo) - lo + 1u;
+                    if (levels > 1u)
+                    {
+                        const uint32_t mask = (1u << (levels - 1u)) - 1u;
+                        extent += lo & mask;
+                        lo &= ~mask;
+                        extent = (extent + mask) & ~mask;
+                    }
+                    base = lo;
+                }
+                else if (mode == 3u) // REGION_REPEAT
+                {
+                    if (lo == 0u)
+                    {
+                        extent = 1u;
+                        base = hi;
+                    }
+                    else
+                    {
+                        const uint32_t mskMsb = 31u - static_cast<uint32_t>(__builtin_clz(lo));
+                        const uint32_t fixLsb = hi ? static_cast<uint32_t>(__builtin_ctz(hi)) : 32u;
+                        if (fixLsb > mskMsb)
+                        {
+                            extent = std::min<uint32_t>(1u << (mskMsb + 1u), extent);
+                            base = hi;
+                        }
+                    }
+                }
+            }
+
+            struct TexRect
+            {
+                uint32_t x = 0, y = 0, w = 0, h = 0;
+            };
+            static TexRect effectiveRect(const GSContext &ctx, uint64_t clamp)
+            {
+                const GSTex0Reg &tex = ctx.tex0;
+                const uint32_t twl = std::min<uint32_t>(tex.tw, 10u), thl = std::min<uint32_t>(tex.th, 10u);
+                const uint32_t mmin = (ctx.tex1 >> 6) & 7u;
+                uint32_t levels = 1u;
+                if (mmin > 1u && mmin <= 5u) // a mipmapping filter: MXL counts
+                    levels = std::min<uint32_t>(std::min<uint32_t>(((ctx.tex1 >> 2) & 7u) + 1u, std::min(twl, thl) + 1u), 7u);
+                TexRect r;
+                effectiveExtent(1u << twl, clamp & 3u, (clamp >> 4) & 0x3FFu, (clamp >> 14) & 0x3FFu, levels, r.x, r.w);
+                effectiveExtent(1u << thl, (clamp >> 2) & 3u, (clamp >> 24) & 0x3FFu, (clamp >> 34) & 0x3FFu, levels, r.y, r.h);
+                return r;
+            }
+
+            // A draw's texture as the texture tools see it: the part paraLLEl-GS would decode (the whole
+            // upload, for a sprite cut out of an atlas with REGION_CLAMP), submitted once per content,
+            // and the pack's replacement for it if there is one. GS thread.
+            void resolvePack(Batch &b)
+            {
+                const GSContext &ctx = b.state.context;
+                const GSTex0Reg &tex = ctx.tex0;
+                TexRect rect = effectiveRect(ctx, ctx.clamp);
+                const uint32_t wms = ctx.clamp & 3u, wmt = (ctx.clamp >> 2) & 3u;
+                if (wms == 2u && wmt == 2u)
+                {
+                    auto up = m_uploads.find(tex.tbp0);
+                    if (up != m_uploads.end() && up->second.psm == tex.psm && up->second.width && up->second.height &&
+                        rect.x + rect.w <= up->second.width && rect.y + rect.h <= up->second.height &&
+                        (rect.w != up->second.width || rect.h != up->second.height || rect.x || rect.y))
+                    {
+                        uint32_t first, last;
+                        pageRange(tex.tbp0, tex.tbw, tex.psm, 0, 0, up->second.width, up->second.height, first, last);
+                        if (!findTargetForPages(first, last))
+                        {
+                            // REGION_CLAMP over the whole upload: MINU/MINV 0, MAXU/MAXV its last texel.
+                            const uint64_t whole = 2u | (2u << 2) | (static_cast<uint64_t>((up->second.width - 1u) & 0x3FFu) << 14) |
+                                                   (static_cast<uint64_t>((up->second.height - 1u) & 0x3FFu) << 34);
+                            rect = effectiveRect(ctx, whole);
+                        }
+                    }
+                }
+                if (!rect.w || !rect.h)
+                    return;
+
+                // Stable key: the description without the palette's colours (Road Trip reloads
+                // palettes every frame, and a fade keeps it); the cache key adds contents and palette.
+                uint64_t stable = mix(0x7E57AB1Eull, tex.tbp0 | (static_cast<uint64_t>(tex.tbw) << 14) |
+                                                     (static_cast<uint64_t>(tex.psm) << 20) | (static_cast<uint64_t>(tex.cpsm) << 26) |
+                                                     (static_cast<uint64_t>(tex.cbp) << 32) | (static_cast<uint64_t>(tex.csa) << 46) |
+                                                     (static_cast<uint64_t>(tex.csm) << 51));
+                stable = mix(stable, rect.x | (rect.y << 10) | (static_cast<uint64_t>(rect.w) << 20) | (static_cast<uint64_t>(rect.h) << 32));
+                stable = mix(stable, b.state.texa.ta0 | (b.state.texa.aem << 8) | (b.state.texa.ta1 << 16));
+                uint64_t key = stable;
+                uint32_t first, last;
+                pageRange(tex.tbp0, tex.tbw, tex.psm, rect.x, rect.y, rect.w, rect.h, first, last);
+                for (uint32_t p = first; p <= last && p < first + kPages; ++p)
+                    key = mix(key, (static_cast<uint64_t>(p) << 32) | m_pageVersion[p % kPages]);
+                if (isIndexed(tex.psm))
+                {
+                    const uint32_t n = isFourBit(tex.psm) ? 16u : 256u;
+                    for (uint32_t i = 0; i < n; ++i)
+                        key = mix(key, clutColor(b.state, i));
+                }
+
+                if (m_resubmit.exchange(false))
+                    m_submitted.clear();
+                if (m_submitted.insert(key).second)
+                {
+                    std::vector<uint8_t> rgba(static_cast<size_t>(rect.w) * rect.h * 4u);
+                    uint32_t *out = reinterpret_cast<uint32_t *>(rgba.data());
+                    for (uint32_t y = 0; y < rect.h; ++y)
+                        for (uint32_t x = 0; x < rect.w; ++x)
+                            out[static_cast<size_t>(y) * rect.w + x] = texel(b.state, tex.psm, tex.tbp0, tex.tbw, rect.x + x, rect.y + y);
+                    m_packs.submit(key, stable, rect.w, rect.h, tex.psm, std::move(rgba));
+                }
+
+                HwTexturePacks::Bound bound = m_packs.lookup(key, stable);
+                if (!bound.image)
+                    return;
+                b.replacement = std::move(bound.image);
+                b.rect[0] = static_cast<float>(rect.x);
+                b.rect[1] = static_cast<float>(rect.y);
+                b.rect[2] = static_cast<float>(rect.w);
+                b.rect[3] = static_cast<float>(rect.h);
+                b.recolor = bound.recolor;
+                if (bound.recolor)
+                    std::copy(std::begin(bound.transform), std::end(bound.transform), b.recolorMap);
             }
 
             // ---------------------------------------------------------------- CLUT and textures
@@ -1053,6 +1238,35 @@ namespace ps2x::gs
                 return *s;
             }
 
+            // Texture-pack images: trilinear with the anisotropy setting, each axis clamped or repeated.
+            const Vulkan::Sampler &anisoSampler(bool clampU, bool clampV)
+            {
+                const uint32_t level = m_anisotropy.load();
+                if (level != m_samplerAnisotropy)
+                {
+                    for (auto &s : m_anisoSamplers)
+                        s.reset();
+                    m_samplerAnisotropy = level;
+                }
+                auto &s = m_anisoSamplers[clampU | (clampV << 1)];
+                if (!s)
+                {
+                    Vulkan::SamplerCreateInfo info = {};
+                    info.mag_filter = VK_FILTER_LINEAR;
+                    info.min_filter = VK_FILTER_LINEAR;
+                    info.mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+                    info.address_mode_u = clampU ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                    info.address_mode_v = clampV ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                    info.address_mode_w = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                    const float maxAniso = m_dev->get_gpu_properties().limits.maxSamplerAnisotropy;
+                    info.anisotropy_enable = level > 1u && m_dev->get_device_features().enabled_features.samplerAnisotropy;
+                    info.max_anisotropy = std::min(static_cast<float>(level), maxAniso);
+                    info.max_lod = VK_LOD_CLAMP_NONE;
+                    s = m_dev->create_sampler(info);
+                }
+                return *s;
+            }
+
             // PS2 blending (A - B) * C / 128 + D as Vulkan fixed-function blend. Returns false when
             // it can't be expressed (logged).
             static bool blendFactors(uint64_t alpha, VkBlendFactor &src, VkBlendFactor &dst, VkBlendOp &op)
@@ -1191,6 +1405,13 @@ namespace ps2x::gs
                                 ct24Target = ctx.tex0.psm == GS_PSM_CT24;
                             }
                         }
+                        else if (b.replacement)
+                        {
+                            // A pack image stands for the texture's rect at any size.
+                            texView = &b.replacement->get_view();
+                            extentW = b.rect[2];
+                            extentH = b.rect[3];
+                        }
                         else if (b.texture)
                         {
                             texView = &b.texture->get_view();
@@ -1314,7 +1535,7 @@ namespace ps2x::gs
                         if (linear)
                             flags |= F_LINEAR;
                         const uint32_t mxl = (tex1 >> 2) & 7u;
-                        if (mxl > 0 && b.texture && b.texture->get_create_info().levels > 1)
+                        if (mxl > 0 && !b.replacement && b.texture && b.texture->get_create_info().levels > 1)
                             flags |= F_MIP;
                         if (b.fromTarget)
                             flags |= F_REPEAT_IN_SHADER;
@@ -1335,10 +1556,23 @@ namespace ps2x::gs
                         p.lod[3] = static_cast<float>(tex1 & 1u);
                         p.texOffset[0] = b.texOffsetX;
                         p.texOffset[1] = b.texOffsetY;
-                        // Decoded textures and REPEAT: the sampler wraps; everything else clamps.
-                        const bool repeatU = !b.fromTarget && wrapS == 0u, repeatV = !b.fromTarget && wrapT == 0u;
-                        cmd.set_texture(0, 0, *texView,
-                                        sampler(mmag, mmin == 1u || mmin >= 4u, mmin == 3u || mmin == 5u, repeatU, repeatV));
+                        if (b.replacement)
+                        {
+                            // Trilinear/anisotropic over the pack image's mips, clamped axes to the edge.
+                            flags |= F_REPLACED | (b.recolor ? F_RECOLOR : 0u);
+                            p.texOffset[0] = -b.rect[0];
+                            p.texOffset[1] = -b.rect[1];
+                            cmd.set_texture(0, 0, *texView, anisoSampler(wrapS == 1u || wrapS == 2u, wrapT == 1u || wrapT == 2u));
+                            if (b.recolor)
+                                std::memcpy(cmd.allocate_constant_data(0, 2, sizeof(b.recolorMap)), b.recolorMap, sizeof(b.recolorMap));
+                        }
+                        else
+                        {
+                            // Decoded textures and REPEAT: the sampler wraps; everything else clamps.
+                            const bool repeatU = !b.fromTarget && wrapS == 0u, repeatV = !b.fromTarget && wrapT == 0u;
+                            cmd.set_texture(0, 0, *texView,
+                                            sampler(mmag, mmin == 1u || mmin >= 4u, mmin == 3u || mmin == 5u, repeatU, repeatV));
+                        }
                     }
                     else
                         cmd.set_texture(0, 0, *texView, sampler(false, false, false, false, false));
@@ -1361,6 +1595,8 @@ namespace ps2x::gs
                     if (date)
                         p.mode[0] |= F_DATE | (((test >> 15) & 1u) ? F_DATM : 0u);
                     cmd.set_texture(0, 1, *destView, sampler(false, false, false, false, false));
+                    if (!(flags & F_RECOLOR))
+                        cmd.set_uniform_buffer(0, 2, *m_noRecolor);
                     if (ctx.fba & 1u)
                         unsupported("FBA");
 
@@ -1559,6 +1795,19 @@ namespace ps2x::gs
                 uint64_t lastUse = 0;
             };
             std::unordered_map<uint64_t, CachedTexture> m_textures;
+            // Texture dumps and packs.
+            HwTexturePacks m_packs;
+            struct UploadExtent
+            {
+                uint32_t psm = 0, width = 0, height = 0;
+            };
+            std::unordered_map<uint32_t, UploadExtent> m_uploads; // GS thread: uploads by base address
+            std::unordered_set<uint64_t> m_submitted;             // GS thread: textures handed to the tools
+            std::atomic<bool> m_resubmit{false};
+            std::atomic<uint32_t> m_anisotropy{16};
+            uint32_t m_samplerAnisotropy = 0; // recording: the level m_anisoSamplers were made for
+            Vulkan::SamplerHandle m_anisoSamplers[4];
+            Vulkan::BufferHandle m_noRecolor;
             std::atomic<uint64_t> m_frame{0};
             // RT_HWGS_STATS=1: per-frame counts, logged every 120 presents.
             struct Stats
