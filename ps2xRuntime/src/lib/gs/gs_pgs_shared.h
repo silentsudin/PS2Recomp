@@ -45,6 +45,10 @@ namespace ps2x::gs
         uint64_t shadowSerial[3] = {};
         // A paraLLEl-GS backend renders on this device (otherwise the CPU GS: pictures are uploaded).
         bool attached = false;
+        // How many scanout images the backend cycles through (0 = unknown): with 3 or more, a
+        // picture stays untouched for two more presents, so the presenter can keep it as history
+        // instead of copying it.
+        uint32_t scanoutRing = 0;
         // Submits the GS's open command buffers (with `mutex` held). A frame context only advances
         // once every command buffer requested in it is submitted, so the presenter calls this
         // before starting a swapchain frame.

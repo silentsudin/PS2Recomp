@@ -286,8 +286,10 @@ namespace ps2x::gs
                 m_uiComposite = post(post_spirv::ui_composite_frag, sizeof(post_spirv::ui_composite_frag), 0, 0x1, 0x7);
                 m_frameGen = post(post_spirv::frame_gen_frag, sizeof(post_spirv::frame_gen_frag), 32, 0x1, 0xF);
                 m_copy = post(post_spirv::copy_frag, sizeof(post_spirv::copy_frag), 0, 0x1);
-                m_flicker = post(post_spirv::flicker_frag, sizeof(post_spirv::flicker_frag), 8, 0x1, 0xF);
-                m_flickerCut = post(post_spirv::flicker_cut_frag, sizeof(post_spirv::flicker_cut_frag), 0, 0x1, 0x3);
+                m_flicker = post(post_spirv::flicker_frag, sizeof(post_spirv::flicker_frag), 0, 0x1, 0x7);
+                m_flickerWeight = post(post_spirv::flicker_weight_frag, sizeof(post_spirv::flicker_weight_frag), 8, 0x1, 0xF);
+                m_flickerGrid = post(post_spirv::flicker_grid_frag, sizeof(post_spirv::flicker_grid_frag), 0, 0x1, 0x3);
+                m_flickerCut = post(post_spirv::flicker_cut_frag, sizeof(post_spirv::flicker_cut_frag), 0, 0x0, 0x1);
                 if (const char *e = std::getenv("RT_SHOW_MOTION"); e && *e == '1')
                 {
                     m_showMotion = true;
@@ -848,7 +850,12 @@ namespace ps2x::gs
             {
                 m_flickerOut.reset();
                 const Vulkan::ImageHandle &raw = m_shared.attached ? m_shared.scanout : m_cpuFrame;
-                if (!raw || !m_progressiveFields || m_showMotion || m_showDepth)
+                // RT_FLICKER=0: no flicker blending (A/B measurements).
+                static const bool flickerOff = [] {
+                    const char *e = std::getenv("RT_FLICKER");
+                    return e && *e == '0';
+                }();
+                if (!raw || !m_progressiveFields || m_showMotion || m_showDepth || flickerOff)
                 {
                     m_flickerValid = 0;
                     return;
@@ -860,20 +867,38 @@ namespace ps2x::gs
                                         before->get_height() == h;
                 if (valid)
                 {
-                    const PassInput cutIn[2] = {{raw.get(), Vulkan::StockSampler::NearestClamp},
-                                                {prev.get(), Vulkan::StockSampler::NearestClamp}};
-                    offscreenPass(cmd, m_flickerCutImage, 1, 1, m_flickerCut, cutIn, 2, nullptr, 0, false);
-                    const float rcp[2] = {1.0f / static_cast<float>(w), 1.0f / static_cast<float>(h)};
-                    const PassInput in[4] = {{raw.get(), Vulkan::StockSampler::NearestClamp},
+                    // The cut: a 32x32 grid of drastic changes, then its share (no 2048 scattered reads
+                    // in one pixel).
+                    const PassInput gridIn[2] = {{raw.get(), Vulkan::StockSampler::NearestClamp},
+                                                 {prev.get(), Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(cmd, m_flickerGridImage, 32, 32, m_flickerGrid, gridIn, 2, nullptr, 0, false);
+                    const PassInput cutIn[1] = {{m_flickerGridImage.get(), Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(cmd, m_flickerCutImage, 1, 1, m_flickerCut, cutIn, 1, nullptr, 0, false);
+                    // The weight at the game's resolution (a supersampled picture is 2x or 4x it), then
+                    // the blend at full resolution.
+                    const uint32_t ds = std::max(1u, w / 640u);
+                    const uint32_t lw = std::max(1u, w / ds), lh = std::max(1u, h / ds);
+                    const float rcp[2] = {1.0f / static_cast<float>(lw), 1.0f / static_cast<float>(lh)};
+                    const PassInput weightIn[4] = {{raw.get(), Vulkan::StockSampler::NearestClamp},
+                                                   {prev.get(), Vulkan::StockSampler::NearestClamp},
+                                                   {haveBefore ? before.get() : prev.get(), Vulkan::StockSampler::NearestClamp},
+                                                   {m_flickerCutImage.get(), Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(cmd, m_flickerWeightImage, lw, lh, m_flickerWeight, weightIn, 4, rcp, sizeof(rcp), false,
+                                  VK_FORMAT_R8_UNORM);
+                    const PassInput in[3] = {{raw.get(), Vulkan::StockSampler::NearestClamp},
                                              {prev.get(), Vulkan::StockSampler::NearestClamp},
-                                             {haveBefore ? before.get() : prev.get(), Vulkan::StockSampler::NearestClamp},
-                                             {m_flickerCutImage.get(), Vulkan::StockSampler::NearestClamp}};
-                    offscreenPass(cmd, m_flickerImage, w, h, m_flicker, in, 4, rcp, sizeof(rcp), false);
+                                             {m_flickerWeightImage.get(), Vulkan::StockSampler::LinearClamp}};
+                    offscreenPass(cmd, m_flickerImage, w, h, m_flicker, in, 3, nullptr, 0, false);
                 }
                 // The raw picture becomes "previous"; the old previous becomes "before last".
                 m_flickerIndex ^= 1u;
-                const PassInput copyIn[1] = {{raw.get(), Vulkan::StockSampler::NearestClamp}};
-                offscreenPass(cmd, m_flickerHist[m_flickerIndex], w, h, m_copy, copyIn, 1, nullptr, 0, false);
+                if (m_shared.scanoutRing >= 3u && m_shared.attached)
+                    m_flickerHist[m_flickerIndex] = raw; // a ring of 3+: kept as it is until overwritten
+                else
+                {
+                    const PassInput copyIn[1] = {{raw.get(), Vulkan::StockSampler::NearestClamp}};
+                    offscreenPass(cmd, m_flickerHist[m_flickerIndex], w, h, m_copy, copyIn, 1, nullptr, 0, false);
+                }
                 m_flickerValid = std::min(m_flickerValid + 1u, 2u);
                 if (valid)
                     m_flickerOut = m_flickerImage;
@@ -1468,8 +1493,9 @@ namespace ps2x::gs
             bool m_temporalValid = false;
             Vulkan::ImageHandle m_taaShadowImage;
             // Interlace flicker blending.
-            Vulkan::Program *m_flicker = nullptr, *m_flickerCut = nullptr;
-            Vulkan::ImageHandle m_flickerHist[2], m_flickerImage, m_flickerOut, m_flickerCutImage;
+            Vulkan::Program *m_flicker = nullptr, *m_flickerCut = nullptr, *m_flickerGrid = nullptr, *m_flickerWeight = nullptr;
+            Vulkan::ImageHandle m_flickerHist[2], m_flickerImage, m_flickerOut, m_flickerCutImage, m_flickerGridImage,
+                m_flickerWeightImage;
             uint32_t m_flickerIndex = 0, m_flickerValid = 0;
             // Frame generation.
             FrameGeneration m_fg;
