@@ -1372,7 +1372,12 @@ namespace ps2x::gs
             std::unordered_map<uint32_t, Vulkan::SamplerHandle> m_samplers;
             std::atomic<uint32_t> m_scale{2};
             std::atomic<bool> m_rescale{false};
-            std::atomic<uint32_t> m_yScale{2};
+            // Progressive fields (the default) until the first Present says otherwise; RT_PROGRESSIVE_FIELDS=0
+            // (the regression harness) says so before any target is made.
+            std::atomic<uint32_t> m_yScale{[] {
+                const char *pf = std::getenv("RT_PROGRESSIVE_FIELDS");
+                return pf && std::strcmp(pf, "0") == 0 ? 1u : 2u;
+            }()};
 
             GSCpuBackend m_cpu; // transfers and readbacks over the shared local memory
             uint8_t *m_vram = nullptr;
