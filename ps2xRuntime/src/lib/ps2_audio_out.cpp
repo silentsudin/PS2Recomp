@@ -1,4 +1,5 @@
 #include "ps2_audio_out.h"
+#include "runtime/ps2_audio_suspend.h"
 #include "runtime/ps2_test_harness.h"
 
 #include "raylib.h"
@@ -90,5 +91,31 @@ void ps2AudioOutSubmit(const int16_t *interleavedStereo, size_t frames)
         g_ring[g_write * 2 + 1] = interleavedStereo[i * 2 + 1];
         g_write = (g_write + 1) % kCapacityFrames;
         ++g_count;
+    }
+}
+
+void ps2AudioOutSuspend(bool suspend)
+{
+    static std::mutex m;
+    static int depth = 0;
+    static bool wasStarted = false;
+    std::lock_guard<std::mutex> lock(m);
+    if (suspend)
+    {
+        if (depth++ > 0)
+            return;
+        wasStarted = g_started.load();
+        ps2AudioOutStop();
+        if (IsAudioDeviceReady())
+            CloseAudioDevice();
+    }
+    else
+    {
+        if (depth == 0 || --depth > 0)
+            return;
+        if (!wasStarted)
+            return;
+        InitAudioDevice();
+        ps2AudioOutStart();
     }
 }

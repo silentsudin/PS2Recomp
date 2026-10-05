@@ -118,6 +118,8 @@ else()
         GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
         GIT_TAG "${PS2X_RAYLIB_TAG}"
         GIT_PROGRESS TRUE
+        PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_raylib_audio.cmake"
+        UPDATE_DISCONNECTED TRUE
     )
     FetchContent_MakeAvailable(raylib)
 
