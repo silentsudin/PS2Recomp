@@ -188,6 +188,8 @@ namespace ps2x::gs
 
             bool open(const char *title, int width, int height) override
             {
+                if (m_window)
+                    return true; // opened early (the app's setup screen), now handed to the runtime
                 if (!SDL_InitSubSystem(SDL_INIT_VIDEO))
                     return fail("SDL video", SDL_GetError());
                 if (!SDL_Vulkan_LoadLibrary(m_options.vulkanLibrary.empty() ? nullptr : m_options.vulkanLibrary.c_str()))
@@ -372,6 +374,8 @@ namespace ps2x::gs
             void uiInit() override
             {
 #if defined(PS2X_PGS_PRESENTER_UI)
+                if (m_ui)
+                    return; // already (the setup screen)
                 if (!ImGui::GetCurrentContext())
                     ImGui::CreateContext();
                 ImGui_ImplSDL3_InitForVulkan(m_window);
@@ -428,6 +432,16 @@ namespace ps2x::gs
                     drawUi();
                 waitForDrawable();
                 render();
+            }
+
+            void frameUi(const std::function<void()> &drawUi) override
+            {
+                pumpEvents();
+                m_uiFrame = false;
+                if (drawUi)
+                    drawUi();
+                waitForDrawable();
+                render(); // no GS yet: a black picture under the UI
             }
 
         private:

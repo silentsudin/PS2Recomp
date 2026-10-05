@@ -42,6 +42,9 @@ namespace ps2x
         // One host frame: the newest GS picture (latched when the guest has shown a new one, or a
         // test capture is pending), then drawUi(), then present.
         virtual void frame(PS2Runtime &runtime, const std::function<void()> &drawUi) = 0;
+        // A frame with only the UI (no runtime yet: the app's first-run setup screen). After open()
+        // and uiInit(); presenters that can't do it ignore it.
+        virtual void frameUi(const std::function<void()> &drawUi) { (void)drawUi; }
 
         // Widescreen: the picture's shape on screen (4:3 by default). Frames the GS marks as
         // 2D-backed (title, menus; GS::lastFrameWas2D) are still shown 4:3, pillarboxed.
