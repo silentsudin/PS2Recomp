@@ -36,6 +36,11 @@ struct VU1State
     uint32_t branchDelay;
 };
 
+// The FMAC's exact result (for overflow/underflow flags) in double: a float product is exact in
+// it. Not long double, which is quad precision in software on Linux/Android arm64 (a fifth of the
+// VU1 thread on the Thor); on Apple arm64 long double is double, so results are unchanged there.
+using VuExact = double;
+
 class VU1Interpreter
 {
 public:
@@ -304,8 +309,8 @@ private:
     void applyFmacDestAcc(float *result, uint8_t dest, uint32_t upper);
     void normalizeFmacValue(float *result, uint8_t dest, uint32_t upper);
     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4], uint32_t upper);
-    bool calculateFmacExactResult(uint32_t component, long double &result, uint32_t upper) const;
-    uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
+    bool calculateFmacExactResult(uint32_t component, VuExact &result, uint32_t upper) const;
+    uint8_t normalizeFmacExactResult(float &value, VuExact exactResult) const;
     uint32_t calculateFmacProductSticky(uint8_t dest, uint32_t upper) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);

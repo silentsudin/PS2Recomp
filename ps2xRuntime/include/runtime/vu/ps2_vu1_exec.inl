@@ -263,7 +263,7 @@ inline __attribute__((always_inline)) void VU1Interpreter::normalizeFmacValue(fl
         const uint32_t exponent = (bits >> 23) & 0xFFu;
         if (__builtin_expect(exponent != 0u && exponent < 0xFEu, 1))
             continue;
-        long double exactResult = 0.0L;
+        VuExact exactResult = 0.0;
         if (calculateFmacExactResult(component, exactResult, upper))
             (void)normalizeFmacExactResult(result[component], exactResult);
         else
@@ -280,7 +280,7 @@ inline __attribute__((always_inline)) float VU1Interpreter::broadcast(const floa
 }
 
 inline __attribute__((always_inline)) bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
-                                               long double &result, uint32_t upper) const
+                                               VuExact &result, uint32_t upper) const
 {
     const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
     const uint8_t special = op >= 0x3Cu
@@ -291,7 +291,7 @@ inline __attribute__((always_inline)) bool VU1Interpreter::calculateFmacExactRes
 
     const auto operand = [this](float value)
     {
-        return static_cast<long double>(normalizeOperand(value));
+        return static_cast<VuExact>(normalizeOperand(value));
     };
     const auto vs = [&](uint32_t lane)
     {
@@ -306,8 +306,8 @@ inline __attribute__((always_inline)) bool VU1Interpreter::calculateFmacExactRes
         return operand(m_state.acc[lane]);
     };
 
-    const long double q = operand(m_state.q);
-    const long double i = operand(m_state.i);
+    const VuExact q = operand(m_state.q);
+    const VuExact i = operand(m_state.i);
 
     if (op < 0x3Cu)
     {
@@ -375,7 +375,7 @@ inline __attribute__((always_inline)) bool VU1Interpreter::calculateFmacExactRes
                 static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
                 static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
                 result = component == 3u
-                             ? 0.0L
+                             ? 0.0
                              : acc(component) - vs(left[component]) * vt(right[component]);
                 break;
             }
@@ -450,7 +450,7 @@ inline __attribute__((always_inline)) bool VU1Interpreter::calculateFmacExactRes
             static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
             static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
             result = component == 3u
-                         ? 0.0L
+                         ? 0.0
                          : vs(left[component]) * vt(right[component]);
             break;
         }
@@ -509,7 +509,7 @@ inline __attribute__((always_inline)) uint32_t VU1Interpreter::calculateFmacProd
         }
 
         float product = left * right;
-        const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
+        const VuExact exactProduct = static_cast<VuExact>(left) * static_cast<VuExact>(right);
         const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
         // Product-sum instructions report Z/S/U/O from the add/subtract result
         // as current flags, while every product condition accumulates into the
@@ -520,16 +520,16 @@ inline __attribute__((always_inline)) uint32_t VU1Interpreter::calculateFmacProd
 }
 
 inline __attribute__((always_inline)) uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
-                                                  long double exactResult) const
+                                                  VuExact exactResult) const
 {
     const bool negative = std::signbit(exactResult);
-    const long double magnitude = std::fabs(exactResult);
-    const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
-    const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
+    const VuExact magnitude = std::fabs(exactResult);
+    const VuExact maximum = static_cast<VuExact>(std::numeric_limits<float>::max());
+    const VuExact minimum = static_cast<VuExact>(std::numeric_limits<float>::min());
     uint8_t flags = negative ? 0x2u : 0u;
 
     uint32_t bits = negative ? 0x80000000u : 0u;
-    if (magnitude == 0.0L)
+    if (magnitude == 0.0)
     {
         flags |= 0x1u;
         std::memcpy(&value, &bits, sizeof(value));
@@ -558,7 +558,7 @@ inline __attribute__((always_inline)) void VU1Interpreter::normalizeFmacResult(f
         if ((dest & laneForComponent(component)) == 0u)
             continue;
 
-        long double exactResult = 0.0L;
+        VuExact exactResult = 0.0;
         if (calculateFmacExactResult(component, exactResult, upper))
         {
             laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
