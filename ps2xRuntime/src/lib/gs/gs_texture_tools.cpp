@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <unistd.h>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -169,7 +170,11 @@ namespace ps2x::gs
                               job.height, job.psm);
                 Image image = {png.data(), static_cast<int>(job.width), static_cast<int>(job.height), 1,
                                PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-                ExportImage(image, (std::filesystem::path(dumpDir) / name).string().c_str());
+                // Under another name, then renamed: several games may dump into one folder.
+                const std::string path = (std::filesystem::path(dumpDir) / name).string();
+                const std::string part = path + "." + std::to_string(getpid()) + ".part.png";
+                if (ExportImage(image, part.c_str()))
+                    std::rename(part.c_str(), path.c_str());
             }
             bool packActive;
             {
