@@ -11,6 +11,7 @@
 #include "thread_id.hpp"
 #include "gs_pgs_shared.h"
 #include "ThreadNaming.h"
+#include "gs_texture_tools.h"
 
 #include <algorithm>
 #include <atomic>
@@ -21,6 +22,8 @@
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace ps2x::gs
 {
@@ -195,6 +198,22 @@ namespace ps2x::gs
 
             uint32_t superSampling() const override { return m_samples; }
 
+            void setTextures(const std::string &dumpDir, const std::string &packDir) override
+            {
+                m_textures.configure(dumpDir, packDir);
+                const auto lock = lockDevice();
+                m_iface.set_texture_readback(m_textures.active());
+            }
+
+            void setAnisotropy(uint32_t level) override
+            {
+                const auto lock = lockDevice();
+                m_iface.set_anisotropy(level);
+                for (auto &shadow : m_shadowIf)
+                    if (shadow)
+                        shadow->set_anisotropy(level);
+            }
+
             void setSharpTextures(bool on) override
             {
                 const auto lock = lockDevice();
@@ -241,6 +260,7 @@ namespace ps2x::gs
                 m_iface.gif_transfer(pathIndex, data, sizeBytes);
                 m_iface.set_vertex_motion(nullptr, 0);
                 recordShadowGifLocked(pathIndex, data, sizeBytes);
+                textureToolsIdleLocked();
             }
 
             void MirrorGifPacket(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes) override
@@ -251,6 +271,7 @@ namespace ps2x::gs
                 m_iface.gif_transfer(pathIndex, data, sizeBytes);
                 m_gpuVramNewer = true;
                 recordShadowGifLocked(pathIndex, data, sizeBytes);
+                textureToolsIdleLocked();
             }
 
             uint32_t ShadowFrames() const override { return m_shadowCount; }
@@ -434,6 +455,7 @@ namespace ps2x::gs
                         // After the real frame's work: its shadows (re-rendered frames).
                         presentShadowsLocked(priv, vsync);
                     }
+                    textureToolsLocked();
                     if (scanout.image)
                     {
                         w = scanout.image->get_width();
@@ -749,6 +771,89 @@ namespace ps2x::gs
                 }
             }
 
+            // Texture dumps and packs: hand finished readbacks to the worker; apply replacements.
+            // Without presentation (headless), vsync runs only when a picture is asked for: the
+            // texture tools are then serviced from the GIF path once no vsync has for 50 ms.
+            void textureToolsIdleLocked()
+            {
+                if (!m_textures.active())
+                    return;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - m_texturesServiced < std::chrono::milliseconds(50))
+                    return;
+                m_iface.flush();
+                m_iface.close_texture_readbacks();
+                textureToolsLocked();
+            }
+
+            void textureToolsLocked()
+            {
+                if (!m_textures.active())
+                    return;
+                m_texturesServiced = std::chrono::steady_clock::now();
+                m_readbacks.clear();
+                m_iface.collect_texture_readbacks(m_readbacks);
+                for (auto &rb : m_readbacks)
+                {
+                    const size_t size = size_t(rb.width) * rb.height * 4;
+                    const auto *src = static_cast<const uint8_t *>(m_dev->map_host_buffer(*rb.buffer, Vulkan::MEMORY_ACCESS_READ_BIT));
+                    if (!src)
+                        continue;
+                    std::vector<uint8_t> rgba(src, src + size);
+                    m_dev->unmap_host_buffer(*rb.buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
+                    m_textures.submit(rb.hash, rb.stable, rb.width, rb.height, rb.psm, std::move(rgba));
+                }
+                m_replacements.clear();
+                m_textures.collect(m_replacements);
+                for (auto &r : m_replacements)
+                {
+                    if (!r.hit)
+                    {
+                        // This description now decodes to something else: stop predicting it.
+                        if (m_predicted.erase(r.stableKey))
+                        {
+                            m_iface.set_texture_prediction(r.stableKey, {});
+                            for (auto &shadow : m_shadowIf)
+                                if (shadow)
+                                    shadow->set_texture_prediction(r.stableKey, {});
+                        }
+                        continue;
+                    }
+                    Vulkan::ImageHandle &image = m_hdImages[r.contentKey];
+                    if (!image && !r.rgba.empty())
+                    {
+                        // Sampled only (no storage usage): paraLLEl-GS recognises it as a
+                        // replacement and keeps it out of its image pool. A full mip chain, for
+                        // trilinear/anisotropic sampling.
+                        auto info = Vulkan::ImageCreateInfo::immutable_2d_image(r.width, r.height, VK_FORMAT_R8G8B8A8_UNORM, true);
+                        Vulkan::ImageInitialData init = {r.rgba.data(), 0, 0};
+                        image = m_dev->create_image(info, &init);
+                    }
+                    if (!image)
+                        continue;
+                    // From now on every decode of this description binds the replacement (textures
+                    // whose palette is reloaded every frame get a new cache key every frame).
+                    m_iface.replace_cached_texture(r.cacheKey, image);
+                    m_iface.set_texture_prediction(r.stableKey, image);
+                    for (auto &shadow : m_shadowIf)
+                        if (shadow)
+                            shadow->set_texture_prediction(r.stableKey, image);
+                    m_predicted.insert(r.stableKey);
+                    m_shadowReplacements[r.cacheKey] = {image, 120u};
+                }
+                // Shadow GS instances decode a frame later: keep trying for two seconds.
+                for (auto it = m_shadowReplacements.begin(); it != m_shadowReplacements.end();)
+                {
+                    for (auto &shadow : m_shadowIf)
+                        if (shadow)
+                            shadow->replace_cached_texture(it->first, it->second.first);
+                    if (--it->second.second == 0)
+                        it = m_shadowReplacements.erase(it);
+                    else
+                        ++it;
+                }
+            }
+
             void pullVramFromGpu()
             {
                 const auto lock = lockDevice();
@@ -782,6 +887,12 @@ namespace ps2x::gs
             const uint8_t *m_variant[kMaxShadows] = {};
             uint32_t m_variantSize[kMaxShadows] = {};
             uint32_t m_shadowCount = 0;
+            TextureTools m_textures;
+            std::vector<ParallelGS::GSRenderer::TextureReadback> m_readbacks;
+            std::vector<TextureTools::Replacement> m_replacements;
+            std::unordered_map<uint64_t, Vulkan::ImageHandle> m_hdImages; // content key -> replacement image
+            std::unordered_map<uint64_t, std::pair<Vulkan::ImageHandle, uint32_t>> m_shadowReplacements;
+            std::unordered_set<uint64_t> m_predicted; // stable keys with a prediction set
             struct ShadowJob
             {
                 std::vector<uint8_t> stream;
@@ -802,6 +913,7 @@ namespace ps2x::gs
             uint8_t *m_vram = nullptr;
             uint32_t m_vramSize = 0u;
             bool m_gpuVramNewer = false;
+            std::chrono::steady_clock::time_point m_texturesServiced{};
             mutable std::mutex m_mutex;
             std::mutex *m_mtx = &m_mutex;
         };

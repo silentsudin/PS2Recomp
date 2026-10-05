@@ -51,6 +51,10 @@ namespace ps2x::gs
         virtual uint32_t superSampling() const = 0;
         // Always sample the top texture level (sharper textures when supersampling).
         virtual void setSharpTextures(bool on) = 0;
+        // Texture dumps and HD packs (gs_texture_tools.h): empty strings switch them off.
+        virtual void setTextures(const std::string &dumpDir, const std::string &packDir) = 0;
+        // Anisotropic filtering of texture-pack images (1 = trilinear only, up to 16).
+        virtual void setAnisotropy(uint32_t level) = 0;
     };
 
     // Returns nullptr (and fills `error`) if paraLLEl-GS isn't compiled in or Vulkan init fails.

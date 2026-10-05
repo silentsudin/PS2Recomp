@@ -55,6 +55,7 @@
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
+#include <cstdio>
 #include <thread>
 #include <vector>
 
@@ -1433,7 +1434,10 @@ namespace ps2x::gs
                     for (size_t p = 3; p < pixels.size(); p += 4)
                         pixels[p] = 0xFF;
                     Image image = {pixels.data(), static_cast<int>(w), static_cast<int>(h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-                    ExportImage(image, path.c_str());
+                    // Written under another name, then renamed: the file appears complete.
+                    const std::string part = path + ".part.png";
+                    if (ExportImage(image, part.c_str()))
+                        std::rename(part.c_str(), path.c_str());
                 }).detach();
                 m_capturePath.clear();
             }
