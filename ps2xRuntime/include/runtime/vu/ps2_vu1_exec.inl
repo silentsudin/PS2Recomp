@@ -10,6 +10,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>

@@ -19,10 +19,12 @@
 
 #include "runtime/vu/ps2_vu1_native.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -269,17 +271,20 @@ namespace
         return s.str();
     }
 
+    // `out` has the include and an open anonymous namespace. With `split`, each entry (microprogram)
+    // becomes its own function in its own file next to `outPath` (<stem>.part<i>.cpp): one function
+    // holding every program compiled superlinearly slowly (minutes on a phone), and parts compile
+    // in parallel. Nodes reachable from several entries are emitted in each.
     bool emitLean(std::ofstream &out, const std::vector<Node> &nodes, const std::vector<uint32_t> &entries,
                   const std::vector<size_t> &entryNodes, const std::vector<uint8_t> &image, const VU1Interpreter &base,
                   const std::set<uint32_t> &flagsLive, const std::map<uint32_t, bool> &pcsUsed,
-                  const std::vector<bool> &loopHead, bool exact)
+                  const std::vector<bool> &loopHead, bool exact, bool split, const std::string &outPath)
     {
         const std::string fast = exact ? "false" : "true";
         // One function per instruction pair: its upper and lower operations on constant words
         // (timing, Q/P landing, branches and XGKICK are per node).
-        for (const auto &[pc, used] : pcsUsed)
+        auto pairFn = [&](std::ostream &out, uint32_t pc)
         {
-            (void)used;
             const auto p = Vu1Native::decode(base, image.data(), pc);
             const LowerKind lk = lowerKind(p);
             const bool flags = flagsLive.count(pc) != 0u;
@@ -365,12 +370,13 @@ namespace
             if (mayWriteZeroRegs(p))
                 out << "        s.vf[0][0] = 0.0f; s.vf[0][1] = 0.0f; s.vf[0][2] = 0.0f; s.vf[0][3] = 1.0f; s.vi[0] = 0;\n";
             out << "    }\n";
-        }
+        };
 
         // Static timing per node, for deopts.
         std::map<std::vector<std::pair<uint8_t, uint8_t>>, uint32_t> timingOffsets;
         std::vector<uint8_t> timingBytes;
-        out << "    const Vu1Native::LeanNode kLeanNodes[] = {\n";
+        std::ostringstream tables;
+        tables << "namespace vu1gen\n{\n    extern const Vu1Native::LeanNode kLeanNodes[] = {\n";
         for (const Node &n : nodes)
         {
             auto it = timingOffsets.find(n.entry.timing);
@@ -384,32 +390,24 @@ namespace
                 }
             }
             const auto &e = n.entry.node;
-            out << "        {" << hx(e.pc) << ", " << hx(e.branchTarget) << ", " << int(e.flags) << ", " << int(e.branchDelay) << ", "
+            tables << "        {" << hx(e.pc) << ", " << hx(e.branchTarget) << ", " << int(e.flags) << ", " << int(e.branchDelay) << ", "
                 << int(e.backupReg) << ", " << int(e.fdivRel) << ", {" << int(e.efuRel[0]) << ", " << int(e.efuRel[1]) << "}, "
                 << int(e.efuResRel) << ", " << n.entry.timing.size() << ", " << it->second << "},\n";
         }
-        out << "    };\n    const uint8_t kLeanTiming[] = {";
+        tables << "    };\n    extern const uint8_t kLeanTiming[] = {";
         for (size_t i = 0; i < timingBytes.size(); ++i)
-            out << (i % 32 == 0 ? "\n        " : "") << int(timingBytes[i]) << ",";
-        out << "0};\n}\n\n";
-
-        out << "extern \"C\" __attribute__((visibility(\"default\"))) int rt_vu1_native_execute(\n"
-            << "    VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory,\n"
-            << "    uint32_t startPC, uint32_t top, uint32_t itop, uint32_t maxCycles)\n{\n"
-            << "    switch (startPC)\n    {\n";
-        for (uint32_t e : entries)
-            out << "    case " << hx(e) << ":\n        break;\n";
-        out << "    default:\n        return Vu1Native::NotHandled;\n    }\n"
-            << "    if (dataSize != 0x4000u || codeSize != 0x4000u)\n        return Vu1Native::NotHandled;\n"
-            << "    Vu1Native::Frame f = Vu1Native::beginExecute(vu, codeSize, vuData, dataSize, gs, memory, startPC, top, itop, maxCycles, "
-            << fast << ");\n"
-            << "    Vu1Native::LeanCtx c;\n    Vu1Native::leanBegin(vu, c);\n"
-            << "    VU1State &s = Vu1Native::state(vu);\n    uint8_t *const mem = vuData;\n"
-            << "    uint64_t cyc = Vu1Native::cycle(vu);\n    uint32_t dn = 0;\n    int dr = 0;\n"
-            << "    switch (startPC)\n    {\n";
-        for (size_t i = 0; i < entries.size(); ++i)
-            out << "    case " << hx(entries[i]) << ":\n        goto N" << entryNodes[i] << ";\n";
-        out << "    default:\n        return Vu1Native::NotHandled;\n    }\n\n";
+            tables << (i % 32 == 0 ? "\n        " : "") << int(timingBytes[i]) << ",";
+        tables << "0};\n}\n\n";
+        const char *tableDecls = "namespace vu1gen\n{\n    extern const Vu1Native::LeanNode kLeanNodes[];\n"
+                                 "    extern const uint8_t kLeanTiming[];\n}\n\n";
+        const std::string params = "VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize, GS &gs, "
+                                   "PS2Memory *memory,\n    uint32_t startPC, uint32_t top, uint32_t itop, uint32_t maxCycles";
+        const std::string prologue =
+            "    Vu1Native::Frame f = Vu1Native::beginExecute(vu, codeSize, vuData, dataSize, gs, memory, startPC, top, itop, "
+            "maxCycles, " + fast + ");\n"
+            "    Vu1Native::LeanCtx c;\n    Vu1Native::leanBegin(vu, c);\n"
+            "    VU1State &s = Vu1Native::state(vu);\n    uint8_t *const mem = vuData;\n"
+            "    uint64_t cyc = Vu1Native::cycle(vu);\n    uint32_t dn = 0;\n    int dr = 0;\n";
 
         auto deopt = [&](size_t id, const char *reason, const std::string &indent)
         {
@@ -418,7 +416,10 @@ namespace
               << indent << "    goto deopt;\n" << indent << "}\n";
             return s.str();
         };
-        for (size_t id = 0; id < nodes.size(); ++id)
+        // The nodes in `ids` (closed under successors), as labelled code.
+        auto emitNodes = [&](std::ostream &out, const std::vector<size_t> &ids) -> bool
+        {
+        for (size_t id : ids)
         {
             const Node &n = nodes[id];
             out << "N" << id << ":\n";
@@ -547,8 +548,86 @@ namespace
                 out << "    goto N" << n.succ[0].node << ";\n";
             }
         }
-        out << "deopt:\n    return Vu1Native::leanDeopt(vu, f, c, cyc, kLeanNodes[dn], kLeanTiming, dr, vuCode);\n}\n\n"
-            << "// Final MAC/status may differ from the interpreter where no instruction can read them.\n"
+        out << "deopt:\n    return Vu1Native::leanDeopt(vu, f, c, cyc, vu1gen::kLeanNodes[dn], vu1gen::kLeanTiming, dr, vuCode);\n}\n\n";
+        return true;
+        };
+
+        const char *checks = "    if (dataSize != 0x4000u || codeSize != 0x4000u)\n        return Vu1Native::NotHandled;\n";
+        if (!split)
+        {
+            for (const auto &[pc, used] : pcsUsed)
+                pairFn(out, pc);
+            out << "}\n\n" << tables.str();
+            out << "extern \"C\" __attribute__((visibility(\"default\"))) int rt_vu1_native_execute(\n    " << params << ")\n{\n"
+                << "    switch (startPC)\n    {\n";
+            for (uint32_t e : entries)
+                out << "    case " << hx(e) << ":\n        break;\n";
+            out << "    default:\n        return Vu1Native::NotHandled;\n    }\n" << checks << prologue << "    switch (startPC)\n    {\n";
+            for (size_t i = 0; i < entries.size(); ++i)
+                out << "    case " << hx(entries[i]) << ":\n        goto N" << entryNodes[i] << ";\n";
+            out << "    default:\n        return Vu1Native::NotHandled;\n    }\n\n";
+            std::vector<size_t> all(nodes.size());
+            for (size_t i = 0; i < all.size(); ++i)
+                all[i] = i;
+            if (!emitNodes(out, all))
+                return false;
+        }
+        else
+        {
+            // Each entry's nodes: everything reachable from it (successors, drained variants).
+            const std::filesystem::path base(outPath);
+            for (size_t i = 0; i < entries.size(); ++i)
+            {
+                std::vector<bool> seen(nodes.size(), false);
+                std::vector<size_t> work{entryNodes[i]}, ids;
+                seen[entryNodes[i]] = true;
+                while (!work.empty())
+                {
+                    const size_t id = work.back();
+                    work.pop_back();
+                    ids.push_back(id);
+                    auto visit = [&](size_t next)
+                    {
+                        if (next < nodes.size() && !seen[next])
+                        {
+                            seen[next] = true;
+                            work.push_back(next);
+                        }
+                    };
+                    for (const Edge &e : nodes[id].succ)
+                        visit(e.node);
+                    if (nodes[id].drainedVariant != SIZE_MAX)
+                        visit(nodes[id].drainedVariant);
+                }
+                std::sort(ids.begin(), ids.end());
+                std::set<uint32_t> pcs;
+                for (size_t id : ids)
+                    if (!nodes[id].unsupported)
+                        pcs.insert(nodes[id].pc);
+                const std::filesystem::path partPath =
+                    base.parent_path() / (base.stem().string() + ".part" + std::to_string(i) + base.extension().string());
+                std::ofstream part(partPath);
+                part << "// Generated by ps2_vu1_recomp from the game's VU1 microcode. Do not edit; do not distribute.\n"
+                     << "#include \"runtime/vu/ps2_vu1_native.h\"\n\nnamespace\n{\n";
+                for (uint32_t pc : pcs)
+                    pairFn(part, pc);
+                part << "}\n\n" << tableDecls << "int rt_vu1_native_entry" << i << "(" << params << ")\n{\n" << prologue
+                     << "    goto N" << entryNodes[i] << ";\n";
+                if (!emitNodes(part, ids) || !part.good())
+                    return false;
+                std::cerr << "wrote " << partPath.string() << " (" << ids.size() << " nodes)\n";
+            }
+            out << "}\n\n" << tables.str();
+            for (size_t i = 0; i < entries.size(); ++i)
+                out << "int rt_vu1_native_entry" << i << "(" << params << ");\n";
+            out << "\nextern \"C\" __attribute__((visibility(\"default\"))) int rt_vu1_native_execute(\n    " << params << ")\n{\n"
+                << checks << "    switch (startPC)\n    {\n";
+            for (size_t i = 0; i < entries.size(); ++i)
+                out << "    case " << hx(entries[i]) << ":\n        return rt_vu1_native_entry" << i
+                    << "(vu, vuCode, codeSize, vuData, dataSize, gs, memory, startPC, top, itop, maxCycles);\n";
+            out << "    default:\n        return Vu1Native::NotHandled;\n    }\n}\n\n";
+        }
+        out << "// Final MAC/status may differ from the interpreter where no instruction can read them.\n"
             << "extern \"C\" __attribute__((visibility(\"default\"))) int rt_vu1_native_flags_exact()\n{\n    return "
             << (flagsLive.size() == pcsUsed.size() ? 1 : 0) << ";\n}\n\n"
             << "extern \"C\" __attribute__((visibility(\"default\"))) uint64_t rt_vu1_native_image_hash()\n{\n    return "
@@ -564,6 +643,7 @@ int ps2x_vu1_recomp_main(int argc, char **argv)
     std::vector<uint32_t> entries;
     bool exact = false; // --exact: bit-exact float model (for vu1_replay); default is the fast SIMD path
     bool interpSteps = false; // --interp-steps: the previous generator (one VU1Interpreter::executePair per pair)
+    bool split = false;       // --split: one function and file per entry (lean code; see emitLean)
     // PS2X_VU1_RECOMP_FLAGS (space-separated, e.g. "--interp-steps") adds options, for A/B builds
     // through the app's game builder.
     std::vector<std::string> args(argv + 1, argv + argc);
@@ -582,6 +662,7 @@ int ps2x_vu1_recomp_main(int argc, char **argv)
         else if (a == "--out") outPath = next();
         else if (a == "--exact") exact = true;
         else if (a == "--interp-steps") interpSteps = true;
+        else if (a == "--split") split = true;
         else if (a == "--entries")
         {
             std::stringstream list(next());
@@ -596,7 +677,7 @@ int ps2x_vu1_recomp_main(int argc, char **argv)
     }
     if (outPath.empty() || (elfPath.empty() == imagePath.empty()))
     {
-        std::cerr << "usage: ps2_vu1_recomp (--elf ELF | --image BIN) --out FILE.cpp [--entries a,b,...] [--exact] [--interp-steps]\n";
+        std::cerr << "usage: ps2_vu1_recomp (--elf ELF | --image BIN) --out FILE.cpp [--entries a,b,...] [--exact] [--interp-steps] [--split]\n";
         return 2;
     }
 
@@ -845,7 +926,7 @@ int ps2x_vu1_recomp_main(int argc, char **argv)
 
     if (!interpSteps)
     {
-        if (!emitLean(out, nodes, entries, entryNodes, image, base, flagsLive, pcsUsed, loopHead, exact))
+        if (!emitLean(out, nodes, entries, entryNodes, image, base, flagsLive, pcsUsed, loopHead, exact, split, outPath))
             return 1;
         std::cerr << "wrote " << outPath << " (lean)\n";
         return out.good() ? 0 : 1;
