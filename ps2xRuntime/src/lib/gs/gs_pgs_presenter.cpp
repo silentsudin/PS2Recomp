@@ -464,6 +464,33 @@ namespace ps2x::gs
                         m_closeRequested = true;
                     if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
                         m_platform->requestResize();
+#if defined(__ANDROID__)
+                    // Android takes the window's surface away while another activity is in front
+                    // (the system file picker, the home screen): drop the Vulkan surface and
+                    // swapchain with it, and make new ones when the app comes back. SDL reports it
+                    // as the window being minimized and restored (its app background/foreground
+                    // events don't reach this queue).
+                    if ((e.type == SDL_EVENT_WINDOW_MINIMIZED || e.type == SDL_EVENT_WILL_ENTER_BACKGROUND) && !m_background)
+                    {
+                        std::lock_guard<std::mutex> lock(m_shared.mutex);
+                        pgsRegisterThread();
+                        m_shared.device->wait_idle();
+                        m_wsi.deinit_surface_and_swapchain();
+                        m_background = true;
+                    }
+                    if ((e.type == SDL_EVENT_WINDOW_RESTORED || e.type == SDL_EVENT_DID_ENTER_FOREGROUND) && m_background)
+                    {
+                        std::lock_guard<std::mutex> lock(m_shared.mutex);
+                        pgsRegisterThread();
+                        const VkSurfaceKHR surface =
+                            m_platform->create_surface(m_shared.device->get_instance(), m_shared.device->get_physical_device());
+                        if (surface != VK_NULL_HANDLE)
+                        {
+                            m_wsi.reinit_surface_and_swapchain(surface);
+                            m_background = false;
+                        }
+                    }
+#endif
                 }
             }
 
@@ -1229,7 +1256,7 @@ namespace ps2x::gs
                 }
                 else
                 {
-                    if (!m_wsi.begin_frame())
+                    if (m_background || !m_wsi.begin_frame())
                         return;
                     backImage = &dev.get_swapchain_view().get_image();
                 }
@@ -1570,6 +1597,7 @@ namespace ps2x::gs
             uint64_t m_lastTick = 0;
             bool m_latched = false;
             bool m_closeRequested = false;
+            bool m_background = false; // Android: no surface while another activity is in front
             bool m_ui = false;
             bool m_uiFrame = false;
             std::string m_capturePath;
