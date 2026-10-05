@@ -1,6 +1,12 @@
 // Replays an RT_VU1_CAPTURE file and checks a VU1 implementation against it bit-for-bit.
 //
-//   vu1_replay <capture.vu1cap> [--verbose]
+//   vu1_replay <capture.vu1cap> [--verbose] [--bench N] [--split B,B,...]
+//
+// --reference-interp ignores the recorded results and checks against the interpreter run on the
+// same inputs (for hand-made captures).
+// --split runs each record again with a cycle budget of B (so a native module bails out
+// mid-program and the interpreter takes over its state), resumes it in the interpreter until it
+// ends, and checks that the result is still the recorded one.
 //
 // Each record's inputs (VU1 state, data memory, code image) are fed to the implementation
 // under test; its final state, data memory and XGKICK packets must equal the recorded ones.
@@ -121,9 +127,24 @@ int main(int argc, char **argv)
     uint32_t total = 0, failed = 0, skipped = 0, handled = 0, deopts = 0;
     std::map<std::pair<int, uint32_t>, uint32_t> deoptWhy;
     int bench = 0;
+    std::vector<uint32_t> splits;
     for (int a = 2; a < argc; ++a)
+    {
         if (std::string(argv[a]) == "--bench" && a + 1 < argc)
             bench = std::atoi(argv[a + 1]);
+        if (std::string(argv[a]) == "--split" && a + 1 < argc)
+            for (const char *p = argv[a + 1]; *p;)
+            {
+                char *end = nullptr;
+                splits.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 0)));
+                p = *end ? end + 1 : end;
+            }
+    }
+    uint32_t splitRuns = 0, splitFailed = 0, splitDeopts = 0;
+    bool referenceInterp = false;
+    for (int a = 2; a < argc; ++a)
+        if (std::string(argv[a]) == "--reference-interp")
+            referenceInterp = true;
     double benchSeconds = 0.0;
     uint64_t vuCycles = 0;
 
@@ -171,6 +192,20 @@ int main(int argc, char **argv)
             continue;
         }
 
+        if (referenceInterp)
+        {
+            VU1Interpreter ref;
+            ref.state() = rec.in;
+            ref.state().dBitEnabled = rec.dBit;
+            ref.state().tBitEnabled = rec.tBit;
+            rec.dataOut = rec.dataIn;
+            rec.packets.clear();
+            ref.setXgkickSink([&](const uint8_t *p, uint32_t n) { rec.packets.emplace_back(p, p + n); });
+            ref.execute(code.data(), static_cast<uint32_t>(code.size()), rec.dataOut.data(),
+                        static_cast<uint32_t>(rec.dataOut.size()), gs, nullptr, rec.startPC, rec.top, rec.itop, 65536);
+            rec.out = ref.state();
+            rec.ended = ref.lastRunEnded();
+        }
         std::vector<uint8_t> data = rec.dataIn;
         std::vector<std::vector<uint8_t>> packets;
         vu.reset();
@@ -209,6 +244,44 @@ int main(int argc, char **argv)
             problems += "xgkick(" + std::to_string(packets.size()) + " vs " + std::to_string(rec.packets.size()) + ") ";
         if (vu.lastRunEnded() != rec.ended)
             problems += "ended ";
+
+        for (uint32_t budget : splits)
+        {
+            std::vector<uint8_t> d2 = rec.dataIn;
+            std::vector<std::vector<uint8_t>> pk2;
+            vu.reset();
+            vu.state() = rec.in;
+            vu.state().dBitEnabled = rec.dBit;
+            vu.state().tBitEnabled = rec.tBit;
+            vu.setXgkickSink([&](const uint8_t *p, uint32_t n) { pk2.emplace_back(p, p + n); });
+            int r = rt_vu1_native_execute
+                        ? rt_vu1_native_execute(vu, code.data(), static_cast<uint32_t>(code.size()), d2.data(),
+                                                static_cast<uint32_t>(d2.size()), gs, nullptr, rec.startPC, rec.top,
+                                                rec.itop, budget)
+                        : 0;
+            if (r == 0)
+                vu.execute(code.data(), static_cast<uint32_t>(code.size()), d2.data(), static_cast<uint32_t>(d2.size()),
+                           gs, nullptr, rec.startPC, rec.top, rec.itop, budget);
+            splitDeopts += r == 2;
+            for (int guard = 0; guard < 1000 && !vu.lastRunEnded(); ++guard)
+                vu.resume(code.data(), static_cast<uint32_t>(code.size()), d2.data(), static_cast<uint32_t>(d2.size()), gs,
+                          nullptr, rec.top, rec.itop, 65536);
+            std::string sp = diffState(rec.out, vu.state());
+            if (d2 != rec.dataOut)
+                sp += "data ";
+            if (pk2 != rec.packets)
+                sp += "xgkick(" + std::to_string(pk2.size()) + " vs " + std::to_string(rec.packets.size()) + ") ";
+            if (!vu.lastRunEnded())
+                sp += "never ended ";
+            ++splitRuns;
+            if (!sp.empty())
+            {
+                ++splitFailed;
+                if (splitFailed <= 10)
+                    std::cout << "record " << (total - 1) << " pc=0x" << std::hex << rec.startPC << std::dec << " split at "
+                              << budget << ": " << sp << "\n";
+            }
+        }
 
         if (bench > 0)
         {
@@ -250,8 +323,10 @@ int main(int argc, char **argv)
     std::cout << "\n";
     for (auto &[why, n] : deoptWhy)
         std::cout << "  deopt reason " << why.first << " at pc 0x" << std::hex << why.second << std::dec << ": " << n << "\n";
+    if (!splits.empty())
+        std::cout << "split runs: " << splitRuns << ", " << splitFailed << " mismatched, " << splitDeopts << " bailed out natively\n";
     std::cout << "average " << (vuCycles / std::max<uint32_t>(1u, total - skipped)) << " VU cycles per run\n";
     if (bench > 0)
         std::cout << "bench: " << (benchSeconds * 1e6 / (double(total - skipped) * bench)) << " us per run\n";
-    return failed == 0 && r.ok ? 0 : 1;
+    return failed == 0 && splitFailed == 0 && r.ok ? 0 : 1;
 }

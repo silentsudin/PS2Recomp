@@ -323,6 +323,10 @@ private:
     void queueViWrite(uint8_t reg, int32_t value, uint32_t latency);
     void queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency);
     void startXgkick(uint32_t qwordAddress);
+    // Shared by the interpreter and the lean recompiled path (ps2_vu1_native.h).
+    static uint32_t clipFlags(const float *vs, const float *vt);
+    void fdivResult(uint32_t instr, float &out, uint32_t &statusDi, uint32_t &latency) const;
+    void efuResult(uint32_t instr, float &out, uint32_t &latency) const;
 
     void resetScheduler();
     void resetSchedulerLight();

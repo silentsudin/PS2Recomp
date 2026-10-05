@@ -997,7 +997,7 @@ inline void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statu
     m_fdiv.statusDi = statusDi & 0x30u;
 }
 
-inline void VU1Interpreter::applyStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
+inline __attribute__((always_inline)) void VU1Interpreter::applyStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
     if (m_activeVuData && address + 16u <= m_activeVuDataSize)
     {
@@ -1012,7 +1012,7 @@ inline void VU1Interpreter::applyStore(uint32_t address, const uint32_t words[4]
     }
 }
 
-inline void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
+inline __attribute__((always_inline)) void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
     // Recompiled code: a store lands at the next cycle boundary, before anything (the next
     // pair, PATH1) can read VU memory, so writing it now is equivalent.
@@ -1099,6 +1099,240 @@ inline void VU1Interpreter::finishXgkick()
     else if (m_activeGs)
         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
     m_xgkick.active = false;
+}
+
+// CLIP judgement of vf[fs].xyz against |vf[ft].w| (six flag bits, as queued into the clip flag).
+inline __attribute__((always_inline)) uint32_t VU1Interpreter::clipFlags(const float *vs, const float *vt)
+{
+    uint32_t wBits = 0u;
+    std::memcpy(&wBits, &vt[3], sizeof(wBits));
+    const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+
+    const auto exceedsClipPlane = [limit](float value, uint32_t signMask)
+    {
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &value, sizeof(bits));
+        bits ^= signMask;
+        int32_t orderedBits = 0;
+        std::memcpy(&orderedBits, &bits, sizeof(orderedBits));
+        return orderedBits > limit;
+    };
+
+    uint32_t flags = 0u;
+    if (exceedsClipPlane(vs[0], 0x00000000u))
+        flags |= 0x01u;
+    if (exceedsClipPlane(vs[0], 0x80000000u))
+        flags |= 0x02u;
+    if (exceedsClipPlane(vs[1], 0x00000000u))
+        flags |= 0x04u;
+    if (exceedsClipPlane(vs[1], 0x80000000u))
+        flags |= 0x08u;
+    if (exceedsClipPlane(vs[2], 0x00000000u))
+        flags |= 0x10u;
+    if (exceedsClipPlane(vs[2], 0x80000000u))
+        flags |= 0x20u;
+    return flags;
+}
+
+// DIV / SQRT / RSQRT (lower special 0x38..0x3A): the value Q receives (already normalized, as
+// queueQ stores it), the status D/I bits it sets and its latency.
+inline __attribute__((always_inline)) void VU1Interpreter::fdivResult(uint32_t instr, float &out, uint32_t &outStatusDi,
+                                                                      uint32_t &outLatency) const
+{
+    const uint8_t vfT = FT(instr);
+    const uint8_t vfS = FS(instr);
+    const uint8_t funct2 = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+    uint32_t ignoredFlags = 0u;
+    switch (funct2)
+    {
+    case 0x38: // DIV
+    {
+        int fsf = (instr >> 21) & 0x3;
+        int ftf = (instr >> 23) & 0x3;
+        const float num = normalizeOperand(m_state.vf[vfS][fsf]);
+        const float den = normalizeOperand(m_state.vf[vfT][ftf]);
+        uint32_t statusDi = 0u;
+        float result = 0.0f;
+        if (den == 0.0f)
+        {
+            statusDi = num == 0.0f ? 0x10u : 0x20u;
+            result = std::signbit(num) != std::signbit(den)
+                         ? -std::numeric_limits<float>::max()
+                         : std::numeric_limits<float>::max();
+        }
+        else
+        {
+            result = num / den;
+        }
+        out = normalizeResult(result, ignoredFlags);
+        outStatusDi = statusDi & 0x30u;
+        outLatency = 7u;
+        return;
+    }
+    case 0x39: // SQRT
+    {
+        int ftf = (instr >> 23) & 0x3;
+        const float val = normalizeOperand(m_state.vf[vfT][ftf]);
+        out = normalizeResult(std::sqrt(std::fabs(val)), ignoredFlags);
+        outStatusDi = val < 0.0f ? 0x10u : 0u;
+        outLatency = 7u;
+        return;
+    }
+    default: // 0x3A RSQRT
+    {
+        int fsf = (instr >> 21) & 0x3;
+        int ftf = (instr >> 23) & 0x3;
+        const float num = normalizeOperand(m_state.vf[vfS][fsf]);
+        const float radicand = normalizeOperand(m_state.vf[vfT][ftf]);
+        const float den = std::sqrt(std::fabs(radicand));
+        uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
+        float result = 0.0f;
+        if (den != 0.0f)
+            result = num / den;
+        else
+        {
+            statusDi = num == 0.0f ? 0x10u : 0x20u;
+            result = std::signbit(num)
+                         ? -std::numeric_limits<float>::max()
+                         : std::numeric_limits<float>::max();
+        }
+        out = normalizeResult(result, ignoredFlags);
+        outStatusDi = statusDi & 0x30u;
+        outLatency = 13u;
+        return;
+    }
+    }
+}
+
+// EFU ops (lower special 0x70..0x7A, 0x7C, 0x7D): the value P receives (normalized, as queueP
+// stores it) and its latency.
+inline __attribute__((always_inline)) void VU1Interpreter::efuResult(uint32_t instr, float &out, uint32_t &outLatency) const
+{
+    const uint8_t vfS = FS(instr);
+    const uint8_t funct2 = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+    float value = 0.0f;
+    uint32_t latency = 0u;
+    switch (funct2)
+    {
+    case 0x70: // ESADD
+    {
+        const float x = normalizeOperand(m_state.vf[vfS][0]);
+        const float y = normalizeOperand(m_state.vf[vfS][1]);
+        const float z = normalizeOperand(m_state.vf[vfS][2]);
+        value = x * x + y * y + z * z;
+        latency = 11u;
+        break;
+    }
+    case 0x71: // ERSADD
+    {
+        const float x = normalizeOperand(m_state.vf[vfS][0]);
+        const float y = normalizeOperand(m_state.vf[vfS][1]);
+        const float z = normalizeOperand(m_state.vf[vfS][2]);
+        const float sum = x * x + y * y + z * z;
+        value = sum != 0.0f ? 1.0f / sum : sum;
+        latency = 18u;
+        break;
+    }
+    case 0x72: // ELENG
+    {
+        const float x = normalizeOperand(m_state.vf[vfS][0]);
+        const float y = normalizeOperand(m_state.vf[vfS][1]);
+        const float z = normalizeOperand(m_state.vf[vfS][2]);
+        value = std::sqrt(x * x + y * y + z * z);
+        latency = 18u;
+        break;
+    }
+    case 0x73: // ERLENG
+    {
+        const float x = normalizeOperand(m_state.vf[vfS][0]);
+        const float y = normalizeOperand(m_state.vf[vfS][1]);
+        const float z = normalizeOperand(m_state.vf[vfS][2]);
+        const float len = std::sqrt(x * x + y * y + z * z);
+        value = len != 0.0f ? 1.0f / len : len;
+        latency = 24u;
+        break;
+    }
+    case 0x74: // EATANxy
+    {
+        const float x = normalizeOperand(m_state.vf[vfS][0]);
+        const float y = normalizeOperand(m_state.vf[vfS][1]);
+        value = x != 0.0f ? vuEatan(y / x) : 0.0f;
+        latency = 54u;
+        break;
+    }
+    case 0x75: // EATANxz
+    {
+        const float x = normalizeOperand(m_state.vf[vfS][0]);
+        const float z = normalizeOperand(m_state.vf[vfS][2]);
+        value = x != 0.0f ? vuEatan(z / x) : 0.0f;
+        latency = 54u;
+        break;
+    }
+    case 0x76: // ESUM
+    {
+        float sum = 0.0f;
+        for (uint32_t component = 0; component < 4u; ++component)
+            sum += normalizeOperand(m_state.vf[vfS][component]);
+        value = sum;
+        latency = 12u;
+        break;
+    }
+    case 0x77: // ERSQRT
+    {
+        const uint32_t component = (instr >> 21) & 3u;
+        const float v = normalizeOperand(m_state.vf[vfS][component]);
+        float result = v;
+        if (result >= 0.0f)
+        {
+            result = std::sqrt(result);
+            if (result != 0.0f)
+                result = 1.0f / result;
+        }
+        value = result;
+        latency = 18u;
+        break;
+    }
+    case 0x78: // ESQRT
+    {
+        const uint32_t component = (instr >> 21) & 3u;
+        const float v = normalizeOperand(m_state.vf[vfS][component]);
+        value = v >= 0.0f ? std::sqrt(v) : v;
+        latency = 12u;
+        break;
+    }
+    case 0x79: // ESIN
+    {
+        const uint32_t component = (instr >> 21) & 3u;
+        value = vuEsin(normalizeOperand(m_state.vf[vfS][component]));
+        latency = 29u;
+        break;
+    }
+    case 0x7A: // ERCPR
+    {
+        const uint32_t component = (instr >> 21) & 3u;
+        const float v = normalizeOperand(m_state.vf[vfS][component]);
+        value = v != 0.0f ? 1.0f / v : v;
+        latency = 12u;
+        break;
+    }
+    case 0x7C: // EATAN
+    {
+        const uint32_t component = (instr >> 21) & 3u;
+        value = vuEatan(normalizeOperand(m_state.vf[vfS][component]));
+        latency = 54u;
+        break;
+    }
+    default: // 0x7D EEXP
+    {
+        const uint32_t component = (instr >> 21) & 3u;
+        value = vuEexp(normalizeOperand(m_state.vf[vfS][component]));
+        latency = 44u;
+        break;
+    }
+    }
+    uint32_t ignoredFlags = 0u;
+    out = normalizeResult(value, ignoredFlags);
+    outLatency = latency;
 }
 
 // ============================================================================
@@ -1465,33 +1699,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
             return;
         case 0x1F: // CLIP
         {
-            uint32_t wBits = 0u;
-            std::memcpy(&wBits, &m_state.vf[ft][3], sizeof(wBits));
-            const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
-
-            const auto exceedsClipPlane = [limit](float value, uint32_t signMask)
-            {
-                uint32_t bits = 0u;
-                std::memcpy(&bits, &value, sizeof(bits));
-                bits ^= signMask;
-                int32_t orderedBits = 0;
-                std::memcpy(&orderedBits, &bits, sizeof(orderedBits));
-                return orderedBits > limit;
-            };
-
-            uint32_t flags = 0u;
-            if (exceedsClipPlane(m_state.vf[fs][0], 0x00000000u))
-                flags |= 0x01u;
-            if (exceedsClipPlane(m_state.vf[fs][0], 0x80000000u))
-                flags |= 0x02u;
-            if (exceedsClipPlane(m_state.vf[fs][1], 0x00000000u))
-                flags |= 0x04u;
-            if (exceedsClipPlane(m_state.vf[fs][1], 0x80000000u))
-                flags |= 0x08u;
-            if (exceedsClipPlane(m_state.vf[fs][2], 0x00000000u))
-                flags |= 0x10u;
-            if (exceedsClipPlane(m_state.vf[fs][2], 0x80000000u))
-                flags |= 0x20u;
+            const uint32_t flags = clipFlags(m_state.vf[fs], m_state.vf[ft]);
             queueClip(flags);
             return;
         }
@@ -1640,15 +1848,16 @@ __attribute__((always_inline)) inline bool VU1Interpreter::execUpperFast(uint32_
     const uint8_t dest = DEST(instr);
     const uint8_t ft = FT(instr), fs = FS(instr), fd = FD(instr);
     const uint8_t op = instr & 0x3Fu;
-    auto vs = [&] { return load(m_state.vf[fs]); };
-    auto vt = [&] { return load(m_state.vf[ft]); };
-    auto acc = [&] { return load(m_state.acc); };
-    auto bc = [&](uint32_t c) { return splat(std::clamp(m_state.vf[ft][c & 3u], -3.402823466e+38f, 3.402823466e+38f)); };
+    // (always_inline: recompiled code calls this with a constant word and needs it all folded)
+    auto vs = [&]() __attribute__((always_inline)) { return load(m_state.vf[fs]); };
+    auto vt = [&]() __attribute__((always_inline)) { return load(m_state.vf[ft]); };
+    auto acc = [&]() __attribute__((always_inline)) { return load(m_state.acc); };
+    auto bc = [&](uint32_t c) __attribute__((always_inline)) { return splat(std::clamp(m_state.vf[ft][c & 3u], -3.402823466e+38f, 3.402823466e+38f)); };
     const f4 q = splat(std::clamp(m_state.q, -3.402823466e+38f, 3.402823466e+38f));
     const f4 i = splat(std::clamp(m_state.i, -3.402823466e+38f, 3.402823466e+38f));
-    auto toFd = [&](f4 r) { store(m_state.vf[fd], clampv(r), dest); };
-    auto toAcc = [&](f4 r) { store(m_state.acc, clampv(r), dest); };
-    auto opRotate = [&](f4 a, f4 b) { return (f4){a.y, a.z, a.x, 0.0f} * (f4){b.z, b.x, b.y, 0.0f}; };
+    auto toFd = [&](f4 r) __attribute__((always_inline)) { store(m_state.vf[fd], clampv(r), dest); };
+    auto toAcc = [&](f4 r) __attribute__((always_inline)) { store(m_state.acc, clampv(r), dest); };
+    auto opRotate = [&](f4 a, f4 b) __attribute__((always_inline)) { return (f4){a.y, a.z, a.x, 0.0f} * (f4){b.z, b.x, b.y, 0.0f}; };
 
     if (op < 0x3Cu)
     {
@@ -2176,58 +2385,13 @@ inline void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t 
                 return;
             }
             case 0x38: // DIV
-            {
-                int fsf = (instr >> 21) & 0x3;
-                int ftf = (instr >> 23) & 0x3;
-                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
-                const float den = normalizeOperand(m_state.vf[vfT][ftf]);
-                uint32_t statusDi = 0u;
-                float result = 0.0f;
-                if (den == 0.0f)
-                {
-                    statusDi = num == 0.0f ? 0x10u : 0x20u;
-                    result = std::signbit(num) != std::signbit(den)
-                                 ? -std::numeric_limits<float>::max()
-                                 : std::numeric_limits<float>::max();
-                }
-                else
-                {
-                    result = num / den;
-                }
-                uint32_t ignoredFlags = 0u;
-                result = normalizeResult(result, ignoredFlags);
-                queueQ(result, 7u, statusDi);
-                return;
-            }
             case 0x39: // SQRT
-            {
-                int ftf = (instr >> 23) & 0x3;
-                const float val = normalizeOperand(m_state.vf[vfT][ftf]);
-                queueQ(std::sqrt(std::fabs(val)), 7u,
-                       val < 0.0f ? 0x10u : 0u);
-                return;
-            }
             case 0x3A: // RSQRT
             {
-                int fsf = (instr >> 21) & 0x3;
-                int ftf = (instr >> 23) & 0x3;
-                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
-                const float radicand = normalizeOperand(m_state.vf[vfT][ftf]);
-                const float den = std::sqrt(std::fabs(radicand));
-                uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
                 float result = 0.0f;
-                if (den != 0.0f)
-                    result = num / den;
-                else
-                {
-                    statusDi = num == 0.0f ? 0x10u : 0x20u;
-                    result = std::signbit(num)
-                                 ? -std::numeric_limits<float>::max()
-                                 : std::numeric_limits<float>::max();
-                }
-                uint32_t ignoredFlags = 0u;
-                result = normalizeResult(result, ignoredFlags);
-                queueQ(result, 13u, statusDi);
+                uint32_t statusDi = 0u, latency = 0u;
+                fdivResult(instr, result, statusDi, latency);
+                queueQ(result, latency, statusDi);
                 return;
             }
             case 0x3B: // WAITQ
@@ -2347,110 +2511,27 @@ inline void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t 
                 startXgkick(static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS])));
                 return;
             case 0x70: // ESADD
-            {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
-                queueP(x * x + y * y + z * z, 11u);
-                return;
-            }
             case 0x71: // ERSADD
-            {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
-                const float sum = x * x + y * y + z * z;
-                queueP(sum != 0.0f ? 1.0f / sum : sum, 18u);
-                return;
-            }
             case 0x72: // ELENG
-            {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
-                queueP(std::sqrt(x * x + y * y + z * z), 18u);
-                return;
-            }
             case 0x73: // ERLENG
-            {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
-                const float len = std::sqrt(x * x + y * y + z * z);
-                queueP(len != 0.0f ? 1.0f / len : len, 24u);
-                return;
-            }
             case 0x74: // EATANxy
-            {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                queueP(x != 0.0f ? vuEatan(y / x) : 0.0f, 54u);
-                return;
-            }
             case 0x75: // EATANxz
-            {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
-                queueP(x != 0.0f ? vuEatan(z / x) : 0.0f, 54u);
-                return;
-            }
             case 0x76: // ESUM
-            {
-                float sum = 0.0f;
-                for (uint32_t component = 0; component < 4u; ++component)
-                    sum += normalizeOperand(m_state.vf[vfS][component]);
-                queueP(sum, 12u);
-                return;
-            }
             case 0x77: // ERSQRT
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                float result = value;
-                if (result >= 0.0f)
-                {
-                    result = std::sqrt(result);
-                    if (result != 0.0f)
-                        result = 1.0f / result;
-                }
-                queueP(result, 18u);
-                return;
-            }
             case 0x78: // ESQRT
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
-                return;
-            }
             case 0x79: // ESIN
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(vuEsin(value), 29u);
-                return;
-            }
             case 0x7A: // ERCPR
+            case 0x7C: // EATAN
+            case 0x7D: // EEXP
             {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(value != 0.0f ? 1.0f / value : value, 12u);
+                float result = 0.0f;
+                uint32_t latency = 0u;
+                efuResult(instr, result, latency);
+                queueP(result, latency);
                 return;
             }
             case 0x7B: // WAITP
                 return;
-            case 0x7C: // EATAN
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
-                return;
-            }
-            case 0x7D: // EEXP
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
-                return;
-            }
             default:
                 reportReservedInstruction(false, instr);
                 return;

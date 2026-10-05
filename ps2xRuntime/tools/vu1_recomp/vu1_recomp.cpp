@@ -1,18 +1,26 @@
 // ps2_vu1_recomp: statically recompiles VU1 microcode to C++.
 //
-//   ps2_vu1_recomp --elf GAME.ELF --out vu1_native.cpp [--entries 0x0,0x10,...] [--exact]
+//   ps2_vu1_recomp --elf GAME.ELF --out vu1_native.cpp [--entries 0x0,0x10,...] [--exact] [--interp-steps]
 //   ps2_vu1_recomp --image code.bin --out vu1_native.cpp [--entries ...]
 //
 // The VU1 code image is assembled from the ELF's .DVP.ovlytab overlays (or read raw). Starting
 // from each MSCAL entry with the clean pipeline state execute() produces, the CFG is explored
 // with the interpreter's own timing model (forcing both outcomes of conditional branches) until
-// every reachable (pc, timing state) node is known. Each node becomes one step of generated code:
-// its precomputed hazard stall plus VU1Interpreter::executePair() on a constexpr decoded pair,
-// followed by a dispatch to the statically known successor. See runtime/vu/ps2_vu1_native.h.
+// every reachable (pc, timing state) node is known.
+//
+// Default (lean) output: each node is straight-line code. Its stall is a constant added to a
+// cycle counter, the pair's operations run directly on constant words, the cycle where each
+// DIV/EFU result lands in Q/P is resolved at build time, branches and delay slots are plain gotos,
+// and an XGKICK copies the whole packet at the kick (see "lean code" in runtime/vu/ps2_vu1_native.h).
+// --interp-steps: the previous output, one VU1Interpreter::executePair() per node on a constexpr
+// decoded pair after the node's precomputed stall (the interpreter's cycle model at run time).
+// --exact: the interpreter's exact float model everywhere instead of the 4-lane fast path (FTZ, RZ,
+// clamping) for pairs whose MAC/status flags nothing reads. See runtime/vu/ps2_vu1_native.h.
 
 #include "runtime/vu/ps2_vu1_native.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -21,6 +29,7 @@
 #include <set>
 #include <memory>
 #include <sstream>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -109,6 +118,13 @@ namespace
         bool unsupported = false;
         size_t drainedVariant = SIZE_MAX; // XGKICK pairs: node to resume at after a dynamic stall
         std::vector<Edge> succ;
+        // Lean mode: the static timing at entry and where in-flight Q/P results land.
+        Vu1Native::LeanProbe entry;
+        bool qPre = false, qPost = false; // FDIV result lands during the stall / after the pair
+        int pPre = -1, pPost = -1;        // EFU slot whose result lands last during the stall / after
+        int efuSlot = -1;                 // slot the pair's own EFU op takes
+        uint32_t drainCycles = 0;         // XGKICK pairs: cycles until timingDrained()
+        Vu1Native::LeanProbe exit;        // ended nodes: state after the last pair
     };
 
     std::string hex(uint64_t v)
@@ -146,6 +162,399 @@ namespace
         const uint32_t op = p.lower >> 25;
         return op >= 0x28 && op <= 0x2F;
     }
+    // ------------------------------------------------------------------ lean code generation
+    // See "lean code" in runtime/vu/ps2_vu1_native.h.
+
+    enum class LowerKind
+    {
+        None,      // NOP or I-bit immediate
+        Plain,     // execLower as is
+        Branch,    // B BAL JR JALR IBxx: control flow is generated per node
+        Xgkick,    // copied at the node (leanKick)
+        Fdiv,      // DIV SQRT RSQRT -> c.qPend
+        Efu,       // EFU ops -> c.pNew
+        Wait,      // WAITQ WAITP (stall only)
+        Fcset,     // clip ring
+        ClipRead,  // FCEQ FCAND FCOR FCGET: clip ring
+        FlagRead,  // FSxx FMxx FSSET: the interpreter's flag ring, committed up to now
+        Store,     // SQ ISW SQI SQD ISWR: execLower, but checked against an in-flight XGKICK
+    };
+
+    uint8_t special2(uint32_t w) { return static_cast<uint8_t>((w & 0x3u) | ((w >> 4) & 0x7Cu)); }
+
+    LowerKind lowerKind(const Vu1Native::Pair &p)
+    {
+        if (p.iBit || p.lower == 0u || p.lower == 0x8000033Cu)
+            return LowerKind::None;
+        const uint32_t opHi = (p.lower >> 25) & 0x7Fu;
+        switch (opHi)
+        {
+        case 0x01: case 0x05: return LowerKind::Store;
+        case 0x10: case 0x12: case 0x13: case 0x1C: return LowerKind::ClipRead;
+        case 0x11: return LowerKind::Fcset;
+        case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1B: return LowerKind::FlagRead;
+        case 0x20: case 0x21: case 0x24: case 0x25: case 0x28: case 0x29: case 0x2C: case 0x2D: case 0x2E: case 0x2F:
+            return LowerKind::Branch;
+        case 0x40:
+        {
+            if ((p.lower & 0x3Fu) < 0x3Cu)
+                return LowerKind::Plain;
+            const uint8_t f = special2(p.lower);
+            if (f == 0x35u || f == 0x37u || f == 0x3Fu)
+                return LowerKind::Store;
+            if (f >= 0x38u && f <= 0x3Au)
+                return LowerKind::Fdiv;
+            if (f == 0x3Bu || f == 0x7Bu)
+                return LowerKind::Wait;
+            if ((f >= 0x70u && f <= 0x7Au) || f == 0x7Cu || f == 0x7Du)
+                return LowerKind::Efu;
+            if (f == 0x6Cu)
+                return LowerKind::Xgkick;
+            return LowerKind::Plain;
+        }
+        default:
+            return LowerKind::Plain;
+        }
+    }
+
+    bool isClipUpper(uint32_t upper)
+    {
+        return (upper & 0x3Fu) >= 0x3Cu && special2(upper) == 0x1Fu;
+    }
+
+    // Might the pair leave something in VF0/VI0 (which run() resets after every pair)? Conservative.
+    bool mayWriteZeroRegs(const Vu1Native::Pair &p)
+    {
+        const uint32_t u = p.upper;
+        if ((u & 0x3Fu) < 0x3Cu)
+        {
+            if (FD(u) == 0u)
+                return true;
+        }
+        else
+        {
+            const uint8_t sop = special2(u);
+            if (((sop >= 0x10u && sop <= 0x17u) || sop == 0x1Du) && FT(u) == 0u)
+                return true;
+        }
+        if (p.iBit || p.lower == 0u || p.lower == 0x8000033Cu)
+            return false;
+        const uint32_t opHi = (p.lower >> 25) & 0x7Fu;
+        if (opHi == 0x00u && FT(p.lower) == 0u)
+            return true;
+        if (opHi == 0x40u && (p.lower & 0x3Fu) >= 0x3Cu)
+        {
+            const uint8_t f = special2(p.lower);
+            if ((f == 0x30u || f == 0x31u || f == 0x34u || f == 0x36u || f == 0x3Du || f == 0x40u || f == 0x41u || f == 0x64u) &&
+                FT(p.lower) == 0u)
+                return true;
+        }
+        return false;
+    }
+
+    uint32_t normalizedImmediate(uint32_t bits)
+    {
+        const uint32_t exponent = bits & 0x7F800000u, sign = bits & 0x80000000u;
+        if (exponent == 0u)
+            return sign;
+        if (exponent == 0x7F800000u)
+            return sign | 0x7F7FFFFFu;
+        return bits;
+    }
+
+    std::string hx(uint64_t v)
+    {
+        std::ostringstream s;
+        s << "0x" << std::hex << v << "u";
+        return s.str();
+    }
+
+    bool emitLean(std::ofstream &out, const std::vector<Node> &nodes, const std::vector<uint32_t> &entries,
+                  const std::vector<size_t> &entryNodes, const std::vector<uint8_t> &image, const VU1Interpreter &base,
+                  const std::set<uint32_t> &flagsLive, const std::map<uint32_t, bool> &pcsUsed,
+                  const std::vector<bool> &loopHead, bool exact)
+    {
+        const std::string fast = exact ? "false" : "true";
+        // One function per instruction pair: its upper and lower operations on constant words
+        // (timing, Q/P landing, branches and XGKICK are per node).
+        for (const auto &[pc, used] : pcsUsed)
+        {
+            (void)used;
+            const auto p = Vu1Native::decode(base, image.data(), pc);
+            const LowerKind lk = lowerKind(p);
+            const bool flags = flagsLive.count(pc) != 0u;
+            out << "    __attribute__((always_inline)) inline void X" << std::hex << pc << std::dec
+                << "(VU1Interpreter &vu, VU1State &s, uint8_t *mem, Vu1Native::LeanCtx &c, uint64_t cyc)\n    {\n"
+                << "        (void)vu; (void)s; (void)mem; (void)c; (void)cyc;\n";
+            if (!p.iBit && p.lowerUsage.delaysNextBranchRead && p.lowerUsage.viWrite != 0u)
+            {
+                for (uint32_t r = 1; r < 16u; ++r)
+                    if (p.lowerUsage.viWrite & (1u << r))
+                    {
+                        out << "        c.viBackup = s.vi[" << r << "];\n";
+                        break;
+                    }
+            }
+            std::string upper;
+            if (isClipUpper(p.upper))
+                upper = "Vu1Native::leanClip(vu, c, " + std::to_string(FS(p.upper)) + "u, " + std::to_string(FT(p.upper)) + "u, cyc);";
+            else if (flags)
+                upper = "Vu1Native::leanSync(vu, cyc); Vu1Native::leanUpper<" + hx(p.upper) + ", true, false>(vu);";
+            else
+                upper = "Vu1Native::leanUpper<" + hx(p.upper) + ", false, " +
+                        ((p.iBit || p.upperVfShadowReg != 0u) ? std::string("false") : fast) + ">(vu);";
+            std::string lower;
+            const std::string L = hx(p.lower), U = hx(p.upper);
+            switch (lk)
+            {
+            case LowerKind::None:
+            case LowerKind::Branch:
+            case LowerKind::Xgkick:
+            case LowerKind::Wait:
+                break;
+            case LowerKind::Plain:
+            case LowerKind::Store:
+                lower = "Vu1Native::leanLower<" + L + ", " + U + ">(vu, mem);";
+                break;
+            case LowerKind::Fdiv:
+                lower = "Vu1Native::leanFdiv<" + L + ">(vu, c);";
+                break;
+            case LowerKind::Efu:
+                lower = "Vu1Native::leanEfu<" + L + ">(vu, c);";
+                break;
+            case LowerKind::Fcset:
+                lower = "Vu1Native::leanFcset(c, " + hx(p.lower & 0xFFFFFFu) + ", cyc);";
+                break;
+            case LowerKind::FlagRead:
+                lower = "Vu1Native::leanCommitFlags(vu, cyc); Vu1Native::leanLower<" + L + ", " + U + ">(vu, mem);";
+                break;
+            case LowerKind::ClipRead:
+            {
+                const uint32_t opHi = (p.lower >> 25) & 0x7Fu, imm = p.lower & 0xFFFFFFu;
+                const std::string clip = "Vu1Native::leanClipAt(c, cyc)";
+                if (opHi == 0x10u)
+                    lower = "s.vi[1] = ((" + clip + " & 0xFFFFFFu) == " + hx(imm) + ") ? 1 : 0;";
+                else if (opHi == 0x12u)
+                    lower = "s.vi[1] = ((" + clip + " & " + hx(imm) + ") != 0u) ? 1 : 0;";
+                else if (opHi == 0x13u)
+                    lower = "s.vi[1] = ((" + clip + " | " + hx(imm) + ") == 0xFFFFFFu) ? 1 : 0;";
+                else if (VIT(p.lower) != 0u)
+                    lower = "s.vi[" + std::to_string(VIT(p.lower)) + "] = static_cast<int32_t>(" + clip + " & 0x0FFFu);";
+                break;
+            }
+            }
+            if (p.upperVfShadowReg != 0u)
+            {
+                const std::string R = std::to_string(p.upperVfShadowReg);
+                out << "        float oldVf[4], upperVf[4];\n"
+                    << "        std::memcpy(oldVf, s.vf[" << R << "], 16);\n"
+                    << "        " << upper << "\n"
+                    << "        std::memcpy(upperVf, s.vf[" << R << "], 16);\n"
+                    << "        std::memcpy(s.vf[" << R << "], oldVf, 16);\n"
+                    << "        " << lower << "\n"
+                    << "        std::memcpy(s.vf[" << R << "], upperVf, 16);\n";
+            }
+            else
+            {
+                out << "        " << upper << "\n";
+                if (!lower.empty())
+                    out << "        " << lower << "\n";
+            }
+            if (p.iBit)
+                out << "        { const uint32_t b = " << hx(normalizedImmediate(p.lower)) << "; std::memcpy(&s.i, &b, 4); }\n";
+            if (mayWriteZeroRegs(p))
+                out << "        s.vf[0][0] = 0.0f; s.vf[0][1] = 0.0f; s.vf[0][2] = 0.0f; s.vf[0][3] = 1.0f; s.vi[0] = 0;\n";
+            out << "    }\n";
+        }
+
+        // Static timing per node, for deopts.
+        std::map<std::vector<std::pair<uint8_t, uint8_t>>, uint32_t> timingOffsets;
+        std::vector<uint8_t> timingBytes;
+        out << "    const Vu1Native::LeanNode kLeanNodes[] = {\n";
+        for (const Node &n : nodes)
+        {
+            auto it = timingOffsets.find(n.entry.timing);
+            if (it == timingOffsets.end())
+            {
+                it = timingOffsets.emplace(n.entry.timing, static_cast<uint32_t>(timingBytes.size())).first;
+                for (auto [code, rel] : n.entry.timing)
+                {
+                    timingBytes.push_back(code);
+                    timingBytes.push_back(rel);
+                }
+            }
+            const auto &e = n.entry.node;
+            out << "        {" << hx(e.pc) << ", " << hx(e.branchTarget) << ", " << int(e.flags) << ", " << int(e.branchDelay) << ", "
+                << int(e.backupReg) << ", " << int(e.fdivRel) << ", {" << int(e.efuRel[0]) << ", " << int(e.efuRel[1]) << "}, "
+                << int(e.efuResRel) << ", " << n.entry.timing.size() << ", " << it->second << "},\n";
+        }
+        out << "    };\n    const uint8_t kLeanTiming[] = {";
+        for (size_t i = 0; i < timingBytes.size(); ++i)
+            out << (i % 32 == 0 ? "\n        " : "") << int(timingBytes[i]) << ",";
+        out << "0};\n}\n\n";
+
+        out << "extern \"C\" __attribute__((visibility(\"default\"))) int rt_vu1_native_execute(\n"
+            << "    VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory,\n"
+            << "    uint32_t startPC, uint32_t top, uint32_t itop, uint32_t maxCycles)\n{\n"
+            << "    switch (startPC)\n    {\n";
+        for (uint32_t e : entries)
+            out << "    case " << hx(e) << ":\n        break;\n";
+        out << "    default:\n        return Vu1Native::NotHandled;\n    }\n"
+            << "    if (dataSize != 0x4000u || codeSize != 0x4000u)\n        return Vu1Native::NotHandled;\n"
+            << "    Vu1Native::Frame f = Vu1Native::beginExecute(vu, codeSize, vuData, dataSize, gs, memory, startPC, top, itop, maxCycles, "
+            << fast << ");\n"
+            << "    Vu1Native::LeanCtx c;\n    Vu1Native::leanBegin(vu, c);\n"
+            << "    VU1State &s = Vu1Native::state(vu);\n    uint8_t *const mem = vuData;\n"
+            << "    uint64_t cyc = Vu1Native::cycle(vu);\n    uint32_t dn = 0;\n    int dr = 0;\n"
+            << "    switch (startPC)\n    {\n";
+        for (size_t i = 0; i < entries.size(); ++i)
+            out << "    case " << hx(entries[i]) << ":\n        goto N" << entryNodes[i] << ";\n";
+        out << "    default:\n        return Vu1Native::NotHandled;\n    }\n\n";
+
+        auto deopt = [&](size_t id, const char *reason, const std::string &indent)
+        {
+            std::ostringstream s;
+            s << indent << "{\n" << indent << "    dn = " << id << "u;\n" << indent << "    dr = Vu1Native::" << reason << ";\n"
+              << indent << "    goto deopt;\n" << indent << "}\n";
+            return s.str();
+        };
+        for (size_t id = 0; id < nodes.size(); ++id)
+        {
+            const Node &n = nodes[id];
+            out << "N" << id << ":\n";
+            if (n.unsupported)
+            {
+                out << deopt(id, "DeoptStep", "    ");
+                continue;
+            }
+            const auto p = Vu1Native::decode(base, image.data(), n.pc);
+            const LowerKind lk = lowerKind(p);
+            const auto &e = n.entry.node;
+            const uint8_t backup = e.backupReg;
+            auto rv = [&](uint32_t r) -> std::string
+            {
+                if (r == 0u)
+                    return "0";
+                if (r == backup)
+                    return "c.viBackup";
+                return "s.vi[" + std::to_string(r) + "]";
+            };
+            if (loopHead[id])
+                out << "    if (cyc >= f.budgetEnd || Vu1Native::stopRequested(vu))\n" << deopt(id, "DeoptStep", "    ");
+            if (p.dBit)
+                out << "    if (Vu1Native::dBitEnabled(vu))\n" << deopt(id, "DeoptHaltBit", "    ");
+            if (p.tBit)
+                out << "    if (Vu1Native::tBitEnabled(vu))\n" << deopt(id, "DeoptHaltBit", "    ");
+            if (lk == LowerKind::Xgkick)
+            {
+                // The previous packet: done by now, or wait for it like run() (then everything has
+                // drained: continue at the drained variant), or let the interpreter wait.
+                out << "    if (c.kickPending)\n    {\n        if (cyc < c.kickEnd)\n        {\n";
+                if (n.drainedVariant == id)
+                    out << "            if (Vu1Native::leanStress())\n" << deopt(id, "DeoptXgkickBusy", "            ")
+                        << "            cyc = c.kickEnd;\n            Vu1Native::leanSubmitKick(vu, c);\n";
+                else if (n.drainedVariant != SIZE_MAX)
+                {
+                    out << "            if (!Vu1Native::leanStress() && c.kickEnd - cyc >= " << n.drainCycles << "u)\n            {\n";
+                    if (e.fdivRel)
+                        out << "                Vu1Native::leanCommitQ(vu, c, cyc + " << int(e.fdivRel) << "u);\n";
+                    std::vector<std::pair<int, int>> efu;
+                    for (int i = 0; i < 2; ++i)
+                        if (e.efuRel[i])
+                            efu.push_back({e.efuRel[i], i});
+                    std::sort(efu.begin(), efu.end());
+                    for (auto [rel, i] : efu)
+                        out << "                s.p = c.p[" << i << "];\n";
+                    out << "                cyc = c.kickEnd;\n                Vu1Native::leanSubmitKick(vu, c);\n"
+                        << "                goto N" << n.drainedVariant << ";\n            }\n";
+                    out << deopt(id, "DeoptXgkickBusy", "            ");
+                }
+                else
+                    out << deopt(id, "DeoptXgkickBusy", "            ");
+                out << "        }\n        else\n            Vu1Native::leanSubmitKick(vu, c);\n    }\n";
+                out << "    if (!Vu1Native::leanKick(vu, c, mem, 0x4000u, s.vi[" << int(VIS(p.lower)) << "], cyc + " << n.stall << "u))\n"
+                    << deopt(id, "DeoptKickPacket", "    ");
+            }
+            const uint32_t opHi = (p.lower >> 25) & 0x7Fu;
+            if (lk == LowerKind::Branch && (opHi == 0x24u || opHi == 0x25u))
+            {
+                if (n.succ.size() != 1u || !n.succ[0].pending)
+                    { std::cerr << "ps2_vu1_recomp: JR node without a single pending successor\n"; return false; }
+                out << "    if (((static_cast<uint32_t>(static_cast<uint16_t>(" << rv(VIS(p.lower)) << ")) * 8u) & 0x3FFFu) != "
+                    << hx(n.succ[0].target) << ")\n" << deopt(id, "DeoptDispatch", "    ");
+            }
+            if (lk == LowerKind::Store)
+                out << "    if (c.kickPending && Vu1Native::leanKickConflict(c, Vu1Native::leanStoreAddr(s, " << hx(p.lower)
+                    << ", 0x4000u), cyc + " << n.stall << "u, 0x4000u))\n" << deopt(id, "DeoptKickWrite", "    ");
+            if (n.qPre)
+                out << "    Vu1Native::leanCommitQ(vu, c, cyc + " << int(e.fdivRel) << "u);\n";
+            if (n.pPre >= 0)
+                out << "    s.p = c.p[" << n.pPre << "];\n";
+            if (n.stall)
+                out << "    cyc += " << n.stall << "u;\n";
+            out << "    X" << std::hex << n.pc << std::dec << "(vu, s, mem, c, cyc);\n";
+            if (n.efuSlot >= 0)
+                out << "    c.p[" << n.efuSlot << "] = c.pNew;\n";
+            std::string taken;
+            if (lk == LowerKind::Branch)
+            {
+                const uint32_t it = VIT(p.lower), is = VIS(p.lower);
+                if ((opHi == 0x21u || opHi == 0x25u) && it != 0u)
+                    out << "    s.vi[" << it << "] = " << ((n.pc + 16u) / 8u) << ";\n";
+                const std::string a = "static_cast<int16_t>(" + rv(is) + ")", b = "static_cast<int16_t>(" + rv(it) + ")";
+                switch (opHi)
+                {
+                case 0x28: taken = a + " == " + b; break;
+                case 0x29: taken = a + " != " + b; break;
+                case 0x2C: taken = a + " < 0"; break;
+                case 0x2D: taken = a + " > 0"; break;
+                case 0x2E: taken = a + " <= 0"; break;
+                case 0x2F: taken = a + " >= 0"; break;
+                default: break;
+                }
+                if (!taken.empty() && rv(it) == "c.viBackup" && (opHi == 0x21u || opHi == 0x25u))
+                    { std::cerr << "ps2_vu1_recomp: unexpected link/backup overlap\n"; return false; }
+            }
+            if (!taken.empty())
+                out << "    {\n        const bool taken = " << taken << ";\n";
+            const std::string in = taken.empty() ? "    " : "        ";
+            if (n.qPost)
+                out << in << "Vu1Native::leanCommitQ(vu, c, cyc + 1u);\n";
+            if (n.pPost >= 0)
+                out << in << "s.p = c.p[" << n.pPost << "];\n";
+            out << in << "cyc += 1u;\n";
+            if (n.ended)
+            {
+                const auto &x = n.exit.node;
+                out << in << "s.pc = " << hx(x.pc) << ";\n" << in << "s.branchPending = " << ((x.flags & 1u) ? "true" : "false")
+                    << ";\n" << in << "s.branchTarget = " << hx(x.branchTarget) << ";\n" << in << "s.branchDelay = "
+                    << int(x.branchDelay) << ";\n" << in << "Vu1Native::leanEnd(vu, f, c, cyc, " << int(x.fdivRel) << ", "
+                    << int(x.efuRel[0]) << ", " << int(x.efuRel[1]) << ");\n" << in << "return Vu1Native::Handled;\n";
+                if (!taken.empty())
+                    out << "    }\n";
+                continue;
+            }
+            if (!taken.empty())
+            {
+                if (n.succ.size() != 2u)
+                    { std::cerr << "ps2_vu1_recomp: conditional branch without two successors\n"; return false; }
+                out << "        if (taken)\n            goto N" << n.succ[0].node << ";\n        goto N" << n.succ[1].node << ";\n    }\n";
+            }
+            else
+            {
+                if (n.succ.size() != 1u)
+                    { std::cerr << "ps2_vu1_recomp: node without a single successor\n"; return false; }
+                out << "    goto N" << n.succ[0].node << ";\n";
+            }
+        }
+        out << "deopt:\n    return Vu1Native::leanDeopt(vu, f, c, cyc, kLeanNodes[dn], kLeanTiming, dr, vuCode);\n}\n\n"
+            << "// Final MAC/status may differ from the interpreter where no instruction can read them.\n"
+            << "extern \"C\" __attribute__((visibility(\"default\"))) int rt_vu1_native_flags_exact()\n{\n    return "
+            << (flagsLive.size() == pcsUsed.size() ? 1 : 0) << ";\n}\n\n"
+            << "extern \"C\" __attribute__((visibility(\"default\"))) uint64_t rt_vu1_native_image_hash()\n{\n    return "
+            << hex(Vu1Native::imageHash(image.data(), static_cast<uint32_t>(image.size()))) << "ull;\n}\n";
+        return true;
+    }
 }
 
 // Callable in-process too (ps2_vu1_recomp_lib, e.g. an app recompiling on a device that can't spawn it).
@@ -154,14 +563,25 @@ int ps2x_vu1_recomp_main(int argc, char **argv)
     std::string elfPath, imagePath, outPath;
     std::vector<uint32_t> entries;
     bool exact = false; // --exact: bit-exact float model (for vu1_replay); default is the fast SIMD path
-    for (int i = 1; i < argc; ++i)
+    bool interpSteps = false; // --interp-steps: the previous generator (one VU1Interpreter::executePair per pair)
+    // PS2X_VU1_RECOMP_FLAGS (space-separated, e.g. "--interp-steps") adds options, for A/B builds
+    // through the app's game builder.
+    std::vector<std::string> args(argv + 1, argv + argc);
+    if (const char *extra = std::getenv("PS2X_VU1_RECOMP_FLAGS"))
     {
-        const std::string a = argv[i];
-        auto next = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
+        std::istringstream words(extra);
+        for (std::string w; words >> w;)
+            args.push_back(w);
+    }
+    for (size_t i = 0; i < args.size(); ++i)
+    {
+        const std::string a = args[i];
+        auto next = [&]() { return i + 1 < args.size() ? args[++i] : std::string(); };
         if (a == "--elf") elfPath = next();
         else if (a == "--image") imagePath = next();
         else if (a == "--out") outPath = next();
         else if (a == "--exact") exact = true;
+        else if (a == "--interp-steps") interpSteps = true;
         else if (a == "--entries")
         {
             std::stringstream list(next());
@@ -176,7 +596,7 @@ int ps2x_vu1_recomp_main(int argc, char **argv)
     }
     if (outPath.empty() || (elfPath.empty() == imagePath.empty()))
     {
-        std::cerr << "usage: ps2_vu1_recomp (--elf ELF | --image BIN) --out FILE.cpp [--entries a,b,...] [--exact]\n";
+        std::cerr << "usage: ps2_vu1_recomp (--elf ELF | --image BIN) --out FILE.cpp [--entries a,b,...] [--exact] [--interp-steps]\n";
         return 2;
     }
 
@@ -262,6 +682,9 @@ int ps2x_vu1_recomp_main(int argc, char **argv)
 
         const uint32_t pc = nodes[id].pc;
         const auto pair = Vu1Native::decode(*vu, image.data(), pc);
+        nodes[id].entry = Vu1Native::leanSnapshot(*vu);
+        if (nodes[id].entry.fdivValid && nodes[id].entry.node.fdivRel == 0u)
+            std::cerr << "warning: node " << id << " has an FDIV result due at entry\n";
         if (pair.upperUsage.reserved || pair.lowerUsage.reserved || pc + 8 > kCodeSize)
         {
             nodes[id].unsupported = true;
@@ -273,11 +696,25 @@ int ps2x_vu1_recomp_main(int argc, char **argv)
             Vu1Native::drain(drained);
             const size_t variant = intern(drained);
             nodes[id].drainedVariant = variant;
+            nodes[id].drainCycles = Vu1Native::drainCycles(*vu);
         }
+        Vu1Native::leanTag(*vu);
         nodes[id].stall = Vu1Native::resolveStall(*vu, pair);
-        if (Vu1Native::executeForExploration(*vu, pair, data.data(), static_cast<uint32_t>(data.size()), gs, kCodeSize))
+        nodes[id].qPre = Vu1Native::leanQLanded(*vu);
+        nodes[id].pPre = Vu1Native::leanPLanded(*vu);
+        const bool efuBefore[2] = {Vu1Native::efuValid(*vu, 0), Vu1Native::efuValid(*vu, 1)};
+        Vu1Native::leanUntag(*vu);
+        const bool endedHere =
+            Vu1Native::executeForExploration(*vu, pair, data.data(), static_cast<uint32_t>(data.size()), gs, kCodeSize);
+        nodes[id].qPost = Vu1Native::leanQLanded(*vu);
+        nodes[id].pPost = Vu1Native::leanPLanded(*vu);
+        for (int i = 0; i < 2; ++i)
+            if (!efuBefore[i] && Vu1Native::efuValid(*vu, i))
+                nodes[id].efuSlot = i;
+        if (endedHere)
         {
             nodes[id].ended = true;
+            nodes[id].exit = Vu1Native::leanSnapshot(*vu);
             continue;
         }
 
@@ -325,6 +762,8 @@ int ps2x_vu1_recomp_main(int argc, char **argv)
     for (auto &[pc, used] : pcsUsed)
     {
         (void)used;
+        if (!interpSteps)
+            break; // lean code doesn't use the decoded pairs
         out << "    constexpr Vu1Native::Pair kP" << std::hex << pc << std::dec << " = "
             << emitPair(Vu1Native::decode(base, image.data(), pc)) << ";\n";
     }
@@ -403,6 +842,14 @@ int ps2x_vu1_recomp_main(int argc, char **argv)
             if (e.pending)
                 delaySlot[e.node] = true;
         }
+
+    if (!interpSteps)
+    {
+        if (!emitLean(out, nodes, entries, entryNodes, image, base, flagsLive, pcsUsed, loopHead, exact))
+            return 1;
+        std::cerr << "wrote " << outPath << " (lean)\n";
+        return out.good() ? 0 : 1;
+    }
 
     auto isPlain = [&](size_t id)
     {
