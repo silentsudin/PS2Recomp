@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <unistd.h>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 
@@ -28,6 +29,137 @@ namespace ps2x::gs
             mix(reinterpret_cast<const uint8_t *>(&h), 4);
             mix(rgba.data(), rgba.size());
             return hash;
+        }
+
+        // RT_TEXTURE_RECOLOR=0: replace exact matches only (tests).
+        bool recolorEnabled()
+        {
+            static const bool on = [] { const char *e = std::getenv("RT_TEXTURE_RECOLOR"); return !e || *e != '0'; }();
+            return on;
+        }
+
+        // RT_TEXTURE_RECOLOR_TEST=swap: recolour every match with red and blue swapped (tests the
+        // recolour path end to end).
+        bool recolorSwapTest()
+        {
+            static const bool on = [] { const char *e = std::getenv("RT_TEXTURE_RECOLOR_TEST"); return e && !std::strcmp(e, "swap"); }();
+            return on;
+        }
+
+        bool paletted(uint32_t psm) { return psm == 0x13 || psm == 0x14 || psm == 0x1B || psm == 0x24 || psm == 0x2C; }
+
+        // A paletted texture's index pattern, palette aside: each distinct colour is a class,
+        // numbered by first appearance; the key hashes the class image. colours[i] is class i's
+        // colour. Two palettes of one texture give the same pattern unless one of them merges
+        // colours the other keeps apart.
+        bool indexPattern(uint32_t w, uint32_t h, const std::vector<uint8_t> &rgba, uint64_t &key, std::vector<uint32_t> &colours)
+        {
+            std::unordered_map<uint32_t, uint8_t> classOf;
+            colours.clear();
+            uint64_t hash = 1469598103934665603ull ^ 0x5348415045ull; // distinct from content keys
+            auto mix = [&](uint32_t v, int bytes) {
+                for (int i = 0; i < bytes; ++i)
+                {
+                    hash ^= (v >> (8 * i)) & 0xFF;
+                    hash *= 1099511628211ull;
+                }
+            };
+            mix(w, 4);
+            mix(h, 4);
+            for (size_t i = 0; i + 4 <= rgba.size(); i += 4)
+            {
+                uint32_t c;
+                std::memcpy(&c, &rgba[i], 4);
+                auto it = classOf.find(c);
+                if (it == classOf.end())
+                {
+                    if (colours.size() == 256)
+                        return false;
+                    it = classOf.emplace(c, uint8_t(colours.size())).first;
+                    colours.push_back(c);
+                }
+                mix(it->second, 1);
+            }
+            key = hash;
+            return true;
+        }
+
+        // Affine map (4x4 + offset, RGBA in 0..255) taking the reference palette's colours to
+        // the variant's, least squares, pulled towards identity where the colours don't pin it
+        // down. False if it doesn't fit (a palette swap no affine map explains).
+        bool fitRecolor(const std::vector<uint32_t> &from, const std::vector<uint32_t> &to, float out[20])
+        {
+            if (from.size() != to.size() || from.empty())
+                return false;
+            double ata[5][5] = {}, atb[5][4] = {};
+            auto chan = [](uint32_t c, int k) { return double((c >> (8 * k)) & 0xFF); };
+            for (size_t n = 0; n < from.size(); ++n)
+            {
+                double a[5] = {chan(from[n], 0), chan(from[n], 1), chan(from[n], 2), chan(from[n], 3), 1.0};
+                for (int i = 0; i < 5; ++i)
+                {
+                    for (int j = 0; j < 5; ++j)
+                        ata[i][j] += a[i] * a[j];
+                    for (int k = 0; k < 4; ++k)
+                        atb[i][k] += a[i] * chan(to[n], k);
+                }
+            }
+            const double lambda = 1.0;
+            for (int i = 0; i < 5; ++i)
+            {
+                ata[i][i] += lambda;
+                if (i < 4)
+                    atb[i][i] += lambda; // towards identity
+            }
+            // Gauss-Jordan on [ata | atb].
+            double m[5][9];
+            for (int i = 0; i < 5; ++i)
+            {
+                for (int j = 0; j < 5; ++j)
+                    m[i][j] = ata[i][j];
+                for (int k = 0; k < 4; ++k)
+                    m[i][5 + k] = atb[i][k];
+            }
+            for (int col = 0; col < 5; ++col)
+            {
+                int piv = col;
+                for (int r = col + 1; r < 5; ++r)
+                    if (std::fabs(m[r][col]) > std::fabs(m[piv][col]))
+                        piv = r;
+                if (std::fabs(m[piv][col]) < 1e-9)
+                    return false;
+                std::swap(m[col], m[piv]);
+                const double d = m[col][col];
+                for (int j = 0; j < 9; ++j)
+                    m[col][j] /= d;
+                for (int r = 0; r < 5; ++r)
+                    if (r != col && m[r][col] != 0.0)
+                    {
+                        const double f = m[r][col];
+                        for (int j = 0; j < 9; ++j)
+                            m[r][j] -= f * m[col][j];
+                    }
+            }
+            // x[i][k] = m[i][5 + k]: output channel k = sum_i x[i][k] * in_i (in_4 = 1).
+            for (size_t n = 0; n < from.size(); ++n)
+            {
+                double a[5] = {chan(from[n], 0), chan(from[n], 1), chan(from[n], 2), chan(from[n], 3), 1.0};
+                for (int k = 0; k < 4; ++k)
+                {
+                    double v = 0.0;
+                    for (int i = 0; i < 5; ++i)
+                        v += a[i] * m[i][5 + k];
+                    if (std::fabs(v - chan(to[n], k)) > 3.0)
+                        return false;
+                }
+            }
+            for (int k = 0; k < 4; ++k)
+            {
+                for (int i = 0; i < 4; ++i)
+                    out[k * 4 + i] = float(m[i][5 + k]);
+                out[16 + k] = float(m[4][5 + k]);
+            }
+            return true;
         }
 
         bool parseKey(const std::string &name, uint64_t &key)
@@ -78,6 +210,7 @@ namespace ps2x::gs
             m_packDir = packDir;
             m_pack.clear();
             m_handedOut.clear();
+            m_shapes.clear();
             m_ready.clear(); // outcomes for the previous pack
             if (!packDir.empty())
                 indexPack(packDir);
@@ -97,6 +230,20 @@ namespace ps2x::gs
                 m_pack[key] = e.path().string();
         }
         std::fprintf(stderr, "[textures] pack %s: %zu replacements\n", dir.c_str(), m_pack.size());
+    }
+
+    void TextureTools::forget(uint64_t contentKey)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_handedOut.erase(contentKey);
+    }
+
+    TextureTools::Stats TextureTools::stats() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        Stats s = m_stats;
+        s.patterns = m_shapes.size();
+        return s;
     }
 
     size_t TextureTools::packSize() const
@@ -148,6 +295,9 @@ namespace ps2x::gs
                 m_jobs.pop_front();
             }
             key = contentHash(job.width, job.height, job.rgba);
+            uint64_t shapeKey = 0;
+            std::vector<uint32_t> colours;
+            const bool hasShape = paletted(job.psm) && indexPattern(job.width, job.height, job.rgba, shapeKey, colours);
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 dumpDir = m_dumpDir;
@@ -188,6 +338,34 @@ namespace ps2x::gs
             r.stableKey = job.stableKey;
             r.contentKey = key;
             r.hit = !packPath.empty();
+            if (hasShape)
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (r.hit && recolorSwapTest())
+                {
+                    // Test hook: recolour exact matches too, red and blue swapped.
+                    r.recolor = true;
+                    float t[20] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+                    std::memcpy(r.transform, t, sizeof(t));
+                }
+                auto s = r.hit ? m_shapes.end() : m_shapes.find(shapeKey);
+                if (r.hit)
+                    m_shapes[shapeKey] = {key, colours};
+                else if (s != m_shapes.end() && recolorEnabled() && (++m_stats.fits, fitRecolor(s->second.colours, colours, r.transform)))
+                {
+                    ++m_stats.fitted;
+                    // Another palette of a replaced texture (a fade, a colour flash): its image,
+                    // recoloured.
+                    auto p = m_pack.find(s->second.contentKey);
+                    if (p != m_pack.end())
+                    {
+                        r.hit = r.recolor = true;
+                        r.contentKey = s->second.contentKey;
+                        packPath = p->second;
+                        handedOut = m_handedOut.count(r.contentKey) != 0;
+                    }
+                }
+            }
             if (r.hit && !handedOut)
             {
                 Image image = LoadImage(packPath.c_str());
@@ -205,7 +383,7 @@ namespace ps2x::gs
             }
             std::lock_guard<std::mutex> lock(m_mutex);
             if (r.hit)
-                m_handedOut.insert(key);
+                m_handedOut.insert(r.contentKey);
             m_ready.push_back(std::move(r));
         }
     }

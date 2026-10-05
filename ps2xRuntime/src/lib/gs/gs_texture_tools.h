@@ -30,6 +30,14 @@ namespace ps2x::gs
         bool active() const;
         // Replacement images in the pack. Any thread.
         size_t packSize() const;
+        // Palette matching: index patterns of replaced textures, fits tried and accepted.
+        struct Stats
+        {
+            size_t patterns = 0, fits = 0, fitted = 0;
+        };
+        Stats stats() const;
+        // The image for this content was dropped (memory budget): load its pixels again next time.
+        void forget(uint64_t contentKey);
 
         // A decoded texture read back by the GS (RGBA8, PS2 alpha: 0x80 = opaque). GS thread.
         void submit(uint64_t cacheKey, uint64_t stableKey, uint32_t width, uint32_t height, uint32_t psm,
@@ -44,6 +52,11 @@ namespace ps2x::gs
             bool hit = false;    // the pack replaces it
             uint32_t width = 0, height = 0;
             std::vector<uint8_t> rgba; // empty if the image for contentKey was handed out before
+            // Another palette of a texture the pack replaces (same index pattern): its image,
+            // recoloured by an affine map fitted between the two palettes. Rows r, g, b, a
+            // (dot with the texel, 0..255, PS2 alpha) then the offset.
+            bool recolor = false;
+            float transform[20] = {};
         };
         // Outcomes since the last call. GS thread.
         void collect(std::vector<Replacement> &out);
@@ -66,6 +79,15 @@ namespace ps2x::gs
         std::unordered_set<uint64_t> m_dumped;                // content keys already on disk
         std::unordered_map<uint64_t, std::string> m_pack;     // content key -> replacement PNG
         std::unordered_set<uint64_t> m_handedOut;             // content keys whose pixels were returned
+        // Paletted textures the pack replaced, by index pattern: their content key and the colour
+        // of each index class (in order of first appearance).
+        struct ShapeRef
+        {
+            uint64_t contentKey;
+            std::vector<uint32_t> colours;
+        };
+        std::unordered_map<uint64_t, ShapeRef> m_shapes;
+        Stats m_stats;
         bool m_stop = false;
         std::thread m_thread;
     };

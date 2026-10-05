@@ -14,6 +14,7 @@
 #include "gs_texture_tools.h"
 
 #include <algorithm>
+#include <deque>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -212,6 +213,11 @@ namespace ps2x::gs
                         if (shadow)
                             shadow->drop_texture_replacements();
                     m_hdImages.clear();
+                    m_hdByImage.clear();
+                    m_pendingImages.clear();
+                    m_pendingOrder.clear();
+                    m_shadowReplacements.clear();
+                    m_hdBytes = 0;
                     m_predicted.clear();
                     m_replaced.clear();
                 }
@@ -804,6 +810,89 @@ namespace ps2x::gs
                 textureToolsLocked();
             }
 
+            struct HdImage
+            {
+                Vulkan::ImageHandle image;
+                size_t bytes = 0;
+                uint64_t lastUsed = 0;
+                std::vector<uint64_t> stableKeys; // predictions binding it
+            };
+            struct PendingBind
+            {
+                uint64_t stableKey, cacheKey;
+                bool recolor;
+                float transform[20];
+            };
+            struct PendingImage
+            {
+                uint32_t width = 0, height = 0;
+                std::vector<uint8_t> rgba;
+                std::vector<PendingBind> binds;
+                bool queued = false;
+            };
+            static constexpr size_t kCreateBytesPerFrame = 24u << 20;
+
+            void predictLocked(uint64_t stableKey, Vulkan::ImageHandle image, const float *recolor = nullptr)
+            {
+                m_iface.set_texture_prediction(stableKey, image, recolor);
+                for (auto &shadow : m_shadowIf)
+                    if (shadow)
+                        shadow->set_texture_prediction(stableKey, image, recolor);
+            }
+
+            // recolor: another palette of the texture (TextureTools::Replacement::transform), or null.
+            void bindLocked(HdImage &hd, uint64_t contentKey, uint64_t stableKey, uint64_t cacheKey, const float *recolor)
+            {
+                // From now on every decode of this description binds the replacement (textures
+                // whose palette is reloaded every frame get a new cache key every frame).
+                hd.lastUsed = m_textureFrame;
+                m_recolored += recolor != nullptr;
+                m_replaced.insert(contentKey);
+                m_iface.replace_cached_texture(cacheKey, hd.image);
+                predictLocked(stableKey, hd.image, recolor);
+                if (m_predicted.insert(stableKey).second)
+                    hd.stableKeys.push_back(stableKey);
+                m_shadowReplacements[cacheKey] = {hd.image, 120u};
+            }
+
+            void evictLocked()
+            {
+                std::vector<std::pair<uint64_t, uint64_t>> byAge; // last used, content key
+                for (auto &[key, hd] : m_hdImages)
+                    if (m_textureFrame - hd.lastUsed > 120) // not drawn for two seconds
+                        byAge.emplace_back(hd.lastUsed, key);
+                std::sort(byAge.begin(), byAge.end());
+                const size_t target = m_hdBudget / 5 * 4;
+                size_t dropped = 0;
+                for (auto [age, key] : byAge)
+                {
+                    if (m_hdBytes <= target)
+                        break;
+                    auto it = m_hdImages.find(key);
+                    for (uint64_t stable : it->second.stableKeys)
+                        if (m_predicted.erase(stable))
+                            predictLocked(stable, {});
+                    for (auto sit = m_shadowReplacements.begin(); sit != m_shadowReplacements.end();)
+                        sit = sit->second.first == it->second.image ? m_shadowReplacements.erase(sit) : std::next(sit);
+                    m_hdByImage.erase(it->second.image.get());
+                    m_hdBytes -= it->second.bytes;
+                    m_replaced.erase(key);
+                    m_textures.forget(key);
+                    m_hdImages.erase(it);
+                    ++dropped;
+                }
+                if (dropped)
+                {
+                    // Cached textures still hold the dropped images: decode everything again
+                    // (predictions rebind the images that stay at once).
+                    m_iface.invalidate_texture_cache();
+                    for (auto &shadow : m_shadowIf)
+                        if (shadow)
+                            shadow->invalidate_texture_cache();
+                    m_evicted += dropped;
+                }
+            }
+
             void textureToolsLocked()
             {
                 if (!m_textures.active())
@@ -821,6 +910,8 @@ namespace ps2x::gs
                     m_dev->unmap_host_buffer(*rb.buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
                     m_textures.submit(rb.hash, rb.stable, rb.width, rb.height, rb.psm, std::move(rgba));
                 }
+                const auto started = std::chrono::steady_clock::now();
+                ++m_textureFrame;
                 m_replacements.clear();
                 m_textures.collect(m_replacements);
                 for (auto &r : m_replacements)
@@ -829,36 +920,82 @@ namespace ps2x::gs
                     {
                         // This description now decodes to something else: stop predicting it.
                         if (m_predicted.erase(r.stableKey))
-                        {
-                            m_iface.set_texture_prediction(r.stableKey, {});
-                            for (auto &shadow : m_shadowIf)
-                                if (shadow)
-                                    shadow->set_texture_prediction(r.stableKey, {});
-                        }
+                            predictLocked(r.stableKey, {});
                         continue;
                     }
-                    Vulkan::ImageHandle &image = m_hdImages[r.contentKey];
-                    if (!image && !r.rgba.empty())
+                    auto it = m_hdImages.find(r.contentKey);
+                    if (it != m_hdImages.end())
                     {
-                        // Sampled only (no storage usage): paraLLEl-GS recognises it as a
-                        // replacement and keeps it out of its image pool. A full mip chain, for
-                        // trilinear/anisotropic sampling.
-                        auto info = Vulkan::ImageCreateInfo::immutable_2d_image(r.width, r.height, VK_FORMAT_R8G8B8A8_UNORM, true);
-                        Vulkan::ImageInitialData init = {r.rgba.data(), 0, 0};
-                        image = m_dev->create_image(info, &init);
-                    }
-                    if (!image)
+                        bindLocked(it->second, r.contentKey, r.stableKey, r.cacheKey, r.recolor ? r.transform : nullptr);
                         continue;
-                    // From now on every decode of this description binds the replacement (textures
-                    // whose palette is reloaded every frame get a new cache key every frame).
-                    m_replaced.insert(r.contentKey);
-                    m_iface.replace_cached_texture(r.cacheKey, image);
-                    m_iface.set_texture_prediction(r.stableKey, image);
-                    for (auto &shadow : m_shadowIf)
-                        if (shadow)
-                            shadow->set_texture_prediction(r.stableKey, image);
-                    m_predicted.insert(r.stableKey);
-                    m_shadowReplacements[r.cacheKey] = {image, 120u};
+                    }
+                    // Not an image yet: created below, within a per-frame budget (a 4x pack has
+                    // images of 50 MB with mips; creating several at once would stall a frame).
+                    auto &pending = m_pendingImages[r.contentKey];
+                    if (!r.rgba.empty())
+                    {
+                        pending.width = r.width;
+                        pending.height = r.height;
+                        pending.rgba = std::move(r.rgba);
+                        if (!pending.queued)
+                        {
+                            pending.queued = true;
+                            m_pendingOrder.push_back(r.contentKey);
+                        }
+                    }
+                    PendingBind bind{r.stableKey, r.cacheKey, r.recolor, {}};
+                    if (r.recolor)
+                        std::memcpy(bind.transform, r.transform, sizeof(bind.transform));
+                    pending.binds.push_back(bind);
+                }
+                size_t created = 0;
+                while (!m_pendingOrder.empty() && created < kCreateBytesPerFrame)
+                {
+                    const uint64_t key = m_pendingOrder.front();
+                    m_pendingOrder.pop_front();
+                    auto pit = m_pendingImages.find(key);
+                    if (pit == m_pendingImages.end() || pit->second.rgba.empty())
+                        continue;
+                    PendingImage pending = std::move(pit->second);
+                    m_pendingImages.erase(pit);
+                    // Sampled only (no storage usage): paraLLEl-GS recognises it as a replacement
+                    // and keeps it out of its image pool. A full mip chain, for trilinear and
+                    // anisotropic sampling.
+                    auto info = Vulkan::ImageCreateInfo::immutable_2d_image(pending.width, pending.height, VK_FORMAT_R8G8B8A8_UNORM, true);
+                    Vulkan::ImageInitialData init = {pending.rgba.data(), 0, 0};
+                    HdImage hd;
+                    hd.image = m_dev->create_image(info, &init);
+                    if (!hd.image)
+                        continue;
+                    hd.bytes = pending.rgba.size() * 4 / 3;
+                    created += pending.rgba.size();
+                    m_hdBytes += hd.bytes;
+                    m_hdByImage[hd.image.get()] = key;
+                    auto &stored = m_hdImages[key] = std::move(hd);
+                    for (const PendingBind &b : pending.binds)
+                        bindLocked(stored, key, b.stableKey, b.cacheKey, b.recolor ? b.transform : nullptr);
+                }
+                // Least recently used images over the memory budget go (they load again when needed).
+                m_usedImages.clear();
+                m_iface.collect_used_replacements(m_usedImages);
+                for (const Vulkan::Image *image : m_usedImages)
+                {
+                    auto u = m_hdByImage.find(image);
+                    if (u != m_hdByImage.end())
+                        m_hdImages[u->second].lastUsed = m_textureFrame;
+                }
+                if (m_hdBytes > m_hdBudget)
+                    evictLocked();
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+                m_textureWorstMs = std::max(m_textureWorstMs, ms);
+                if (m_textureFrame % 300 == 0 && !m_hdImages.empty())
+                {
+                    const auto ts = m_textures.stats();
+                    std::fprintf(stderr, "[textures] pack: %zu images, %zu MB (budget %zu), %zu pending, %zu evicted, worst %.1f ms/frame; "
+                                         "palettes: %zu patterns, %zu/%zu fitted, %zu recoloured binds\n",
+                                 m_hdImages.size(), m_hdBytes >> 20, m_hdBudget >> 20, m_pendingOrder.size(), m_evicted,
+                                 m_textureWorstMs, ts.patterns, ts.fitted, ts.fits, m_recolored);
+                    m_textureWorstMs = 0.0;
                 }
                 // Shadow GS instances decode a frame later: keep trying for two seconds.
                 for (auto it = m_shadowReplacements.begin(); it != m_shadowReplacements.end();)
@@ -909,7 +1046,18 @@ namespace ps2x::gs
             TextureTools m_textures;
             std::vector<ParallelGS::GSRenderer::TextureReadback> m_readbacks;
             std::vector<TextureTools::Replacement> m_replacements;
-            std::unordered_map<uint64_t, Vulkan::ImageHandle> m_hdImages; // content key -> replacement image
+            std::unordered_map<uint64_t, HdImage> m_hdImages; // content key -> replacement image
+            std::unordered_map<const Vulkan::Image *, uint64_t> m_hdByImage;
+            std::unordered_map<uint64_t, PendingImage> m_pendingImages;
+            std::deque<uint64_t> m_pendingOrder;
+            std::vector<const Vulkan::Image *> m_usedImages;
+            size_t m_hdBytes = 0, m_evicted = 0, m_recolored = 0;
+            size_t m_hdBudget = [] {
+                const char *mb = std::getenv("RT_TEXTURE_PACK_BUDGET_MB");
+                return size_t(mb ? std::strtoull(mb, nullptr, 10) : 2048) << 20;
+            }();
+            uint64_t m_textureFrame = 0;
+            double m_textureWorstMs = 0.0;
             std::unordered_set<uint64_t> m_replaced; // content keys of pack images in use
             std::string m_packDir;
             std::unordered_map<uint64_t, std::pair<Vulkan::ImageHandle, uint32_t>> m_shadowReplacements;
