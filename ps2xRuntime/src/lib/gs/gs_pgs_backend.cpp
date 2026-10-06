@@ -282,11 +282,16 @@ namespace ps2x::gs
                 return m_shared && m_shared->wantDepth.load(std::memory_order_relaxed);
             }
 
-            void SnapshotDepth(uint32_t zbp, uint32_t fbw, uint32_t) override
+            void SnapshotDepth(uint32_t zbp, uint32_t fbw, uint32_t fbp) override
             {
                 const auto lock = lockDevice();
                 m_iface.flush();
-                m_iface.snapshot_depth(zbp, fbw, 512);
+                // A slot per frame buffer (the game double-buffers): the next frame's snapshot
+                // mustn't replace the one of the frame still on display.
+                uint32_t slot = m_depthSlotFbp[0] == fbp ? 0u : m_depthSlotFbp[1] == fbp ? 1u : (m_lastDepthSlot ^ 1u);
+                m_depthSlotFbp[slot] = fbp;
+                m_lastDepthSlot = slot;
+                m_iface.snapshot_depth(zbp, fbw, 512, slot);
             }
 
             // ---------------------------------------------------------------- GSPacketMirror
@@ -485,6 +490,9 @@ namespace ps2x::gs
                         vsync.depth_zbp = request.depthZbp;
                         vsync.depth_psm = 0x30u | (request.depthPsm & 0xFu); // PSMZ32/24/16/16S
                         vsync.scanout_motion = m_shared->wantMotion.load(std::memory_order_relaxed);
+                        // The snapshot of the frame in the buffer on display (circuit 1), else the newest.
+                        const uint32_t fbp = static_cast<uint32_t>(request.dispfb1 & 0x1FFu);
+                        vsync.depth_slot = m_depthSlotFbp[0] == fbp ? 0u : m_depthSlotFbp[1] == fbp ? 1u : m_lastDepthSlot;
                         static int dbg = 0;
                         if (std::getenv("RT_SHOW_DEPTH") && (dbg++ % 120) == 0)
                             std::fprintf(stderr, "[depth] zbp=%u psm=0x%x dispfb fbp=%u fbw=%u\n", request.depthZbp, vsync.depth_psm,
@@ -551,6 +559,7 @@ namespace ps2x::gs
 
         private:
             bool m_progressive = true;
+            uint32_t m_depthSlotFbp[2] = {~0u, ~0u}, m_lastDepthSlot = 0; // SnapshotDepth's slots
             std::atomic<uint32_t> m_samples{1};
             ParallelGS::Hacks m_hacks = {}; // every hack set so far (set_hacks replaces them all)
             bool m_motionEnabled = false;

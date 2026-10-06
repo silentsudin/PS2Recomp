@@ -67,6 +67,9 @@ namespace ps2x::gs
         // once every command buffer requested in it is submitted, so the presenter calls this
         // before starting a swapchain frame.
         std::function<void()> flushLocked;
+        // The backend records and submits only while holding `mutex` (no command buffer stays open
+        // outside it), so the presenter may let it go while it waits for a swapchain image.
+        bool submitsUnderLock = false;
     };
 
     // The shared device of a presenter made by createPgsPresenter, or nullptr.

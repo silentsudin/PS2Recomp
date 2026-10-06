@@ -26,6 +26,7 @@
 #include "device.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -185,6 +186,59 @@ namespace ps2x::gs
             uint64_t drawSerial = 1, snapshotSerial = 0;
         };
 
+        // The render targets and Z buffers frames draw into: the real ones, and one set per shadow
+        // frame (re-rendered frame generation).
+        struct TargetSet
+        {
+            std::unordered_map<uint32_t, Target> targets;
+            std::unordered_map<uint32_t, Vulkan::ImageHandle> depths;
+        };
+
+        float halfToFloat(uint16_t h)
+        {
+            const uint32_t sign = (h >> 15) & 1u, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
+            float f;
+            if (exp == 0)
+                f = std::ldexp(static_cast<float>(man), -24);
+            else if (exp == 31)
+                f = man ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
+            else
+                f = std::ldexp(static_cast<float>(man | 0x400u), static_cast<int>(exp) - 25);
+            return sign ? -f : f;
+        }
+
+        // A shadow frame's vertices: the 3D moved on by t frames along each vertex's motion (the HUD
+        // and 2D carry none, or the UI marks, and stay). A triangle with a vertex moving more than
+        // 200 GS pixels (a camera cut, a mismatched object) isn't moved. Z and texture
+        // coordinates stay, as paraLLEl-GS's shadow frames keep them.
+        void moveVertices(const std::vector<HwVertex> &in, float t, std::vector<HwVertex> &out)
+        {
+            out = in;
+            for (size_t i = 0; i + 3 <= out.size(); i += 3)
+            {
+                float dx[3], dy[3];
+                bool move = false, keep = false;
+                for (int k = 0; k < 3; ++k)
+                {
+                    const uint32_t m = out[i + k].motion;
+                    dx[k] = halfToFloat(static_cast<uint16_t>(m & 0xFFFFu));
+                    dy[k] = halfToFloat(static_cast<uint16_t>(m >> 16));
+                    if (!std::isfinite(dx[k]) || !std::isfinite(dy[k]))
+                        dx[k] = dy[k] = 0.0f;
+                    if (std::fabs(dx[k]) > 200.0f || std::fabs(dy[k]) > 200.0f)
+                        keep = true;
+                    move |= m != 0u;
+                }
+                if (!move || keep)
+                    continue;
+                for (int k = 0; k < 3; ++k)
+                {
+                    out[i + k].x += t * dx[k];
+                    out[i + k].y += t * dy[k];
+                }
+            }
+        }
+
         class HwBackend final : public GSRasterBackend, public PgsControl
         {
         public:
@@ -201,6 +255,7 @@ namespace ps2x::gs
                 }
                 const auto lock = lockDevice();
                 m_shared->flushLocked = nullptr;
+                m_shared->submitsUnderLock = false;
                 m_shared->attached = false;
                 m_shared->scanoutRing = 0;
                 m_shared->scanout.reset();
@@ -291,6 +346,7 @@ namespace ps2x::gs
                 m_shared->attached = true;
                 m_shared->scanoutRing = 3; // m_scanout
                 m_shared->flushLocked = [] {};
+                m_shared->submitsUnderLock = true;
                 const auto &props = m_dev->get_gpu_properties();
                 m_info.name = props.deviceName;
                 m_info.vendorId = props.vendorID;
@@ -580,6 +636,7 @@ namespace ps2x::gs
                     return;
                 auto cmd = m_dev->request_command_buffer();
                 record(*cmd, batches, vertices);
+                keepForShadows(batches, vertices);
                 batches.clear();
                 vertices.clear();
                 if (m_depthRequested)
@@ -742,18 +799,32 @@ namespace ps2x::gs
                         m_uiVerts.clear();
                     }
                     if (m_rescale.exchange(false))
-                        m_targets.clear(), m_depths.clear();
+                    {
+                        m_main = {};
+                        for (auto &set : m_shadowSets)
+                            set = {};
+                    }
                     servicePacks();
                     m_yScale = request.progressiveFields ? 2u : 1u;
                     m_motionOn = m_shared && m_shared->wantMotion.load(std::memory_order_relaxed);
+                    // Shadow frames start from empty buffers: published once the game has drawn
+                    // every buffer again.
+                    const uint32_t shadows = m_shared ? std::min(m_shared->wantShadows.load(std::memory_order_relaxed), kMaxShadows) : 0u;
+                    if (shadows != m_shadows)
+                    {
+                        m_shadows = shadows;
+                        m_shadowBatches.clear();
+                        m_shadowBatchVerts.clear();
+                        for (auto &set : m_shadowSets)
+                            set = {};
+                        m_shadowWarm = 0;
+                    }
                     auto cmd = m_dev->request_command_buffer();
                     // The presenter may still be sampling an older scanout image.
                     cmd->barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
                                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
                     record(*cmd, batches, vertices);
-                    batches.clear();
-                    vertices.clear();
                     const Vulkan::Image *scan = scanout(*cmd, request);
                     publishMap(*cmd);
                     if (scan && m_shared && m_shared->wantUi.load(std::memory_order_relaxed))
@@ -783,6 +854,34 @@ namespace ps2x::gs
                         if (request.readback && scan)
                             fence = used;
                     }
+                    // The shadows after the real frame (submitted first, so they don't delay it).
+                    if (m_shadows)
+                    {
+                        keepForShadows(batches, vertices);
+                        auto shadowCmd = m_dev->request_command_buffer();
+                        recordShadows(*shadowCmd, m_shadowBatches, m_shadowBatchVerts);
+                        m_shadowBatches.clear();
+                        m_shadowBatchVerts.clear();
+                        m_shadowIndex = (m_shadowIndex + 1u) % 3u;
+                        m_shadowWarm = std::min(m_shadowWarm + 1u, 3u);
+                        for (uint32_t i = 0; i < m_shadows; ++i)
+                        {
+                            m_set = &m_shadowSets[i];
+                            m_inShadow = true;
+                            m_shadowSlot = i;
+                            const Vulkan::Image *shadowScan = scan ? scanout(*shadowCmd, request) : nullptr;
+                            m_inShadow = false;
+                            m_set = &m_main;
+                            if (shadowScan && m_shadowWarm >= 3u)
+                            {
+                                m_shared->shadowScanout[i] = m_shadowScan[i][m_shadowIndex];
+                                m_shared->shadowSerial[i] = m_shared->presentSerial;
+                            }
+                        }
+                        submitRecorded(shadowCmd);
+                    }
+                    batches.clear();
+                    vertices.clear();
                     if (m_own)
                         m_dev->next_frame_context();
                 }
@@ -799,6 +898,9 @@ namespace ps2x::gs
                     m_stats.dateBatches = 0;
                     m_stats.motionVertices = 0;
                     std::fprintf(stderr, "[hwgs] batches broken by texture/CLUT changes: %.0f per present\n", m_breakEpoch / n);
+                    std::fprintf(stderr, "[hwgs] shadows: %u, recording %.2f ms per present; vertex-ring waits %.1f per present, %.2f ms\n",
+                                 m_shadows, m_stats.shadowUs / n / 1000.0, m_stats.vboWaits / n, m_stats.vboWaitUs / n / 1000.0);
+                    m_stats.vboWaits = m_stats.vboWaitUs = m_stats.shadowUs = 0;
                     m_breakEpoch = 0;
                 }
                 PresentationFrame frame{};
@@ -1222,7 +1324,7 @@ namespace ps2x::gs
             Target &target(uint32_t fbp, uint32_t fbw, uint32_t psm, uint32_t minHeight, Vulkan::CommandBuffer &cmd,
                            bool &passOpen)
             {
-                Target &t = m_targets[fbp];
+                Target &t = m_set->targets[fbp];
                 const uint32_t width = std::max<uint32_t>(fbw, 1u) * 64u;
                 const uint32_t height = std::max<uint32_t>((minHeight + 31u) & ~31u, 32u);
                 if (!t.color || t.width != width || t.height < height || t.sx != m_scale || t.sy != m_scale * m_yScale)
@@ -1273,7 +1375,7 @@ namespace ps2x::gs
 
             Vulkan::ImageHandle &depth(uint32_t zbp, const Target &t, Vulkan::CommandBuffer &cmd, bool &passOpen)
             {
-                Vulkan::ImageHandle &d = m_depths[zbp];
+                Vulkan::ImageHandle &d = m_set->depths[zbp];
                 const uint32_t w = t.color->get_width(), h = t.color->get_height();
                 if (!d || d->get_width() != w || d->get_height() != h)
                 {
@@ -1380,6 +1482,9 @@ namespace ps2x::gs
                     x0 = std::min(x0, vertices[i].x), x1 = std::max(x1, vertices[i].x);
                     y0 = std::min(y0, vertices[i].y), y1 = std::max(y1, vertices[i].y);
                 }
+                // Edges the scissor cut (the town map's window) are exact; the others get a margin.
+                m_mapClipped[0] |= x0 < sc.x0, m_mapClipped[1] |= y0 < sc.y0;
+                m_mapClipped[2] |= x1 > sc.x1 + 1, m_mapClipped[3] |= y1 > sc.y1 + 1;
                 x0 = std::max(x0, static_cast<float>(sc.x0)), y0 = std::max(y0, static_cast<float>(sc.y0));
                 x1 = std::min(x1, static_cast<float>(sc.x1 + 1)), y1 = std::min(y1, static_cast<float>(sc.y1 + 1));
                 if (x1 <= x0 || y1 <= y0)
@@ -1396,16 +1501,30 @@ namespace ps2x::gs
                 const Target &m = m_mapLayers[m_mapIndex];
                 if (m_mapDrawn && m.color && m_mapBox[2] > m_mapBox[0])
                 {
-                    // Steady while the same map is shown: the box only grows (frames where part of the
-                    // map is clipped or drawn later don't shrink it), and starts again once the map
-                    // has been gone a while.
-                    if (m_mapStable[2] > m_mapStable[0])
+                    // A fixed size while the same map is shown: the first frame's box with a margin
+                    // where the scissor didn't cut it (a race map's outline wobbles a pixel or two as
+                    // it is drawn; the town map fills its window exactly), grown only when the
+                    // drawing leaves it, kept until the map has been gone for two seconds (another
+                    // course or town). A box that changed with the drawing made the second screen's
+                    // map change size.
+                    constexpr float kMargin = 4.0f; // GS pixels
+                    const bool inside = m_mapStable[2] > m_mapStable[0] && m_mapBox[0] >= m_mapStable[0] && m_mapBox[1] >= m_mapStable[1] &&
+                                        m_mapBox[2] <= m_mapStable[2] && m_mapBox[3] <= m_mapStable[3];
+                    if (!inside)
+                    {
+                        const bool had = m_mapStable[2] > m_mapStable[0];
                         for (int i = 0; i < 2; ++i)
                         {
-                            m_mapBox[i] = std::min(m_mapBox[i], m_mapStable[i]);
-                            m_mapBox[i + 2] = std::max(m_mapBox[i + 2], m_mapStable[i + 2]);
+                            const float lo = m_mapBox[i] - (m_mapClipped[i] ? 0.0f : kMargin);
+                            const float hi = m_mapBox[i + 2] + (m_mapClipped[i + 2] ? 0.0f : kMargin);
+                            m_mapStable[i] = had ? std::min(m_mapStable[i], lo) : lo;
+                            m_mapStable[i + 2] = had ? std::max(m_mapStable[i + 2], hi) : hi;
                         }
-                    std::memcpy(m_mapStable, m_mapBox, sizeof(m_mapBox));
+                        m_mapStable[0] = std::max(m_mapStable[0], 0.0f), m_mapStable[1] = std::max(m_mapStable[1], 0.0f);
+                        m_mapStable[2] = std::min(m_mapStable[2], static_cast<float>(m.width));
+                        m_mapStable[3] = std::min(m_mapStable[3], static_cast<float>(m.height));
+                    }
+                    std::memcpy(m_mapBox, m_mapStable, sizeof(m_mapBox));
                     // Sampled by the presenter from here on (back to an attachment when reused).
                     cmd.image_barrier(*m.color, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -1422,12 +1541,16 @@ namespace ps2x::gs
                     m_mapIndex ^= 1u;
                     m_mapMissed = 0;
                 }
-                else if (++m_mapMissed > 10)
+                else
                 {
-                    m_shared->map.reset(); // no map for a while: none to show
-                    m_mapStable[0] = m_mapStable[2] = 0; // the next map (another course or town) starts afresh
+                    ++m_mapMissed;
+                    if (m_mapMissed > 10)
+                        m_shared->map.reset(); // no map for a while: none to show
+                    if (m_mapMissed > 120)
+                        m_mapStable[0] = m_mapStable[2] = 0; // the next map (another course or town) gets its own box
                 }
                 m_mapDrawn = false;
+                m_mapClipped[0] = m_mapClipped[1] = m_mapClipped[2] = m_mapClipped[3] = false;
             }
 
             void endPass(Vulkan::CommandBuffer &cmd, bool &passOpen)
@@ -1582,7 +1705,14 @@ namespace ps2x::gs
                 VboSlot &slot = m_vbo[m_vboSlot];
                 if (slot.fence)
                 {
-                    slot.fence->wait();
+                    if (!slot.fence->wait_timeout(0))
+                    {
+                        // The GPU still reads this slot: the ring is too small for the frame.
+                        const auto t0 = std::chrono::steady_clock::now();
+                        slot.fence->wait();
+                        ++m_stats.vboWaits;
+                        m_stats.vboWaitUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+                    }
                     slot.fence.reset();
                 }
                 const size_t bytes = vertices.size() * sizeof(HwVertex);
@@ -1597,6 +1727,7 @@ namespace ps2x::gs
                 void *dst = m_dev->map_host_buffer(*slot.buffer, Vulkan::MEMORY_ACCESS_WRITE_BIT);
                 std::memcpy(dst, vertices.data(), bytes);
                 m_dev->unmap_host_buffer(*slot.buffer, Vulkan::MEMORY_ACCESS_WRITE_BIT);
+                m_vboPending.push_back(m_vboSlot);
                 return slot.buffer.get();
             }
 
@@ -1605,9 +1736,9 @@ namespace ps2x::gs
             {
                 Vulkan::Fence fence;
                 m_dev->submit(cmd, &fence);
-                if (m_vboUsed)
-                    m_vbo[m_vboSlot].fence = fence;
-                m_vboUsed = false;
+                for (uint32_t slot : m_vboPending) // every vertex slot this submit reads
+                    m_vbo[slot].fence = fence;
+                m_vboPending.clear();
                 if (extra)
                     *extra = fence;
             }
@@ -1616,14 +1747,18 @@ namespace ps2x::gs
             {
                 ++m_frame;
                 bool passOpen = false;
+                static const bool gpuTimes = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && *e == '1'; }();
+                Vulkan::QueryPoolHandle tsStart = gpuTimes ? cmd.write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                 const Vulkan::Buffer *vbo = uploadVertices(vertices);
-                m_vboUsed = vbo != nullptr;
-                m_stats.batches += batches.size();
-                m_stats.vertices += vertices.size();
+                if (!m_inShadow)
+                {
+                    m_stats.batches += batches.size();
+                    m_stats.vertices += vertices.size();
+                }
                 for (const Batch &b : batches)
                 {
                     const GSDrawState &s = b.state;
-                    if ((s.context.test >> 14) & 1u)
+                    if (!m_inShadow && ((s.context.test >> 14) & 1u))
                         ++m_stats.dateBatches;
                     const GSContext &ctx = s.context;
                     const uint32_t fpsm = ctx.frame.psm;
@@ -1635,6 +1770,8 @@ namespace ps2x::gs
                     Target &frameTarget =
                         target(ctx.frame.fbp, ctx.frame.fbw, fpsm, static_cast<uint32_t>(ctx.scissor.y1) + 1u, cmd, passOpen);
                     const bool toMap = b.map && m_shared && m_shared->wantMap.load(std::memory_order_relaxed);
+                    if (toMap && m_inShadow)
+                        continue; // (the real frame draws it into the map layer, not the frame)
                     Target &t = toMap ? mapLayer(frameTarget, cmd, passOpen) : frameTarget;
                     if (toMap)
                         noteMapBox(b, vertices);
@@ -1655,8 +1792,8 @@ namespace ps2x::gs
                     {
                         if (b.fromTarget)
                         {
-                            auto it = m_targets.find(b.targetFbp);
-                            if (it != m_targets.end() && it->second.color)
+                            auto it = m_set->targets.find(b.targetFbp);
+                            if (it != m_set->targets.end() && it->second.color)
                             {
                                 const Vulkan::Image &snap = snapshot(it->second, cmd, passOpen);
                                 texView = &snap.get_view();
@@ -1690,7 +1827,7 @@ namespace ps2x::gs
 
                     // Motion for TAA: a second attachment on the frame's targets while it is wanted.
                     Vulkan::Image *motionImage = nullptr;
-                    if (m_motionOn && !toMap)
+                    if (m_motionOn && !toMap && !m_inShadow)
                     {
                         if (!t.motion || t.motion->get_width() != t.color->get_width() || t.motion->get_height() != t.color->get_height())
                         {
@@ -1915,30 +2052,71 @@ namespace ps2x::gs
                     }
                 }
                 endPass(cmd, passOpen);
+                if (gpuTimes)
+                    m_dev->register_time_interval("GPU", std::move(tsStart), cmd.write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
+                                                  m_inShadow ? "gs: shadow recording" : "gs: real recording");
+            }
 
+            // Batches recorded before Present (buffer flips on the GS thread) wait for the shadows,
+            // which are all recorded at Present on the presenter's thread (the GS thread is the
+            // busiest: recording them there cost the game frames at 120 Hz).
+            void keepForShadows(const std::vector<Batch> &batches, const std::vector<HwVertex> &vertices)
+            {
+                if (!m_shadows || batches.empty())
+                    return;
+                const uint32_t base = static_cast<uint32_t>(m_shadowBatchVerts.size());
+                m_shadowBatchVerts.insert(m_shadowBatchVerts.end(), vertices.begin(), vertices.end());
+                for (const Batch &b : batches)
+                {
+                    m_shadowBatches.push_back(b);
+                    m_shadowBatches.back().firstVertex += base;
+                }
+            }
+
+            // Re-rendered frame generation: the same batches into each shadow's own targets, with
+            // the 3D moved on by (i + 1) / (shadows + 1) of a frame, so each shadow's frame buffers
+            // hold the game's frames as they would look that much later.
+            void recordShadows(Vulkan::CommandBuffer &cmd, const std::vector<Batch> &batches, const std::vector<HwVertex> &vertices)
+            {
+                if (batches.empty() || !m_shadows)
+                    return;
+                const auto t0 = std::chrono::steady_clock::now();
+                for (uint32_t i = 0; i < m_shadows; ++i)
+                {
+                    moveVertices(vertices, static_cast<float>(i + 1) / static_cast<float>(m_shadows + 1), m_shadowVerts);
+                    m_set = &m_shadowSets[i];
+                    m_inShadow = true;
+                    record(cmd, batches, m_shadowVerts);
+                    m_inShadow = false;
+                    m_set = &m_main;
+                }
+                m_stats.shadowUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
             }
 
             // ---------------------------------------------------------------- scanout
+            // The buffer on display into the next scanout image: the real frame's (shared with the
+            // presenter, with its motion), or (m_inShadow) shadow m_shadowSlot's.
             const Vulkan::Image *scanout(Vulkan::CommandBuffer &cmd, const GSPresentationRequest &r)
             {
                 const bool en1 = r.pmode & 1u, en2 = (r.pmode >> 1) & 1u;
                 const uint64_t dispfb = en1 ? r.dispfb1 : (en2 ? r.dispfb2 : r.dispfb1);
                 const uint64_t display = en1 ? r.display1 : (en2 ? r.display2 : r.display1);
                 const uint32_t fbp = dispfb & 0x1FFu;
-                m_scanFbp = fbp;
+                if (!m_inShadow)
+                    m_scanFbp = fbp;
                 const uint32_t dbx = (dispfb >> 32) & 0x7FFu, dby = (dispfb >> 43) & 0x7FFu;
                 const uint32_t magh = ((display >> 23) & 0xFu) + 1u;
                 const uint32_t dw = static_cast<uint32_t>((display >> 32) & 0xFFFu) + 1u;
                 uint32_t dh = static_cast<uint32_t>((display >> 44) & 0x7FFu) + 1u;
-                auto it = m_targets.find(fbp);
-                if (it == m_targets.end() || !it->second.color)
+                auto it = m_set->targets.find(fbp);
+                if (it == m_set->targets.end() || !it->second.color)
                 {
                     static int logged = 0;
-                    if (logged++ < 5)
+                    if (!m_inShadow && logged++ < 5)
                     {
                         std::cerr << "[hwgs] scanout: no target at fbp " << fbp << " (pmode " << std::hex << r.pmode
                                   << " dispfb " << dispfb << std::dec << "); targets:";
-                        for (auto &[f, t] : m_targets)
+                        for (auto &[f, t] : m_set->targets)
                             std::cerr << " " << f;
                         std::cerr << "\n";
                     }
@@ -1959,10 +2137,12 @@ namespace ps2x::gs
                 }
                 const uint32_t sx = t.sx, sy = t.sy;
                 const uint32_t outW = w * sx, outH = h * sy;
-                m_scanGeom = {dbx, dby, sx, sy, outW, outH};
-
-                m_scanoutIndex = (m_scanoutIndex + 1u) % 3u;
-                Vulkan::ImageHandle &out = m_scanout[m_scanoutIndex];
+                if (!m_inShadow)
+                {
+                    m_scanGeom = {dbx, dby, sx, sy, outW, outH};
+                    m_scanoutIndex = (m_scanoutIndex + 1u) % 3u;
+                }
+                Vulkan::ImageHandle &out = m_inShadow ? m_shadowScan[m_shadowSlot][m_shadowIndex] : m_scanout[m_scanoutIndex];
                 if (!out || out->get_width() != outW || out->get_height() != outH)
                 {
                     auto info = Vulkan::ImageCreateInfo::render_target(outW, outH, VK_FORMAT_R8G8B8A8_UNORM);
@@ -1987,6 +2167,8 @@ namespace ps2x::gs
                                   VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
                 // Motion: the same part, for TAA (the scanout's size, GS pixels), then cleared for the
                 // next frame.
+                if (m_inShadow)
+                    return out.get();
                 m_motionOut.reset();
                 if (m_motionOn && t.motion)
                 {
@@ -2020,8 +2202,8 @@ namespace ps2x::gs
             void snapshotDepthLocked(Vulkan::CommandBuffer &cmd, uint32_t zbp, uint32_t fbp)
             {
                 const ScanGeom &g = m_scanGeom;
-                auto it = m_depths.find(zbp);
-                if (it == m_depths.end() || !it->second || !g.outW || !g.outH || !m_depthCopyProgram)
+                auto it = m_main.depths.find(zbp);
+                if (it == m_main.depths.end() || !it->second || !g.outW || !g.outH || !m_depthCopyProgram)
                     return;
                 const Vulkan::Image &depth = *it->second;
                 m_depthIndex = (m_depthIndex + 1u) % 3u;
@@ -2254,6 +2436,7 @@ namespace ps2x::gs
             struct Stats
             {
                 uint64_t batches = 0, vertices = 0, passes = 0, snapshots = 0, decodes = 0, presents = 0, dateBatches = 0;
+                uint64_t vboWaits = 0, vboWaitUs = 0, shadowUs = 0; // frame generation's costs
                 std::atomic<uint64_t> motionVertices{0};
             } m_stats;
             uint64_t m_breakEpoch = 0;
@@ -2265,9 +2448,18 @@ namespace ps2x::gs
             uint64_t m_currentEpoch = 0;
             mutable std::mutex m_targetPagesMutex;
 
-            // Recording (device lock).
-            std::unordered_map<uint32_t, Target> m_targets;
-            std::unordered_map<uint32_t, Vulkan::ImageHandle> m_depths;
+            // Recording (device lock). m_set: the set being recorded (the real one, or a shadow's).
+            static constexpr uint32_t kMaxShadows = 3;
+            TargetSet m_main, m_shadowSets[kMaxShadows];
+            TargetSet *m_set = &m_main;
+            uint32_t m_shadows = 0; // shadow frames rendered (PgsShared::wantShadows)
+            bool m_inShadow = false;
+            std::vector<HwVertex> m_shadowVerts;
+            std::vector<Batch> m_shadowBatches; // this frame's batches so far, for the shadows
+            std::vector<HwVertex> m_shadowBatchVerts;
+            Vulkan::ImageHandle m_shadowScan[kMaxShadows][3];
+            uint32_t m_shadowIndex = 0, m_shadowSlot = 0;
+            uint32_t m_shadowWarm = 0; // presents since the shadows (re)started: their buffers fill first
             const Vulkan::Image *m_passColor = nullptr, *m_passDepth = nullptr;
             Vulkan::ImageHandle m_scanout[3];
             // The UI mask: the HUD's triangles (GS frame coordinates), staged by the GS thread,
@@ -2294,17 +2486,18 @@ namespace ps2x::gs
             uint32_t m_mapIndex = 0, m_mapMissed = 0;
             bool m_mapDrawn = false;
             float m_mapBox[4] = {};
-            float m_mapStable[4] = {}; // the box so far for the map on show (grow-only)
+            float m_mapStable[4] = {}; // the fixed box of the map on show
+            bool m_mapClipped[4] = {};  // this frame's map edges the scissor cut
             uint32_t m_scanoutIndex = 0;
             Vulkan::BufferHandle m_readback;
-            static constexpr uint32_t kVboRing = 8;
+            static constexpr uint32_t kVboRing = 32; // shadow frames upload their own vertices too
             struct VboSlot
             {
                 Vulkan::BufferHandle buffer;
                 Vulkan::Fence fence;
             } m_vbo[kVboRing];
             uint32_t m_vboSlot = 0;
-            bool m_vboUsed = false;
+            std::vector<uint32_t> m_vboPending; // slots written since the last submit
         };
     }
 

@@ -611,6 +611,38 @@ if(PS2X_ENABLE_PGS)
             set_source_files_properties(src/lib/gs/gs_metal_present.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
             target_link_libraries(ps2_runtime PRIVATE "-framework Metal" "-framework MetalFX" "-framework Foundation" "-framework QuartzCore")
         endif()
+        # Arm Accuracy Super Resolution (MIT; FSR 2-derived temporal upscaler): its library and
+        # Vulkan backend with the prebuilt shaders, on the presenter's device.
+        FetchContent_Declare(
+            arm_asr
+            GIT_REPOSITORY "https://github.com/arm/accuracy-super-resolution-generic-library.git"
+            GIT_TAG 0501f490bd9946a2e1806b5363d7ab8a9a6a5e0a
+            PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_arm_asr.cmake"
+            UPDATE_DISCONNECTED TRUE
+        )
+        FetchContent_GetProperties(arm_asr)
+        if(NOT arm_asr_POPULATED)
+            FetchContent_Populate(arm_asr)
+        endif()
+        set(_asr "${arm_asr_SOURCE_DIR}")
+        add_library(arm_asr STATIC
+            "${_asr}/src/shared/ffxm_assert.cpp"
+            "${_asr}/src/shared/ffxm_object_management.cpp"
+            "${_asr}/src/components/fsr2/ffxm_fsr2.cpp"
+            "${_asr}/src/backends/vk/ffxm_vk.cpp"
+            "${_asr}/src/backends/vk/ffxm_hash.cpp"
+            "${_asr}/src/backends/shared/ffxm_shader_blobs.cpp"
+            "${_asr}/src/backends/shared/blob_accessors/ffxm_fsr2_shaderblobs.cpp")
+        target_include_directories(arm_asr SYSTEM PUBLIC "${_asr}/include" "${_asr}/include/host" "${_asr}/include/host/backends/vk")
+        target_include_directories(arm_asr SYSTEM PRIVATE "${_asr}" "${_asr}/include/gpu" "${_asr}/src/backends/shared"
+                                   "${_asr}/src/backends/vk" "${_asr}/src/components"
+                                   "${_asr}/src/backends/shared/blob_accessors/prebuilt_shaders")
+        target_compile_definitions(arm_asr PUBLIC FFXM_VKLOADER_VOLK=1 PRIVATE FFXM_FSR)
+        set_target_properties(arm_asr PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+        target_compile_options(arm_asr PRIVATE -w -include cstddef) # ffxm_hash.h uses size_t without it
+        target_link_libraries(arm_asr PUBLIC granite-volk-headers)
+        target_link_libraries(ps2_runtime PRIVATE arm_asr)
+        target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_ARM_ASR=1)
     endif()
     message(STATUS "paraLLEl-GS Vulkan GS backend: enabled")
 endif()

@@ -17,6 +17,10 @@
 #include "gs_metal_present.h"
 #endif
 #include "post/post_spirv.h"
+#if defined(PS2X_HAVE_ARM_ASR)
+#include "ffxm_fsr2.h"
+#include "ffxm_vk.h"
+#endif
 
 // FidelityFX FSR 1 constants, computed on the CPU (post/ffx, MIT).
 #define A_CPU 1
@@ -282,7 +286,11 @@ namespace ps2x::gs
                                                             code, size, &fsVert, &frag);
                 };
                 m_fxaa = post(post_spirv::fxaa_frag, sizeof(post_spirv::fxaa_frag), 8, 0x1);
-                m_easu = post(post_spirv::fsr_easu_frag, sizeof(post_spirv::fsr_easu_frag), 80, 0);
+                // EASU in 16-bit arithmetic where the device has it (about half the cost on
+                // mobile GPUs: 1.5 ms a present at the Thor's 401 MHz); RT_FSR_FP32=1 keeps 32-bit.
+                const bool fp16 = m_shared.device->get_device_features().vk12_features.shaderFloat16 && !std::getenv("RT_FSR_FP32");
+                m_easu = fp16 ? post(post_spirv::fsr_easu_h_frag, sizeof(post_spirv::fsr_easu_h_frag), 80, 0)
+                              : post(post_spirv::fsr_easu_frag, sizeof(post_spirv::fsr_easu_frag), 80, 0);
                 m_rcas = post(post_spirv::fsr_rcas_frag, sizeof(post_spirv::fsr_rcas_frag), 32, 0);
                 m_sgsr1 = post(post_spirv::sgsr1_frag, sizeof(post_spirv::sgsr1_frag), 16, 0x1);
                 m_sgsr2Convert = post(post_spirv::sgsr2_convert_frag, sizeof(post_spirv::sgsr2_convert_frag), sizeof(Sgsr2Push), 0x1, 0x3);
@@ -696,7 +704,11 @@ namespace ps2x::gs
                     return;
                 }
 #endif
-                if (m_post.scaling == PostProcess::Scaling::Fsr1 && rect.extent.width > sw)
+                // Shadow frames (frame generation) can't go through GSR 2 or ASR (their history is the
+                // real frames'): FSR 1, which looks close.
+                const bool temporalUpscaler = m_post.scaling == PostProcess::Scaling::SnapdragonGsr2 ||
+                                              m_post.scaling == PostProcess::Scaling::ArmAsr;
+                if ((m_post.scaling == PostProcess::Scaling::Fsr1 || (m_noTemporal && temporalUpscaler)) && rect.extent.width > sw)
                 {
                     struct
                     {
@@ -706,13 +718,23 @@ namespace ps2x::gs
                     FsrEasuCon(push.con, push.con + 4, push.con + 8, push.con + 12, static_cast<AF1>(sw), static_cast<AF1>(sh),
                                static_cast<AF1>(sw), static_cast<AF1>(sh), static_cast<AF1>(rect.extent.width),
                                static_cast<AF1>(rect.extent.height));
+                    static const bool gpuTimesEasu = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && *e == '1'; }();
+                    Vulkan::QueryPoolHandle tsEasu = gpuTimesEasu ? cmd.write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                     offscreenPass(cmd, m_upImage, rect.extent.width, rect.extent.height, m_easu, *m_final, &push, sizeof(push));
+                    if (gpuTimesEasu)
+                        m_shared.device->register_time_interval("GPU", std::move(tsEasu), cmd.write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
+                                                                "post: FSR 1 EASU");
                     m_final = m_upImage.get();
                     m_finalRcas = true;
                 }
-                if (m_post.scaling == PostProcess::Scaling::SnapdragonGsr2 && rect.extent.width > sw &&
+                if (m_post.scaling == PostProcess::Scaling::SnapdragonGsr2 && !m_noTemporal && rect.extent.width > sw &&
                     upscaleSgsr2(cmd, sw, sh, rect.extent.width, rect.extent.height))
                     return;
+#if defined(PS2X_HAVE_ARM_ASR)
+                if (m_post.scaling == PostProcess::Scaling::ArmAsr && !m_noTemporal && rect.extent.width > sw &&
+                    upscaleArmAsr(cmdHandle, sw, sh, rect.extent.width, rect.extent.height))
+                    return;
+#endif
                 if (m_post.scaling == PostProcess::Scaling::SnapdragonGsr1 && m_sgsr1 && rect.extent.width > sw)
                 {
                     // Snapdragon GSR 1: upscaling and sharpening in one pass (no RCAS after it).
@@ -729,14 +751,19 @@ namespace ps2x::gs
                 m_progressiveFields = runtime.gsUnsynced().progressiveFields();
                 const bool on = m_post.aa == PostProcess::AntiAliasing::Taa ||
                                 m_post.scaling == PostProcess::Scaling::MetalFxTemporal ||
-                                m_post.scaling == PostProcess::Scaling::SnapdragonGsr2;
-                const bool motion = on || m_fg.factor > 1; // frame generation needs motion and depth too
+                                m_post.scaling == PostProcess::Scaling::SnapdragonGsr2 ||
+                                m_post.scaling == PostProcess::Scaling::ArmAsr;
+                // Per-pixel motion and depth: the temporal passes and the picture-warping frame
+                // generation. Re-rendered frame generation needs only the tracker's per-vertex
+                // motion (the side data stays on for the UI mask), not the GPU's motion attachment
+                // and depth snapshots (on the Thor at 120 Hz, GPU time it can't spare).
+                const bool motion = on || (m_fg.factor > 1 && !m_fg.rerender);
                 m_shared.wantShadows = m_fg.factor > 1 && m_fg.rerender ? m_fg.factor - 1 : 0u;
                 if (!m_showMotion && !m_showDepth)
                 {
                     m_shared.wantDepth = motion;
                     m_shared.wantMotion = motion;
-                    MotionTracker::instance().setEnabled(motion);
+                    MotionTracker::instance().setEnabled(motion || m_fg.factor > 1);
                 }
                 // Jitter across one picture pixel: the frame buffer is 640 x 224 (fields), the
                 // picture 2x or more of it.
@@ -746,7 +773,7 @@ namespace ps2x::gs
                 runtime.gsUnsynced().setTemporalJitter(on, sx, sy);
                 m_temporalOn = on;
                 if (!on)
-                    m_taaValid = m_sgsr2Valid = false;
+                    m_taaValid = m_sgsr2Valid = m_asrValid = false;
                 // Any post-processing (and frame generation) spares the UI (the GS marks where the HUD and 2D
                 // screens drew).
                 m_shared.wantUi = m_post.aa != PostProcess::AntiAliasing::None || m_post.scaling != PostProcess::Scaling::Bilinear ||
@@ -857,6 +884,179 @@ namespace ps2x::gs
                 m_sgsr2Valid = true;
                 return true;
             }
+
+#if defined(PS2X_HAVE_ARM_ASR)
+            // Arm Accuracy Super Resolution (FSR 2-derived, Arm's library with its own Vulkan
+            // backend and prebuilt shaders): the picture, the GS's depth (normalised, larger =
+            // nearer: inverted, infinite) and motion (jitter included: the library cancels it).
+            // It records raw Vulkan, so it gets a command buffer of its own between Granite's.
+            // False when it can't run (a 2D screen, or the library failed): the caller scales as usual.
+            struct ArmAsr
+            {
+                arm::FfxmFsr2Context context = {};
+                uint32_t renderW = 0, renderH = 0, displayW = 0, displayH = 0;
+                uint32_t retireFrames = 0; // dropped: destroyed when this counts down (the GPU is done)
+                bool created = false;
+                ~ArmAsr()
+                {
+                    if (created)
+                        arm::ffxmFsr2ContextDestroy(&context);
+                }
+            };
+
+            static void asrMessage(arm::FfxmMsgType type, const wchar_t *message)
+            {
+                std::fprintf(stderr, "[asr] %s: %ls\n", type == arm::FFXM_MESSAGE_TYPE_ERROR ? "error" : "warning", message);
+            }
+
+            bool upscaleArmAsr(Vulkan::CommandBufferHandle &cmd, uint32_t sw, uint32_t sh, uint32_t w, uint32_t h)
+            {
+                if (m_asrFailed || !m_shared.motion || !m_shared.depth || m_shared.motion->get_width() != sw ||
+                    m_shared.motion->get_height() != sh || m_shared.depth->get_width() != sw || m_shared.depth->get_height() != sh)
+                {
+                    m_asrValid = false;
+                    return false;
+                }
+                Vulkan::Device &dev = *m_shared.device;
+                // Contexts for up to two sizes (the picture's shape changes between screens). No GPU
+                // waits here (Granite's wait_idle would wait for this very command buffer): a
+                // dropped context is destroyed some frames later.
+                for (auto it = m_asrRetired.begin(); it != m_asrRetired.end();)
+                    it = --(*it)->retireFrames == 0 ? m_asrRetired.erase(it) : it + 1;
+                auto matches = [&](const std::unique_ptr<ArmAsr> &a) {
+                    return a && a->renderW == sw && a->renderH == sh && a->displayW == w && a->displayH == h;
+                };
+                if (!matches(m_asr) && matches(m_asrOther))
+                {
+                    std::swap(m_asr, m_asrOther);
+                    m_asrValid = false;
+                }
+                if (!matches(m_asr))
+                {
+                    if (m_asrOther)
+                    {
+                        m_asrOther->retireFrames = 8;
+                        m_asrRetired.push_back(std::move(m_asrOther));
+                    }
+                    m_asrOther = std::move(m_asr);
+                    auto asr = std::make_unique<ArmAsr>();
+                    // The library's Vulkan backend is one per process: made once, with room for
+                    // the two contexts and one being retired.
+                    arm::FfxmErrorCode err = arm::FFXM_OK;
+                    const char *step = "backend";
+                    if (m_asrScratch.empty())
+                    {
+                        constexpr size_t kContexts = 3 * FFXM_FSR2_CONTEXT_COUNT;
+                        const size_t size = arm::ffxmGetScratchMemorySizeVK(dev.get_physical_device(), kContexts);
+                        m_asrScratch.resize(size);
+                        m_asrDevice = {dev.get_device(), dev.get_physical_device(), vkGetDeviceProcAddr};
+                        err = arm::ffxmGetInterfaceVK(&m_asrIface, arm::ffxmGetDeviceVK(&m_asrDevice), m_asrScratch.data(), size,
+                                                      kContexts);
+                    }
+                    arm::FfxmFsr2ContextDescription desc = {};
+                    desc.qualityMode = arm::FFXM_FSR2_SHADER_QUALITY_MODE_QUALITY;
+                    desc.flags = arm::FFXM_FSR2_ENABLE_DEPTH_INVERTED | arm::FFXM_FSR2_ENABLE_DEPTH_INFINITE |
+                                 arm::FFXM_FSR2_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
+                    desc.maxRenderSize = {sw, sh};
+                    desc.displaySize = {w, h};
+                    desc.fpMessage = asrMessage;
+                    if (err == arm::FFXM_OK)
+                    {
+                        desc.backendInterface = m_asrIface;
+                        err = arm::ffxmFsr2ContextCreate(&asr->context, &desc);
+                        step = "context";
+                    }
+                    if (err != arm::FFXM_OK)
+                    {
+                        std::fprintf(stderr, "[asr] the upscaler could not be created (%s: error 0x%x); scaling without it\n", step,
+                                     static_cast<unsigned>(err));
+                        m_asrFailed = true;
+                        return false;
+                    }
+                    asr->created = true;
+                    asr->renderW = sw, asr->renderH = sh, asr->displayW = w, asr->displayH = h;
+                    m_asr = std::move(asr);
+                    m_asrValid = false;
+                }
+                if (!m_asrOut || m_asrOut->get_width() != w || m_asrOut->get_height() != h)
+                {
+                    auto info = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
+                    info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+                    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    m_asrOut = dev.create_image(info);
+                    cmd->image_barrier(*m_asrOut, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                       VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                    m_asrValid = false;
+                }
+                if (m_asrValid && m_shared.pictureSerial == m_asrSerial)
+                {
+                    m_final = m_asrOut.get(); // the same 3D again: the last output
+                    return true;
+                }
+                const float steps = pictureSteps(m_asrSerial);
+                const bool reset = !m_asrValid || steps == 0.0f;
+                m_asrSerial = m_shared.pictureSerial;
+                const PassInput depthIn[1] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(*cmd, m_depthNorm, sw, sh, m_depthNormalize, depthIn, 1, nullptr, 0, false, VK_FORMAT_R32_SFLOAT);
+                cmd->barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                             VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+                dev.submit(cmd);
+
+                auto resource = [](const Vulkan::Image &image, arm::FfxmSurfaceFormat format, uint32_t usage) {
+                    arm::FfxmResourceDescription d = {};
+                    d.type = arm::FFXM_RESOURCE_TYPE_TEXTURE2D;
+                    d.format = format;
+                    d.width = image.get_width();
+                    d.height = image.get_height();
+                    d.depth = 1;
+                    d.mipCount = 1;
+                    d.flags = arm::FFXM_RESOURCE_FLAGS_NONE;
+                    d.usage = static_cast<arm::FfxmResourceUsage>(usage);
+                    return arm::ffxmGetResourceVK(reinterpret_cast<void *>(image.get_image()), d, nullptr,
+                                                  arm::FFXM_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+                };
+                auto asrCmd = dev.request_command_buffer();
+                const float fw = static_cast<float>(sw), fh = static_cast<float>(sh);
+                const float k = std::max(steps, 1.0f);
+                arm::FfxmFsr2DispatchDescription d = {};
+                d.commandList = arm::ffxmGetCommandListVK(asrCmd->get_command_buffer());
+                d.color = resource(*m_final, arm::FFXM_SURFACE_FORMAT_R8G8B8A8_UNORM, arm::FFXM_RESOURCE_USAGE_READ_ONLY);
+                d.depth = resource(*m_depthNorm, arm::FFXM_SURFACE_FORMAT_R32_FLOAT, arm::FFXM_RESOURCE_USAGE_READ_ONLY);
+                d.motionVectors = resource(*m_shared.motion, arm::FFXM_SURFACE_FORMAT_R16G16_FLOAT, arm::FFXM_RESOURCE_USAGE_READ_ONLY);
+                d.output = resource(*m_asrOut, arm::FFXM_SURFACE_FORMAT_R8G8B8A8_UNORM,
+                                    arm::FFXM_RESOURCE_USAGE_RENDERTARGET | arm::FFXM_RESOURCE_USAGE_UAV);
+                // The camera's jitter in picture pixels; motion from current to previous in picture
+                // pixels (ours: current minus previous, GS pixels, one frame).
+                d.jitterOffset = {m_jitter[0] * fw / 640.0f, m_jitter[1] * fh / 224.0f};
+                d.motionVectorScale = {-k * fw / 640.0f, -k * fh / 224.0f};
+                d.renderSize = {sw, sh};
+                d.enableSharpening = true;
+                d.sharpness = m_post.sharpness;
+                d.frameTimeDelta = 1000.0f / 59.94f;
+                d.preExposure = 1.0f;
+                d.reset = reset;
+                d.cameraNear = 1.0f;
+                d.cameraFar = 100000.0f;
+                d.cameraFovAngleVertical = 1.03f; // Road Trip's cameras: about 74 degrees across at 4:3
+                d.viewSpaceToMetersFactor = 1.0f;
+                const arm::FfxmErrorCode err = arm::ffxmFsr2ContextDispatch(&m_asr->context, &d);
+                asrCmd->barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+                dev.submit(asrCmd);
+                cmd = dev.request_command_buffer();
+                if (err != arm::FFXM_OK)
+                {
+                    std::fprintf(stderr, "[asr] dispatch failed (%d); scaling without it\n", static_cast<int>(err));
+                    m_asrFailed = true;
+                    return false;
+                }
+                m_final = m_asrOut.get();
+                m_finalRcas = false; // its own RCAS (the Sharpening option)
+                m_asrValid = true;
+                return true;
+            }
+#endif
 
             void temporalAntiAliasing(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh)
             {
@@ -1702,7 +1902,23 @@ namespace ps2x::gs
                 }
                 else
                 {
-                    if (m_background || !m_wsi.begin_frame())
+                    // Acquiring the next image may wait a refresh or more (present wait). A
+                    // backend that never leaves command buffers open outside its lock (the
+                    // hardware GS) keeps drawing meanwhile: the lock is let go for it. (Holding it
+                    // there cost the hardware GS's frame generation half its frames.)
+                    bool begun = false;
+                    if (!m_background)
+                    {
+                        if (m_shared.submitsUnderLock)
+                        {
+                            lock.unlock();
+                            begun = m_wsi.begin_frame();
+                            lock.lock();
+                        }
+                        else
+                            begun = m_wsi.begin_frame();
+                    }
+                    if (!begun)
                         return;
                     backImage = &dev.get_swapchain_view().get_image();
                 }
@@ -1714,8 +1930,18 @@ namespace ps2x::gs
                 const bool fresh = m_lastTick != m_renderedTick;
                 m_renderedTick = m_lastTick;
                 m_subframe = fresh ? 0u : m_subframe + 1u;
+                // RT_GPU_TIMES=1: GPU time of the presenter's passes and the GS's recordings, logged
+                // every 2 s (per occurrence).
+                static const bool gpuTimes = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && *e == '1'; }();
+                Vulkan::QueryPoolHandle tsPost = gpuTimes ? cmd->write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                 if (fresh)
+                {
+                    Vulkan::QueryPoolHandle tsFlicker = gpuTimes ? cmd->write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                     blendFlicker(*cmd);
+                    if (gpuTimes)
+                        dev.register_time_interval("GPU", std::move(tsFlicker), cmd->write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
+                                                   "post: flicker blending");
+                }
                 if (m_fg.factor > 1)
                     generatedPicture(cmd, fw, fh, fresh);
                 else if (fresh || !m_lastPicture)
@@ -1734,6 +1960,21 @@ namespace ps2x::gs
                     m_finalRcas = m_lastRcas;
                 }
                 spareUi(*cmd, fw, fh);
+                if (gpuTimes)
+                {
+                    dev.register_time_interval("GPU", std::move(tsPost), cmd->write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
+                                               fresh ? "post: real frame" : "post: repeated/generated frame");
+                    static auto last = std::chrono::steady_clock::now();
+                    if (std::chrono::steady_clock::now() - last > std::chrono::seconds(2))
+                    {
+                        last = std::chrono::steady_clock::now();
+                        dev.timestamp_log([](const std::string &tag, const Vulkan::TimestampIntervalReport &r) {
+                            std::fprintf(stderr, "[gputime] %s: %.2f ms each, %.1f per frame context\n", tag.c_str(),
+                                         r.time_per_accumulation * 1000.0, r.accumulations_per_frame_context);
+                        });
+                        dev.timestamp_log_reset();
+                    }
+                }
 #if defined(__APPLE__)
                 if (m_metalPresent)
                 {
@@ -1771,9 +2012,13 @@ namespace ps2x::gs
 #endif
                 auto rp = dev.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
                 rp.clear_color[0] = {};
+                Vulkan::QueryPoolHandle tsPass = gpuTimes ? cmd->write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                 cmd->begin_render_pass(rp);
                 drawScene(*cmd, fw, fh);
                 cmd->end_render_pass();
+                if (gpuTimes)
+                    dev.register_time_interval("GPU", std::move(tsPass), cmd->write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
+                                               "swapchain pass");
                 dev.submit(cmd);
                 if (!m_capturePath.empty())
                     captureLocked(fw, fh);
@@ -1974,6 +2219,17 @@ namespace ps2x::gs
             uint32_t m_sgsr2Index = 0;
             bool m_sgsr2Valid = false;
             uint64_t m_sgsr2Serial = ~0ull, m_taaSerial = ~0ull, m_mfxSerial = ~0ull; // PgsShared::pictureSerial each last ran on
+#if defined(PS2X_HAVE_ARM_ASR)
+            std::vector<uint8_t> m_asrScratch; // the backend's (one per process; outlives the contexts)
+            arm::FfxmInterface m_asrIface = {};
+            arm::VkDeviceContext m_asrDevice = {};
+            std::unique_ptr<ArmAsr> m_asr, m_asrOther;
+            std::vector<std::unique_ptr<ArmAsr>> m_asrRetired;
+            Vulkan::ImageHandle m_asrOut;
+            uint64_t m_asrSerial = ~0ull;
+            bool m_asrFailed = false;
+#endif
+            bool m_asrValid = false;
             PostProcess m_post;
             Vulkan::ImageHandle m_aaImage, m_upImage; // intermediate pictures
             Vulkan::Program *m_depthView = nullptr, *m_motionView = nullptr, *m_taa = nullptr;
