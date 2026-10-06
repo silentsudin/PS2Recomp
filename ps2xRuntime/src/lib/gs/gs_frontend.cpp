@@ -727,12 +727,23 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
         data = m_wideScratch.data();
     }
 
+    // Per-vertex motion for the 3D (PATH1 with a motion context): mirrored to paraLLEl-GS below,
+    // and put on each vertex for primitive backends (GSVertex::motion).
+    m_packetMotion.clear();
+    ps2x::gs::MotionContext packetMotionContext;
+    const bool haveMotion = sideband && pathIndex == 0 && m_motionId &&
+                            ps2x::gs::MotionTracker::instance().context(m_motionId, packetMotionContext);
+    if (haveMotion && !m_packetMirror)
+    {
+        ps2x::gs::MotionTracker::packetMotion(data, sizeBytes & ~15u, packetMotionContext, m_packetMotion);
+        accumulateMotionStats();
+    }
     if (m_packetMirror && sideband)
     {
         // Per-vertex side data: motion for the 3D (PATH1 with a motion context), UI classes from
         // the classifier for the HUD and 2D screens.
-        ps2x::gs::MotionContext motion;
-        if (pathIndex == 0 && m_motionId && ps2x::gs::MotionTracker::instance().context(m_motionId, motion))
+        const ps2x::gs::MotionContext &motion = packetMotionContext;
+        if (haveMotion)
         {
             ps2x::gs::MotionTracker::packetMotion(data, sizeBytes & ~15u, motion, m_motionScratch);
             accumulateMotionStats();
@@ -1903,6 +1914,7 @@ void GS::vertexKick(bool drawing)
     const auto &classes = m_wide.vertexClasses();
     const uint32_t kick = m_packetKicks++;
     const uint8_t vertexClass = kick < classes.size() ? static_cast<uint8_t>(classes[kick]) : 0u;
+    m_vtxQueue[(m_vtxCount - 1) % kMaxVerts].motion = kick < m_packetMotion.size() ? m_packetMotion[kick] : 0u;
     if (drawing)
     {
         logBatchVertex(m_vtxQueue[(m_vtxCount - 1) % kMaxVerts]);

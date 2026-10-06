@@ -15,6 +15,7 @@
 #if defined(PS2X_HAVE_PGS)
 
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_motion.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "../gs_pgs_shared.h"
 #include "../post/post_spirv.h"
@@ -49,8 +50,9 @@ namespace ps2x::gs
             uint32_t rgba;
             float s, t, q;
             float fog;
+            uint32_t motion; // screen motion (two halves, GS pixels; 0 for the HUD and 2D)
         };
-        static_assert(sizeof(HwVertex) == 32);
+        static_assert(sizeof(HwVertex) == 36);
 
         struct Push
         {
@@ -178,6 +180,8 @@ namespace ps2x::gs
             uint32_t width = 0, height = 0; // GS pixels
             uint32_t sx = 1, sy = 1;        // device pixels per GS pixel
             Vulkan::ImageHandle color, snapshot;
+            Vulkan::ImageHandle motion; // RG16F per-pixel motion, while TAA wants it
+            bool motionStale = false;   // scanned out: cleared before the next frame draws into it
             uint64_t drawSerial = 1, snapshotSerial = 0;
         };
 
@@ -228,18 +232,24 @@ namespace ps2x::gs
                     m_shared = &m_ownShared;
                     m_own = true;
                 }
+                // RT_HWGS_MOTION=1: motion vectors without a presenter asking (headless tests).
+                if (const char *e = std::getenv("RT_HWGS_MOTION"); e && *e == '1')
+                {
+                    m_shared->wantMotion = true;
+                    MotionTracker::instance().setEnabled(true);
+                }
                 m_dev = m_shared->device;
                 if (const char *s = std::getenv("RT_GS_SCALE"))
                     m_scale = std::clamp<uint32_t>(static_cast<uint32_t>(std::atoi(s)), 1u, 6u);
 
                 const auto lock = lockDevice();
                 Vulkan::ResourceLayout vert = {};
-                vert.input_mask = 0x1F;
-                vert.output_mask = 0x7;
+                vert.input_mask = 0x3F;
+                vert.output_mask = 0xF;
                 vert.push_constant_size = sizeof(Push);
                 Vulkan::ResourceLayout frag = {};
-                frag.input_mask = 0x7;
-                frag.output_mask = 0x1;
+                frag.input_mask = 0xF;
+                frag.output_mask = 0x3; // colour, motion (unused without the motion attachment)
                 frag.push_constant_size = sizeof(Push);
                 frag.sets[0].sampled_image_mask = 0x3;
                 frag.sets[0].fp_mask = 0x3;
@@ -314,7 +324,10 @@ namespace ps2x::gs
             // ---------------------------------------------------------------- GSRasterBackend
             bool WantsPrimitives() const override { return true; }
             // The classifier's HUD/scene verdicts (GSPrimitiveBatch::vertexClass) for the UI mask.
-            bool WantsVertexSideband() const override { return m_shared && m_shared->wantUi.load(std::memory_order_relaxed); }
+            bool WantsVertexSideband() const override
+            {
+                return m_shared && (m_shared->wantUi.load(std::memory_order_relaxed) || m_shared->wantMotion.load(std::memory_order_relaxed));
+            }
 
             void Initialize(uint8_t *vram, uint32_t vramSize) override
             {
@@ -432,6 +445,8 @@ namespace ps2x::gs
                         o.q = v.q;
                     }
                     o.fog = v.fog;
+                    o.motion = v.motion;
+                    m_stats.motionVertices += v.motion != 0;
                     return o;
                 };
 
@@ -700,6 +715,7 @@ namespace ps2x::gs
                         m_targets.clear(), m_depths.clear();
                     servicePacks();
                     m_yScale = request.progressiveFields ? 2u : 1u;
+                    m_motionOn = m_shared && m_shared->wantMotion.load(std::memory_order_relaxed);
                     auto cmd = m_dev->request_command_buffer();
                     // The presenter may still be sampling an older scanout image.
                     cmd->barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -718,6 +734,7 @@ namespace ps2x::gs
                         outW = scan->get_width();
                         outH = scan->get_height();
                         m_shared->scanout = m_scanout[m_scanoutIndex];
+                        m_shared->motion = m_motionOut;
                         ++m_shared->presentSerial;
                     }
                     if (scan && request.readback)
@@ -738,7 +755,11 @@ namespace ps2x::gs
                     std::fprintf(stderr, "[hwgs] per present: %.0f batches (%.0f DATE), %.0f vertices, %.1f passes, %.1f snapshots, %.1f texture decodes\n",
                                  m_stats.batches / n, m_stats.dateBatches / n, m_stats.vertices / n, m_stats.passes / n,
                                  m_stats.snapshots / n, m_stats.decodes / n);
-                    m_stats = {};
+                    std::fprintf(stderr, "[hwgs] vertices with motion: %.0f per present (motion %s)\n", m_stats.motionVertices.load() / n,
+                                 m_motionOn ? "on" : "off");
+                    m_stats.batches = m_stats.vertices = m_stats.passes = m_stats.snapshots = m_stats.decodes = m_stats.presents = 0;
+                    m_stats.dateBatches = 0;
+                    m_stats.motionVertices = 0;
                     std::fprintf(stderr, "[hwgs] batches broken by texture/CLUT changes: %.0f per present\n", m_breakEpoch / n);
                     m_breakEpoch = 0;
                 }
@@ -1234,6 +1255,28 @@ namespace ps2x::gs
                 return d;
             }
 
+            // A target's motion image (RG16F, the colour's size), cleared to no motion.
+            void createMotion(Target &t, Vulkan::CommandBuffer &cmd)
+            {
+                auto info = Vulkan::ImageCreateInfo::render_target(t.color->get_width(), t.color->get_height(), VK_FORMAT_R16G16_SFLOAT);
+                info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                t.motion = m_dev->create_image(info);
+                clearMotion(*t.motion, cmd, VK_IMAGE_LAYOUT_UNDEFINED);
+            }
+
+            void clearMotion(const Vulkan::Image &image, Vulkan::CommandBuffer &cmd, VkImageLayout from)
+            {
+                cmd.image_barrier(image, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                                  VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                VkClearValue zero = {};
+                cmd.clear_image(image, zero);
+                cmd.image_barrier(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                                  VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            }
+
             // The map layer for this frame: an opaque image like the frame buffer's, filled with the
             // second screen's map background before the frame's first map draw (two, swapped at
             // Present, so the presenter samples a finished one).
@@ -1356,6 +1399,7 @@ namespace ps2x::gs
                     passOpen = false;
                     m_passColor = nullptr;
                     m_passDepth = nullptr;
+                    m_passMotion = nullptr;
                 }
             }
 
@@ -1605,15 +1649,34 @@ namespace ps2x::gs
                     if (date)
                         destView = &snapshot(t, cmd, passOpen).get_view();
 
-                    if (passOpen && (m_passColor != t.color.get() || m_passDepth != depthImage))
+                    // Motion for TAA: a second attachment on the frame's targets while it is wanted.
+                    Vulkan::Image *motionImage = nullptr;
+                    if (m_motionOn && !toMap)
+                    {
+                        if (!t.motion || t.motion->get_width() != t.color->get_width() || t.motion->get_height() != t.color->get_height())
+                        {
+                            endPass(cmd, passOpen);
+                            createMotion(t, cmd);
+                        }
+                        if (t.motionStale)
+                        {
+                            endPass(cmd, passOpen);
+                            clearMotion(*t.motion, cmd, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL);
+                            t.motionStale = false;
+                        }
+                        motionImage = t.motion.get();
+                    }
+                    if (passOpen && (m_passColor != t.color.get() || m_passDepth != depthImage || m_passMotion != motionImage))
                         endPass(cmd, passOpen);
                     if (!passOpen)
                     {
                         Vulkan::RenderPassInfo rp = {};
-                        rp.num_color_attachments = 1;
+                        rp.num_color_attachments = motionImage ? 2 : 1;
                         rp.color_attachments[0] = &t.color->get_view();
-                        rp.load_attachments = 1;
-                        rp.store_attachments = 1;
+                        if (motionImage)
+                            rp.color_attachments[1] = &motionImage->get_view();
+                        rp.load_attachments = motionImage ? 3 : 1;
+                        rp.store_attachments = motionImage ? 3 : 1;
                         if (depthImage)
                         {
                             rp.depth_stencil = &depthImage->get_view();
@@ -1624,6 +1687,7 @@ namespace ps2x::gs
                         passOpen = true;
                         m_passColor = t.color.get();
                         m_passDepth = depthImage;
+                        m_passMotion = motionImage;
                     }
                     ++t.drawSerial;
 
@@ -1639,6 +1703,7 @@ namespace ps2x::gs
                     cmd.set_vertex_attrib(2, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(HwVertex, rgba));
                     cmd.set_vertex_attrib(3, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(HwVertex, s));
                     cmd.set_vertex_attrib(4, 0, VK_FORMAT_R32_SFLOAT, offsetof(HwVertex, fog));
+                    cmd.set_vertex_attrib(5, 0, VK_FORMAT_R16G16_SFLOAT, offsetof(HwVertex, motion));
 
                     // Depth.
                     if (depthImage)
@@ -1779,7 +1844,8 @@ namespace ps2x::gs
                         unsupported("FBA");
 
                     cmd.set_vertex_binding(0, *vbo, 0, sizeof(HwVertex));
-                    cmd.set_color_write_mask(mask);
+                    // Motion from opaque draws only (blending would blend it); the HUD writes its zero.
+                    cmd.set_color_write_mask(mask | (motionImage && !s.prim.abe ? 0x30u : 0u));
                     cmd.set_specialization_constant_mask(0x7);
                     cmd.set_specialization_constant(0, p.mode[0]);
                     cmd.set_specialization_constant(1, p.mode[1]);
@@ -1876,6 +1942,35 @@ namespace ps2x::gs
                 cmd.image_barrier(*t.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
                                   VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                                   VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                // Motion: the same part, for TAA (the scanout's size, GS pixels), then cleared for the
+                // next frame.
+                m_motionOut.reset();
+                if (m_motionOn && t.motion)
+                {
+                    Vulkan::ImageHandle &mo = m_motionScan[m_scanoutIndex];
+                    if (!mo || mo->get_width() != outW || mo->get_height() != outH)
+                    {
+                        auto info = Vulkan::ImageCreateInfo::render_target(outW, outH, VK_FORMAT_R16G16_SFLOAT);
+                        info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                        info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                        mo = m_dev->create_image(info);
+                    }
+                    cmd.image_barrier(*t.motion, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                      VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+                    cmd.image_barrier(*mo, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                      0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                    cmd.copy_image(*mo, *t.motion, {0, 0, 0}, {static_cast<int32_t>(dbx * sx), static_cast<int32_t>(dby * sy), 0},
+                                   {outW, outH, 1}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
+                    cmd.image_barrier(*mo, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                      VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                    cmd.image_barrier(*t.motion, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+                                      VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                    t.motionStale = true; // (a repeated present shows this frame's motion again)
+                    m_motionOut = mo;
+                }
                 return out.get();
             }
 
@@ -1923,6 +2018,7 @@ namespace ps2x::gs
                     cmd.set_vertex_attrib(2, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(HwVertex, rgba));
                     cmd.set_vertex_attrib(3, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(HwVertex, s));
                     cmd.set_vertex_attrib(4, 0, VK_FORMAT_R32_SFLOAT, offsetof(HwVertex, fog));
+                    cmd.set_vertex_attrib(5, 0, VK_FORMAT_R16G16_SFLOAT, offsetof(HwVertex, motion));
                     auto *dst = static_cast<HwVertex *>(cmd.allocate_vertex_data(0, verts.size() * sizeof(HwVertex), sizeof(HwVertex)));
                     std::memcpy(dst, verts.data(), verts.size() * sizeof(HwVertex));
                     cmd.set_texture(0, 0, m_white->get_view(), sampler(false, false, false, false, false));
@@ -2068,6 +2164,7 @@ namespace ps2x::gs
             struct Stats
             {
                 uint64_t batches = 0, vertices = 0, passes = 0, snapshots = 0, decodes = 0, presents = 0, dateBatches = 0;
+                std::atomic<uint64_t> motionVertices{0};
             } m_stats;
             uint64_t m_breakEpoch = 0;
             uint64_t m_lastEviction = 0;
@@ -2091,6 +2188,10 @@ namespace ps2x::gs
             {
                 uint32_t dbx = 0, dby = 0, sx = 1, sy = 1, outW = 0, outH = 0;
             } m_scanGeom;
+            // Motion vectors (PgsShared::wantMotion): per-target attachments, the scanned-out part.
+            bool m_motionOn = false;
+            const Vulkan::Image *m_passMotion = nullptr;
+            Vulkan::ImageHandle m_motionScan[3], m_motionOut;
             Target m_mapLayers[2];
             uint32_t m_mapIndex = 0, m_mapMissed = 0;
             bool m_mapDrawn = false;

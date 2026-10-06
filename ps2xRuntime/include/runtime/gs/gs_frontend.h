@@ -278,6 +278,7 @@ private:
     int m_vtxCount = 0;
     int m_vtxIndex = 0;
     uint32_t m_packetKicks = 0; // vertex kicks so far in the packet being parsed
+    std::vector<uint32_t> m_packetMotion; // this packet's per-vertex motion (primitive backends)
 
     std::vector<uint8_t> m_displaySnapshot;
     std::mutex m_snapshotMutex;

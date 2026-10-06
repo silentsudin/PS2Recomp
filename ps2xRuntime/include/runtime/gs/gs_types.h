@@ -115,6 +115,9 @@ struct GSVertex
     uint16_t u = 0;
     uint16_t v = 0;
     uint8_t fog = 0;
+    // Screen motion, current minus previous frame (two halves, GS pixels; MotionTracker), for
+    // backends that ask (WantsVertexSideband with motion on); 0 = none.
+    uint32_t motion = 0;
 };
 
 struct GSFrameReg

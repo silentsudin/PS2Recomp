@@ -17,6 +17,7 @@ layout(set = 0, binding = 2) uniform Recolor
 layout(location = 0) in vec4 vColor;
 layout(location = 1) noperspective in vec3 vStq;
 layout(location = 2) noperspective in float vFog;
+layout(location = 3) noperspective in vec2 vMotion;
 
 // Per pipeline (one per combination the game uses): the feature flags below, the alpha test, and
 // which pass of the alpha test this is. Branches on them compile away.
@@ -36,6 +37,8 @@ layout(push_constant) uniform Push
 } push;
 
 layout(location = 0) out vec4 outColor;
+// Per-pixel motion for TAA and temporal upscalers (a second attachment while they are on).
+layout(location = 1) out vec4 outMotion;
 
 const uint F_TME = 1u, F_TCC = 8u, F_FGE = 16u, F_MIP = 1024u, F_LINEAR = 2048u, F_REPEAT_IN_SHADER = 4096u, F_DATE = 8192u,
            F_DATM = 16384u, F_REPLACED = 32768u, F_RECOLOR = 65536u;
@@ -160,4 +163,5 @@ void main()
     }
 
     outColor = vec4(rgb / 255.0, clamp(a / 128.0, 0.0, 1.0));
+    outMotion = vec4(vMotion, 0.0, 0.0);
 }
