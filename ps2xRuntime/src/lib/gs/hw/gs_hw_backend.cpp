@@ -340,10 +340,11 @@ namespace ps2x::gs
             // Depth for temporal upscalers: taken where the 3D ends (the HUD and the post-pass
             // overwrite Z), as raw GS Z the scanout's size (PgsShared::depth).
             bool WantsDepthSnapshot() const override { return m_shared && m_shared->wantDepth.load(std::memory_order_relaxed); }
-            void SnapshotDepth(uint32_t zbp, uint32_t) override
+            void SnapshotDepth(uint32_t zbp, uint32_t, uint32_t fbp) override
             {
                 publish(true);
                 m_depthRequestZbp = zbp;
+                m_depthRequestFbp = fbp;
                 m_depthRequested = true;
                 flushPending();
             }
@@ -584,7 +585,7 @@ namespace ps2x::gs
                 if (m_depthRequested)
                 {
                     m_depthRequested = false;
-                    snapshotDepthLocked(*cmd, m_depthRequestZbp);
+                    snapshotDepthLocked(*cmd, m_depthRequestZbp, m_depthRequestFbp);
                 }
                 submitRecorded(cmd);
                 // A device of its own: a frame context per flush (waits for the one a few flushes
@@ -765,8 +766,14 @@ namespace ps2x::gs
                         m_shared->scanout = m_scanout[m_scanoutIndex];
                         m_shared->motion = m_motionOut;
                         if (m_shared->wantDepth.load(std::memory_order_relaxed))
-                            m_shared->depth = m_depthReady; // the newest snapshot (2D frames keep the last 3D's)
+                        {
+                            // The snapshot of the 3D in the buffer on display; else the newest (2D
+                            // frames keep the last 3D's).
+                            const auto it = m_depthByFbp.find(m_scanFbp);
+                            m_shared->depth = it != m_depthByFbp.end() ? it->second : m_depthReady;
+                        }
                         ++m_shared->presentSerial;
+                        m_shared->pictureSerial = request.frame3D;
                     }
                     if (scan && request.readback)
                         readbackCopy(*cmd, *scan);
@@ -1918,6 +1925,7 @@ namespace ps2x::gs
                 const uint64_t dispfb = en1 ? r.dispfb1 : (en2 ? r.dispfb2 : r.dispfb1);
                 const uint64_t display = en1 ? r.display1 : (en2 ? r.display2 : r.display1);
                 const uint32_t fbp = dispfb & 0x1FFu;
+                m_scanFbp = fbp;
                 const uint32_t dbx = (dispfb >> 32) & 0x7FFu, dby = (dispfb >> 43) & 0x7FFu;
                 const uint32_t magh = ((display >> 23) & 0xFu) + 1u;
                 const uint32_t dw = static_cast<uint32_t>((display >> 32) & 0xFFFu) + 1u;
@@ -2009,7 +2017,7 @@ namespace ps2x::gs
                 return out.get();
             }
 
-            void snapshotDepthLocked(Vulkan::CommandBuffer &cmd, uint32_t zbp)
+            void snapshotDepthLocked(Vulkan::CommandBuffer &cmd, uint32_t zbp, uint32_t fbp)
             {
                 const ScanGeom &g = m_scanGeom;
                 auto it = m_depths.find(zbp);
@@ -2053,6 +2061,7 @@ namespace ps2x::gs
                                   VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
                 m_depthReady = out;
+                m_depthByFbp[fbp] = out;
             }
 
             // The UI mask (PgsShared::ui, the scanout's size): 1 where the frame's HUD and 2D screens
@@ -2277,8 +2286,10 @@ namespace ps2x::gs
             // HUD starts, copied after the frame's 3D is recorded.
             Vulkan::Program *m_depthCopyProgram = nullptr;
             bool m_depthRequested = false;
-            uint32_t m_depthRequestZbp = 0, m_depthIndex = 0;
+            uint32_t m_depthRequestZbp = 0, m_depthRequestFbp = 0, m_depthIndex = 0;
+            std::map<uint32_t, Vulkan::ImageHandle> m_depthByFbp; // the latest snapshot per 3D frame buffer
             Vulkan::ImageHandle m_depthOut[3], m_depthReady;
+            uint32_t m_scanFbp = 0; // the frame buffer the last scanout showed
             Target m_mapLayers[2];
             uint32_t m_mapIndex = 0, m_mapMissed = 0;
             bool m_mapDrawn = false;

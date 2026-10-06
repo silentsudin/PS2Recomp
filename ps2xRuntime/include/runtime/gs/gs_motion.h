@@ -31,6 +31,7 @@ namespace ps2x::gs
         Mat4 cur;      // this frame's C
         Mat4 curInv;   // its inverse
         Mat4 prev;     // last frame's C for the same object (== cur when unmatched: no motion)
+        float jitter[2] = {}; // the camera jitter (GS pixels) of the frame this run belongs to
     };
 
     class MotionTracker
@@ -47,6 +48,10 @@ namespace ps2x::gs
         // EE, at the game's clear (the VIF queue is drained): this frame's objects become last
         // frame's.
         void frameStart();
+        // EE, as the player camera is built: the jitter it gets (GS pixels). The VU1 runs that
+        // follow carry it, so the GS thread, which lags the EE by up to a frame, knows the jitter
+        // of the 3D it is drawing.
+        void noteCameraJitter(float x, float y);
         // GS thread: a context by id (false if unknown or overwritten).
         bool context(uint32_t id, MotionContext &out) const;
 
@@ -103,6 +108,7 @@ namespace ps2x::gs
         static constexpr uint32_t kRing = 1u << 14;
         std::vector<MotionContext> m_ring = std::vector<MotionContext>(kRing);
         uint32_t m_nextId = 1;
+        float m_cameraJitter[2] = {};
         Stats m_stats{}, m_lastStats{};
     };
 }

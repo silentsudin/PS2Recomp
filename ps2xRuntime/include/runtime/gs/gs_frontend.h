@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -129,6 +130,7 @@ public:
     // pixels, sized so it spans one pixel of the picture (fbPerPixel: frame-buffer pixels per
     // picture pixel). The game hook adds it to the player cameras (cameraJitter).
     void setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY);
+    // Also notes it for the motion contexts (MotionTracker::noteCameraJitter).
     bool cameraJitter(float &x, float &y) const;
     // The jitter of the frame whose depth/motion were last kept, and of the one before.
     void snapshotJitter(float &curX, float &curY, float &prevX, float &prevY) const;
@@ -225,6 +227,13 @@ private:
     uint64_t m_motionHist[6] = {};
     GSZbufReg m_lastZbuf3D{};              // the Z buffer of the last 3D (PATH1) draw
     bool m_haveZbuf3D = false;
+    uint64_t m_frames3D = 0;                    // 3D frames completed so far
+    std::map<uint32_t, uint64_t> m_frame3DByFbp; // the latest of them per frame buffer
+    // No HUD start for a while (2D screens, scenes the classifier finds no HUD in): every
+    // presentation is a new picture (m_fallbackFrame3D, kept apart from the numbering above).
+    uint64_t m_framesAtLatch = 0, m_fallbackFrame3D = 0;
+    uint32_t m_latchesWithoutHud = 0;
+    float m_frameJitter[2] = {}; // the camera jitter of the 3D being drawn (from its motion contexts)
     // m_wide's answers for other threads without the state lock (the game's camera hook asks on
     // every camera build): published after each change, under the lock.
     std::atomic<bool> m_wideDriving{false}, m_wide2D{false};
@@ -235,6 +244,12 @@ private:
     std::atomic<float> m_jitterScaleX{0.5f}, m_jitterScaleY{0.25f};
     std::atomic<uint32_t> m_frameIndex{0};
     float m_snapJitter[4] = {}; // cur x, y, prev x, y (under m_stateMutex)
+    // The same per frame buffer the 3D drew into (FBP), and that of the buffer on display when
+    // the presenter last latched a picture: the GS thread may have drawn the next frame's 3D by
+    // then, so the newest snapshot is not always the picture's.
+    std::map<uint32_t, std::array<float, 4>> m_jitterByFbp;
+    float m_presentJitter[4] = {};
+    uint32_t m_lastFbp3D = 0;
     std::atomic<float> m_wideK{1.0f};
     void publishWideUnlocked();
     std::vector<uint8_t> m_wideScratch;    // the packet being transformed

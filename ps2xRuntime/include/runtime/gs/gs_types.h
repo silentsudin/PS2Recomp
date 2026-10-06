@@ -307,6 +307,10 @@ struct GSPresentationRequest
     bool depthValid = false;
     uint32_t depthZbp = 0;
     uint32_t depthPsm = 0; // ZBUF.PSM (low 4 bits)
+    // Which of the game's 3D frames the buffer on display holds (counted where each frame's HUD
+    // begins; 0 = none yet): the same number = the same picture, a step of more than 1 = the
+    // presenter missed pictures (the motion covers one frame).
+    uint64_t frame3D = 0;
 };
 
 struct PresentationFrame

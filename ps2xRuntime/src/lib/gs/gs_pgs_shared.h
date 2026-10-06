@@ -51,6 +51,11 @@ namespace ps2x::gs
         Vulkan::ImageHandle shadowScanout[3];
         // Which real frame each shadow picture belongs to (presentSerial counts real scanouts).
         uint64_t presentSerial = 0;
+        // The game's 3D frame on show (GSPresentationRequest::frame3D). Temporal passes (TAA, GSR 2,
+        // MetalFX) run once per picture, and scale the motion (one frame's) by how many frames the
+        // picture is past their history: with the game ahead of the presenter (a slow present,
+        // lockstep tests), the history is several frames back.
+        uint64_t pictureSerial = 0;
         uint64_t shadowSerial[3] = {};
         // A paraLLEl-GS backend renders on this device (otherwise the CPU GS: pictures are uploaded).
         bool attached = false;

@@ -282,7 +282,7 @@ namespace ps2x::gs
                 return m_shared && m_shared->wantDepth.load(std::memory_order_relaxed);
             }
 
-            void SnapshotDepth(uint32_t zbp, uint32_t fbw) override
+            void SnapshotDepth(uint32_t zbp, uint32_t fbw, uint32_t) override
             {
                 const auto lock = lockDevice();
                 m_iface.flush();
@@ -522,7 +522,10 @@ namespace ps2x::gs
                         w = scanout.image->get_width();
                         h = scanout.image->get_height();
                         if (onGpu)
+                        {
                             m_shared->scanout = scanout.image;
+                            m_shared->pictureSerial = request.frame3D;
+                        }
                         if (!onGpu || request.readback)
                             fence = submitReadbackLocked(*scanout.image, onGpu);
                     }

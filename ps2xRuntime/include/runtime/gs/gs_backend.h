@@ -59,10 +59,12 @@ public:
     virtual bool WantsDepthSnapshot() const { return false; }
     // Per-vertex side data (motion, UI classes) wanted at all (MirrorGifPacketWithMotion).
     virtual bool WantsVertexSideband() const { return false; }
-    virtual void SnapshotDepth(uint32_t zbp, uint32_t fbw)
+    // fbp: the frame buffer the 3D drew into (the snapshot belongs to that picture).
+    virtual void SnapshotDepth(uint32_t zbp, uint32_t fbw, uint32_t fbp)
     {
         (void)zbp;
         (void)fbw;
+        (void)fbp;
     }
     virtual void TextureFlush() = 0;
     virtual void Sync(GSSyncReason reason) = 0;

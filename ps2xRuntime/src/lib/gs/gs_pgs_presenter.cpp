@@ -285,6 +285,8 @@ namespace ps2x::gs
                 m_easu = post(post_spirv::fsr_easu_frag, sizeof(post_spirv::fsr_easu_frag), 80, 0);
                 m_rcas = post(post_spirv::fsr_rcas_frag, sizeof(post_spirv::fsr_rcas_frag), 32, 0);
                 m_sgsr1 = post(post_spirv::sgsr1_frag, sizeof(post_spirv::sgsr1_frag), 16, 0x1);
+                m_sgsr2Convert = post(post_spirv::sgsr2_convert_frag, sizeof(post_spirv::sgsr2_convert_frag), sizeof(Sgsr2Push), 0x1, 0x3);
+                m_sgsr2Upscale = post(post_spirv::sgsr2_upscale_frag, sizeof(post_spirv::sgsr2_upscale_frag), sizeof(Sgsr2Push), 0x1, 0x7);
                 m_smaaEdges = post(post_spirv::smaa_edges_frag, sizeof(post_spirv::smaa_edges_frag), 16, 0x1, 0x1);
                 m_smaaWeights = post(post_spirv::smaa_weights_frag, sizeof(post_spirv::smaa_weights_frag), 16, 0x1, 0x7);
                 m_smaaBlend = post(post_spirv::smaa_blend_frag, sizeof(post_spirv::smaa_blend_frag), 16, 0x1, 0x3);
@@ -515,6 +517,9 @@ namespace ps2x::gs
                 m_lastTick = tick;
                 const bool gpu = m_shared.attached;
                 runtime.gsUnsynced().latchHostPresentationFrame(gpu, capture || !gpu);
+                // The jitter of the picture just latched (its 3D's, and the frame's before it).
+                if (m_temporalOn)
+                    runtime.gsUnsynced().snapshotJitter(m_jitter[0], m_jitter[1], m_jitter[2], m_jitter[3]);
                 if (!capture && gpu)
                     return;
                 std::vector<uint8_t> pixels;
@@ -705,6 +710,9 @@ namespace ps2x::gs
                     m_final = m_upImage.get();
                     m_finalRcas = true;
                 }
+                if (m_post.scaling == PostProcess::Scaling::SnapdragonGsr2 && rect.extent.width > sw &&
+                    upscaleSgsr2(cmd, sw, sh, rect.extent.width, rect.extent.height))
+                    return;
                 if (m_post.scaling == PostProcess::Scaling::SnapdragonGsr1 && m_sgsr1 && rect.extent.width > sw)
                 {
                     // Snapdragon GSR 1: upscaling and sharpening in one pass (no RCAS after it).
@@ -720,7 +728,8 @@ namespace ps2x::gs
             {
                 m_progressiveFields = runtime.gsUnsynced().progressiveFields();
                 const bool on = m_post.aa == PostProcess::AntiAliasing::Taa ||
-                                m_post.scaling == PostProcess::Scaling::MetalFxTemporal;
+                                m_post.scaling == PostProcess::Scaling::MetalFxTemporal ||
+                                m_post.scaling == PostProcess::Scaling::SnapdragonGsr2;
                 const bool motion = on || m_fg.factor > 1; // frame generation needs motion and depth too
                 m_shared.wantShadows = m_fg.factor > 1 && m_fg.rerender ? m_fg.factor - 1 : 0u;
                 if (!m_showMotion && !m_showDepth)
@@ -735,10 +744,9 @@ namespace ps2x::gs
                 const float sx = pic ? 640.0f / static_cast<float>(pic->get_width()) : 0.5f;
                 const float sy = pic ? 224.0f / static_cast<float>(pic->get_height()) : 0.25f;
                 runtime.gsUnsynced().setTemporalJitter(on, sx, sy);
-                if (on)
-                    runtime.gsUnsynced().snapshotJitter(m_jitter[0], m_jitter[1], m_jitter[2], m_jitter[3]);
+                m_temporalOn = on;
                 if (!on)
-                    m_taaValid = false;
+                    m_taaValid = m_sgsr2Valid = false;
                 // Any post-processing (and frame generation) spares the UI (the GS marks where the HUD and 2D
                 // screens drew).
                 m_shared.wantUi = m_post.aa != PostProcess::AntiAliasing::None || m_post.scaling != PostProcess::Scaling::Bilinear ||
@@ -772,6 +780,84 @@ namespace ps2x::gs
                 m_final = m_taaShadowImage.get();
             }
 
+            // Snapdragon GSR 2 (post/sgsr2_*.frag): the GS's motion and depth turned into its motion /
+            // depth-clip buffer at the picture's size, then upscaled into a history at the output's.
+            // False without 3D (a 2D screen): the caller scales as usual and the history starts again.
+            struct Sgsr2Push
+            {
+                float renderSize[2], outputSize[2], renderSizeRcp[2], outputSizeRcp[2];
+                float jitterOffset[2], scaleRatio[2], motionToNdc[2];
+                float cameraFovAngleHor, minLerpContribution, reset, pad;
+                float jitterDelta[2]; // GS pixels, this frame's jitter minus last frame's
+            };
+
+            // Game frames between the picture a temporal pass last ran on (serial) and this one; 0 to
+            // start the history again (none yet, or too far back to extrapolate the motion).
+            float pictureSteps(uint64_t serial) const
+            {
+                const uint64_t gap = m_shared.pictureSerial - serial;
+                static const bool debug = [] { const char *e = std::getenv("RT_TEMPORAL_DEBUG"); return e && *e == '1'; }();
+                if (debug && serial != ~0ull && gap > 1)
+                    std::fprintf(stderr, "[temporal] %llu frames since the last temporal pass\n", (unsigned long long)gap);
+                return serial == ~0ull || gap > 4 ? 0.0f : static_cast<float>(gap);
+            }
+
+            bool upscaleSgsr2(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh, uint32_t w, uint32_t h)
+            {
+                if (!m_sgsr2Convert || !m_sgsr2Upscale || !m_shared.motion || !m_shared.depth || m_shared.motion->get_width() != sw ||
+                    m_shared.motion->get_height() != sh || m_shared.depth->get_width() != sw || m_shared.depth->get_height() != sh)
+                {
+                    m_sgsr2Valid = false;
+                    return false;
+                }
+                Vulkan::ImageHandle &out = m_sgsr2History[m_sgsr2Index];
+                const Vulkan::ImageHandle &history = m_sgsr2History[m_sgsr2Index ^ 1];
+                const bool sized = m_sgsr2Valid && history && history->get_width() == w && history->get_height() == h;
+                if (sized && m_shared.pictureSerial == m_sgsr2Serial)
+                {
+                    // The same 3D again: the last output (its history) is the picture.
+                    m_final = history.get();
+                    m_finalRcas = true;
+                    return true;
+                }
+                const float steps = pictureSteps(m_sgsr2Serial);
+                const bool valid = sized && steps > 0.0f;
+                m_sgsr2Serial = m_shared.pictureSerial;
+                const float fw = static_cast<float>(sw), fh = static_cast<float>(sh), ow = static_cast<float>(w), oh = static_cast<float>(h);
+                Sgsr2Push push = {};
+                push.renderSize[0] = fw, push.renderSize[1] = fh;
+                push.outputSize[0] = ow, push.outputSize[1] = oh;
+                push.renderSizeRcp[0] = 1.0f / fw, push.renderSizeRcp[1] = 1.0f / fh;
+                push.outputSizeRcp[0] = 1.0f / ow, push.outputSizeRcp[1] = 1.0f / oh;
+                // The camera's jitter (GS pixels) in picture pixels.
+                push.jitterOffset[0] = m_jitter[0] * fw / 640.0f;
+                push.jitterOffset[1] = m_jitter[1] * fh / 224.0f;
+                push.scaleRatio[0] = ow / fw;
+                push.scaleRatio[1] = std::min(20.0f, std::pow(ow * oh / (fw * fh), 3.0f));
+                push.motionToNdc[0] = std::max(steps, 1.0f) * 2.0f / 640.0f;
+                push.motionToNdc[1] = std::max(steps, 1.0f) * 2.0f / 224.0f;
+                // The motion comes from the jittered cameras: without this frame's jitter step (as
+                // GSR expects, and as TAA takes it out too).
+                push.jitterDelta[0] = m_jitter[0] - m_jitter[2];
+                push.jitterDelta[1] = m_jitter[1] - m_jitter[3];
+                push.cameraFovAngleHor = 0.75f; // tan(FOV / 2): Road Trip's cameras are about 74 degrees across
+                push.minLerpContribution = 0.0f;
+                push.reset = valid ? 0.0f : 1.0f;
+                const PassInput convertIn[2] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp},
+                                                {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(cmd, m_sgsr2Mda, sw, sh, m_sgsr2Convert, convertIn, 2, &push, sizeof(push), false,
+                              VK_FORMAT_R16G16B16A16_SFLOAT);
+                const PassInput upscaleIn[3] = {{valid ? history.get() : m_final, Vulkan::StockSampler::LinearClamp},
+                                                {m_sgsr2Mda.get(), Vulkan::StockSampler::LinearClamp},
+                                                {m_final, Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(cmd, out, w, h, m_sgsr2Upscale, upscaleIn, 3, &push, sizeof(push), false);
+                m_final = out.get();
+                m_finalRcas = true; // GSR 2 doesn't sharpen: FSR's RCAS after it (the Sharpening option)
+                m_sgsr2Index ^= 1;
+                m_sgsr2Valid = true;
+                return true;
+            }
+
             void temporalAntiAliasing(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh)
             {
                 if (!m_shared.motion || m_shared.motion->get_width() != sw || m_shared.motion->get_height() != sh)
@@ -781,7 +867,15 @@ namespace ps2x::gs
                 }
                 Vulkan::ImageHandle &out = m_taaHistory[m_taaIndex];
                 const Vulkan::ImageHandle &history = m_taaHistory[m_taaIndex ^ 1];
-                const bool valid = m_taaValid && history && history->get_width() == sw && history->get_height() == sh;
+                const bool sized = m_taaValid && history && history->get_width() == sw && history->get_height() == sh;
+                if (sized && m_shared.pictureSerial == m_taaSerial)
+                {
+                    m_final = history.get(); // the same 3D again: the last output
+                    return;
+                }
+                const float steps = pictureSteps(m_taaSerial);
+                const bool valid = sized && steps > 0.0f;
+                m_taaSerial = m_shared.pictureSerial;
                 struct
                 {
                     float motionToUv[2];
@@ -789,7 +883,8 @@ namespace ps2x::gs
                     float rcpSize[2];
                     float blend;
                     float historyValid;
-                } push = {{1.0f / 640.0f, 1.0f / 224.0f}, {m_jitter[0] - m_jitter[2], m_jitter[1] - m_jitter[3]},
+                } push = {{std::max(steps, 1.0f) / 640.0f, std::max(steps, 1.0f) / 224.0f},
+                          {m_jitter[0] - m_jitter[2], m_jitter[1] - m_jitter[3]},
                           {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh)}, 0.1f, valid ? 1.0f : 0.0f};
                 const PassInput inputs[3] = {{m_final, Vulkan::StockSampler::NearestClamp},
                                              {valid ? history.get() : m_final, Vulkan::StockSampler::LinearClamp},
@@ -847,6 +942,17 @@ namespace ps2x::gs
                 bool &valid = m_noTemporal ? m_temporalValidShadow : m_temporalValid;
                 if (!scaler)
                     return;
+                if (!m_noTemporal && valid && m_shared.pictureSerial == m_mfxSerial && upImage && upImage->get_width() == w &&
+                    upImage->get_height() == h)
+                {
+                    m_final = upImage.get(); // the same 3D again: the last output
+                    return;
+                }
+                const float steps = m_noTemporal ? 1.0f : pictureSteps(m_mfxSerial);
+                if (steps == 0.0f)
+                    valid = false;
+                if (!m_noTemporal)
+                    m_mfxSerial = m_shared.pictureSerial;
                 const PassInput depthIn[1] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp}};
                 offscreenPass(*cmd, m_depthNorm, sw, sh, m_depthNormalize, depthIn, 1, nullptr, 0, false, VK_FORMAT_R32_SFLOAT);
                 if (!upImage || upImage->get_width() != w || upImage->get_height() != h ||
@@ -877,8 +983,8 @@ namespace ps2x::gs
                 f.outH = h;
                 f.jitterX = m_jitter[0] * px;
                 f.jitterY = m_jitter[1] * py;
-                f.motionScaleX = -px; // ours: current minus previous, GS pixels
-                f.motionScaleY = -py;
+                f.motionScaleX = -px * std::max(steps, 1.0f); // ours: current minus previous, GS pixels, one frame
+                f.motionScaleY = -py * std::max(steps, 1.0f);
                 f.reset = !valid;
                 if (f.color && f.depth && f.motion && f.output && queue && scaler->upscale(queue, f))
                 {
@@ -1863,12 +1969,18 @@ namespace ps2x::gs
             Vulkan::WSI m_wsi; // after m_shared: destroyed first, with the device
             Vulkan::Program *m_program = nullptr;
             Vulkan::Program *m_fxaa = nullptr, *m_easu = nullptr, *m_rcas = nullptr, *m_sgsr1 = nullptr;
+            Vulkan::Program *m_sgsr2Convert = nullptr, *m_sgsr2Upscale = nullptr;
+            Vulkan::ImageHandle m_sgsr2Mda, m_sgsr2History[2];
+            uint32_t m_sgsr2Index = 0;
+            bool m_sgsr2Valid = false;
+            uint64_t m_sgsr2Serial = ~0ull, m_taaSerial = ~0ull, m_mfxSerial = ~0ull; // PgsShared::pictureSerial each last ran on
             PostProcess m_post;
             Vulkan::ImageHandle m_aaImage, m_upImage; // intermediate pictures
             Vulkan::Program *m_depthView = nullptr, *m_motionView = nullptr, *m_taa = nullptr;
             Vulkan::ImageHandle m_taaHistory[2];
             uint32_t m_taaIndex = 0;
             bool m_taaValid = false;
+            bool m_temporalOn = false;
             float m_jitter[4] = {}; // this frame's and last frame's camera jitter (GS pixels)
             Vulkan::Program *m_depthNormalize = nullptr;
             Vulkan::ImageHandle m_depthNorm;

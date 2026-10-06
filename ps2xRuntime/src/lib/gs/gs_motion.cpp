@@ -202,6 +202,8 @@ namespace ps2x::gs
         MotionContext ctx;
         ctx.cur = m_activeBase;
         ctx.prev = m_activePrevBase;
+        ctx.jitter[0] = m_cameraJitter[0];
+        ctx.jitter[1] = m_cameraJitter[1];
         // Loops 8 and 6 add the batch offset VU26 to positions.
         if (startPC == 0x40 || startPC == 0x30)
         {
@@ -216,6 +218,13 @@ namespace ps2x::gs
             m_nextId = 1;
         m_ring[id % kRing] = ctx;
         return id;
+    }
+
+    void MotionTracker::noteCameraJitter(float x, float y)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_cameraJitter[0] = x;
+        m_cameraJitter[1] = y;
     }
 
     void MotionTracker::frameStart()

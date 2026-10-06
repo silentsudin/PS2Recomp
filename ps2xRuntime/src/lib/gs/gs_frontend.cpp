@@ -554,6 +554,18 @@ void GS::latchHostPresentationFrame(bool keepOnGpu, bool readback)
         request.depthValid = m_haveZbuf3D;
         request.depthZbp = m_lastZbuf3D.zbp;
         request.depthPsm = m_lastZbuf3D.psm;
+        // The 3D frame in the buffer on display, and its jitter (read circuit as the backends do).
+        const bool en1 = request.pmode & 1u, en2 = (request.pmode >> 1) & 1u;
+        const uint32_t fbp = static_cast<uint32_t>((en1 || !en2 ? request.dispfb1 : request.dispfb2) & 0x1FFu);
+        const auto frame = m_frame3DByFbp.find(fbp);
+        request.frame3D = frame != m_frame3DByFbp.end() ? frame->second : 0u;
+        m_latchesWithoutHud = m_frames3D != m_framesAtLatch ? 0u : std::min(m_latchesWithoutHud + 1u, 1000u);
+        m_framesAtLatch = m_frames3D;
+        if (m_latchesWithoutHud >= 8)
+            request.frame3D = (1ull << 62) + ++m_fallbackFrame3D;
+        const auto it = m_jitterByFbp.find(fbp);
+        const float *j = it != m_jitterByFbp.end() ? it->second.data() : m_snapJitter;
+        std::copy(j, j + 4, m_presentJitter);
     }
     request.readback = readback;
 
@@ -714,15 +726,22 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
         m_wide.setRecordClasses(sideband);
         m_wide.transformPacket(pathIndex, m_wideScratch.data(), sizeBytes, st);
         publishWideUnlocked();
-        // The frame's 3D is complete before its HUD: keep its depth (HUD and post-pass overwrite Z).
-        if (m_wide.consumeHudStart() && m_haveZbuf3D && m_backend->WantsDepthSnapshot())
+        // The frame's 3D is complete before its HUD: number it, note the jitter it was drawn with
+        // (its motion contexts carry it: the EE may have moved on to the next frame's), both per
+        // frame buffer, and keep its depth (HUD and post-pass overwrite Z).
+        if (m_wide.consumeHudStart() && m_haveZbuf3D)
         {
             m_snapJitter[2] = m_snapJitter[0];
             m_snapJitter[3] = m_snapJitter[1];
-            if (!cameraJitter(m_snapJitter[0], m_snapJitter[1]))
-                m_snapJitter[0] = m_snapJitter[1] = 0.0f;
-            const uint32_t fbw = m_ctx[1].frame.fbw ? m_ctx[1].frame.fbw : m_ctx[0].frame.fbw;
-            m_backend->SnapshotDepth(m_lastZbuf3D.zbp, fbw);
+            m_snapJitter[0] = m_frameJitter[0];
+            m_snapJitter[1] = m_frameJitter[1];
+            m_jitterByFbp[m_lastFbp3D] = {m_snapJitter[0], m_snapJitter[1], m_snapJitter[2], m_snapJitter[3]};
+            m_frame3DByFbp[m_lastFbp3D] = ++m_frames3D;
+            if (m_backend->WantsDepthSnapshot())
+            {
+                const uint32_t fbw = m_ctx[1].frame.fbw ? m_ctx[1].frame.fbw : m_ctx[0].frame.fbw;
+                m_backend->SnapshotDepth(m_lastZbuf3D.zbp, fbw, m_lastFbp3D);
+            }
         }
         data = m_wideScratch.data();
     }
@@ -733,6 +752,11 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
     ps2x::gs::MotionContext packetMotionContext;
     const bool haveMotion = sideband && pathIndex == 0 && m_motionId &&
                             ps2x::gs::MotionTracker::instance().context(m_motionId, packetMotionContext);
+    if (haveMotion)
+    {
+        m_frameJitter[0] = packetMotionContext.jitter[0];
+        m_frameJitter[1] = packetMotionContext.jitter[1];
+    }
     if (haveMotion && !m_packetMirror)
     {
         ps2x::gs::MotionTracker::packetMotion(data, sizeBytes & ~15u, packetMotionContext, m_packetMotion);
@@ -1922,6 +1946,7 @@ void GS::vertexKick(bool drawing)
         if (m_curPath == 0)
         {
             m_lastZbuf3D = m_ctx[m_prim.ctxt ? 1 : 0].zbuf;
+            m_lastFbp3D = m_ctx[m_prim.ctxt ? 1 : 0].frame.fbp;
             m_haveZbuf3D = true;
         }
     }
@@ -2198,7 +2223,10 @@ void GS::setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY)
 bool GS::cameraJitter(float &x, float &y) const
 {
     if (!m_jitterOn.load(std::memory_order_relaxed))
+    {
+        ps2x::gs::MotionTracker::instance().noteCameraJitter(0.0f, 0.0f);
         return false;
+    }
     auto halton = [](uint32_t i, uint32_t base) {
         float f = 1.0f, r = 0.0f;
         for (; i; i /= base)
@@ -2211,16 +2239,17 @@ bool GS::cameraJitter(float &x, float &y) const
     const uint32_t i = (m_frameIndex.load(std::memory_order_relaxed) % 8u) + 1u;
     x = (halton(i, 2) - 0.5f) * m_jitterScaleX.load(std::memory_order_relaxed);
     y = (halton(i, 3) - 0.5f) * m_jitterScaleY.load(std::memory_order_relaxed);
+    ps2x::gs::MotionTracker::instance().noteCameraJitter(x, y);
     return true;
 }
 
 void GS::snapshotJitter(float &curX, float &curY, float &prevX, float &prevY) const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    curX = m_snapJitter[0];
-    curY = m_snapJitter[1];
-    prevX = m_snapJitter[2];
-    prevY = m_snapJitter[3];
+    curX = m_presentJitter[0];
+    curY = m_presentJitter[1];
+    prevX = m_presentJitter[2];
+    prevY = m_presentJitter[3];
 }
 
 void GS::markFrameStart()
