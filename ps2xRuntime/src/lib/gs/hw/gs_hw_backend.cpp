@@ -169,6 +169,7 @@ namespace ps2x::gs
             float rect[4] = {};
             bool recolor = false;
             float recolorMap[20] = {};
+            bool map = false; // the game's map (PgsShared::wantMap)
         };
 
         struct Target
@@ -398,6 +399,7 @@ namespace ps2x::gs
                     publish(true);
                     m_current = Batch{};
                     m_current.state = state;
+                    m_current.map = isMap(state);
                     if (state.prim.tme)
                         resolveTexture(m_current);
                     m_haveCurrent = true;
@@ -452,6 +454,19 @@ namespace ps2x::gs
                 }
                 if (m_stage.size() >= 1536u)
                     publish(false);
+            }
+
+            // The game's map: every course-map and town-minimap draw has TEST_2 = 0x3380B (alpha test
+            // GEQUAL 0x80 with RGB_ONLY, Z test ALWAYS; a template at ELF 0x2A43B0, nothing else uses
+            // it), and in towns its bezel is three sprites of one palette bank ([map] in Road Trip's
+            // config/game_state.toml).
+            static bool isMap(const GSDrawState &s)
+            {
+                if (s.prim.ctxt && (s.context.test & 0x7FFFFu) == 0x3380Bu)
+                    return true;
+                const GSTex0Reg &t = s.context.tex0;
+                return !s.prim.ctxt && s.prim.type == GS_PRIM_SPRITE && s.prim.tme && t.tbp0 == 7828u && t.psm == 0x14u &&
+                       t.cbp == 7892u && t.csa == 10u;
             }
 
             // GS thread: hands the staged vertices of the current batch to the shared lists (one lock
@@ -681,6 +696,7 @@ namespace ps2x::gs
                     batches.clear();
                     vertices.clear();
                     const Vulkan::Image *scan = scanout(*cmd, request);
+                    publishMap();
                     if (scan)
                     {
                         outW = scan->get_width();
@@ -1202,6 +1218,98 @@ namespace ps2x::gs
                 return d;
             }
 
+            // The map layer for this frame: an opaque image like the frame buffer's, filled with the
+            // second screen's map background before the frame's first map draw (two, swapped at
+            // Present, so the presenter samples a finished one).
+            Target &mapLayer(const Target &frame, Vulkan::CommandBuffer &cmd, bool &passOpen)
+            {
+                Target &m = m_mapLayers[m_mapIndex];
+                const bool fresh = !m.color || m.width != frame.width || m.height != frame.height || m.sx != frame.sx || m.sy != frame.sy;
+                if (fresh || !m_mapDrawn)
+                {
+                    endPass(cmd, passOpen);
+                    if (fresh)
+                    {
+                        m = Target{};
+                        m.fbp = ~0u;
+                        m.width = frame.width;
+                        m.height = frame.height;
+                        m.sx = frame.sx;
+                        m.sy = frame.sy;
+                        auto info = Vulkan::ImageCreateInfo::render_target(frame.color->get_width(), frame.color->get_height(),
+                                                                           VK_FORMAT_R8G8B8A8_UNORM);
+                        info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                        info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                        m.color = m_dev->create_image(info);
+                    }
+                    cmd.image_barrier(*m.color, fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                      VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                                      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                    VkClearValue bg = {};
+                    bg.color.float32[0] = 0x0B / 255.0f; // the second screen's navy
+                    bg.color.float32[1] = 0x12 / 255.0f;
+                    bg.color.float32[2] = 0x40 / 255.0f;
+                    bg.color.float32[3] = 1.0f;
+                    cmd.clear_image(*m.color, bg);
+                    cmd.image_barrier(*m.color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+                                      VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                    m_mapDrawn = true;
+                    m_mapBox[0] = m_mapBox[1] = 1e9f;
+                    m_mapBox[2] = m_mapBox[3] = -1e9f;
+                }
+                return m;
+            }
+
+            // The part of the frame the map covers (inside its scissor: the town map's vertices reach
+            // far outside it). The town bezel is drawn into the layer but not counted: the second
+            // screen shows the map itself.
+            void noteMapBox(const Batch &b, const std::vector<HwVertex> &vertices)
+            {
+                if (!b.state.prim.ctxt)
+                    return;
+                const GSScissorReg &sc = b.state.context.scissor;
+                float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                for (uint32_t i = b.firstVertex; i < b.firstVertex + b.vertexCount && i < vertices.size(); ++i)
+                {
+                    x0 = std::min(x0, vertices[i].x), x1 = std::max(x1, vertices[i].x);
+                    y0 = std::min(y0, vertices[i].y), y1 = std::max(y1, vertices[i].y);
+                }
+                x0 = std::max(x0, static_cast<float>(sc.x0)), y0 = std::max(y0, static_cast<float>(sc.y0));
+                x1 = std::min(x1, static_cast<float>(sc.x1 + 1)), y1 = std::min(y1, static_cast<float>(sc.y1 + 1));
+                if (x1 <= x0 || y1 <= y0)
+                    return;
+                m_mapBox[0] = std::min(m_mapBox[0], x0), m_mapBox[1] = std::min(m_mapBox[1], y0);
+                m_mapBox[2] = std::max(m_mapBox[2], x1), m_mapBox[3] = std::max(m_mapBox[3], y1);
+            }
+
+            // At Present: hands this frame's map (if one was drawn) to the second screen.
+            void publishMap()
+            {
+                if (!m_shared)
+                    return;
+                const Target &m = m_mapLayers[m_mapIndex];
+                if (m_mapDrawn && m.color && m_mapBox[2] > m_mapBox[0])
+                {
+                    m_shared->map = m.color;
+                    m_shared->mapUv[0] = m_mapBox[0] / m.width;
+                    m_shared->mapUv[1] = m_mapBox[1] / m.height;
+                    m_shared->mapUv[2] = m_mapBox[2] / m.width;
+                    m_shared->mapUv[3] = m_mapBox[3] / m.height;
+                    // GS pixels on a 4:3 TV: a 640x224 field fills it, so a pixel is 4/3 * 224/640 as
+                    // wide as it is tall... per field line.
+                    const float pixelAspect = (4.0f / 3.0f) * 224.0f / 640.0f;
+                    m_shared->mapAspect = (m_mapBox[2] - m_mapBox[0]) * pixelAspect / (m_mapBox[3] - m_mapBox[1]);
+                    m_mapIndex ^= 1u;
+                    m_mapMissed = 0;
+                }
+                else if (++m_mapMissed > 10)
+                    m_shared->map.reset(); // no map for a while: none to show
+                m_mapDrawn = false;
+            }
+
             void endPass(Vulkan::CommandBuffer &cmd, bool &passOpen)
             {
                 if (passOpen)
@@ -1403,12 +1511,17 @@ namespace ps2x::gs
                         unsupported("frame buffer format other than CT32/CT24");
                         continue;
                     }
-                    Target &t = target(ctx.frame.fbp, ctx.frame.fbw, fpsm, static_cast<uint32_t>(ctx.scissor.y1) + 1u, cmd, passOpen);
+                    Target &frameTarget =
+                        target(ctx.frame.fbp, ctx.frame.fbw, fpsm, static_cast<uint32_t>(ctx.scissor.y1) + 1u, cmd, passOpen);
+                    const bool toMap = b.map && m_shared && m_shared->wantMap.load(std::memory_order_relaxed);
+                    Target &t = toMap ? mapLayer(frameTarget, cmd, passOpen) : frameTarget;
+                    if (toMap)
+                        noteMapBox(b, vertices);
 
                     const bool zte = (ctx.test >> 16) & 1u;
                     const uint32_t ztst = (ctx.test >> 17) & 3u;
-                    const bool zwrite = !ctx.zbuf.zmask;
-                    const bool useDepth = (zte && ztst != 1u) || zwrite;
+                    const bool zwrite = !ctx.zbuf.zmask && !toMap;
+                    const bool useDepth = !toMap && ((zte && ztst != 1u) || zwrite);
                     const Vulkan::Image *depthImage = nullptr;
                     if (useDepth)
                         depthImage = depth(ctx.zbuf.zbp, t, cmd, passOpen).get();
@@ -1532,8 +1645,8 @@ namespace ps2x::gs
                         if (m != 0u && m != 0xFFu)
                             unsupported("partial FBMSK");
                     }
-                    if (fpsm == GS_PSM_CT24)
-                        mask &= 0x7u;
+                    if (fpsm == GS_PSM_CT24 || toMap)
+                        mask &= 0x7u; // (the map layer stays opaque)
 
                     // Scissor.
                     VkRect2D sc;
@@ -1859,6 +1972,10 @@ namespace ps2x::gs
             std::unordered_map<uint32_t, Vulkan::ImageHandle> m_depths;
             const Vulkan::Image *m_passColor = nullptr, *m_passDepth = nullptr;
             Vulkan::ImageHandle m_scanout[3];
+            Target m_mapLayers[2];
+            uint32_t m_mapIndex = 0, m_mapMissed = 0;
+            bool m_mapDrawn = false;
+            float m_mapBox[4] = {};
             uint32_t m_scanoutIndex = 0;
             Vulkan::BufferHandle m_readback;
             static constexpr uint32_t kVboRing = 8;

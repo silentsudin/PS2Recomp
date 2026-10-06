@@ -36,6 +36,15 @@ namespace ps2x::gs
         // The UI mask (R8: 1 where the HUD / 2D screens drew), so post-processing spares the UI.
         Vulkan::ImageHandle ui;
         std::atomic<bool> wantUi{false};
+        // The game's map (course map, town minimap) drawn on its own (a second screen shows it):
+        // with wantMap set, a backend that can (the hardware GS) draws the map's batches into `map`
+        // instead of the frame (an opaque image the size of the frame buffer), and mapUv is the part
+        // the map covered in the last frame that drew it (u0, v0, u1, v1), mapAspect its width over
+        // height on a 4:3 TV. `map` is null when the last frames drew no map (guarded by `mutex`).
+        std::atomic<bool> wantMap{false};
+        Vulkan::ImageHandle map;
+        float mapUv[4] = {};
+        float mapAspect = 1.0f;
         // Re-rendered frame generation: shadow GS instances replay the frame with the 3D moved on by
         // (i + 1) / (wantShadows + 1) of a frame; their pictures, scanned out with the real one.
         std::atomic<uint32_t> wantShadows{0};

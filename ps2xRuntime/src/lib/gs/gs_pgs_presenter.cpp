@@ -50,11 +50,17 @@
 
 #include "raylib.h" // ExportImage for screenshots
 
+#if defined(__ANDROID__)
+#include <android/native_window.h>
+#include <vulkan/vulkan_android.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -1170,8 +1176,27 @@ namespace ps2x::gs
 
             void drawUi(Vulkan::CommandBuffer &cmd, float fw, float fh)
             {
-                ImDrawData *dd = ImGui::GetDrawData();
-                if (!m_uiFrame || !dd || dd->TotalVtxCount == 0)
+                if (m_uiFrame)
+                    drawImGui(cmd, ImGui::GetDrawData(), fw, fh);
+            }
+
+            // An ImGui texture: the presenter's own (kPictureTexture) or one of the font atlas's.
+            const Vulkan::ImageView *uiTexture(ImTextureID id)
+            {
+                if (id == static_cast<ImTextureID>(kMapTexture))
+                    return m_shared.map ? &m_shared.map->get_view() : nullptr;
+                if (id == static_cast<ImTextureID>(kPictureTexture))
+                {
+                    const Vulkan::Image *picture = m_shared.attached ? m_shared.scanout.get() : m_cpuFrame.get();
+                    return picture ? &picture->get_view() : nullptr;
+                }
+                auto it = m_textures.find(id);
+                return it == m_textures.end() || !it->second ? nullptr : &it->second->get_view();
+            }
+
+            void drawImGui(Vulkan::CommandBuffer &cmd, ImDrawData *dd, float fw, float fh)
+            {
+                if (!dd || dd->TotalVtxCount == 0)
                     return;
                 const ImVec2 scale = dd->FramebufferScale;
                 // ImGui works in window points; the swapchain is in pixels.
@@ -1201,12 +1226,16 @@ namespace ps2x::gs
                         const float y1 = std::min(fh, (c.ClipRect.w - dd->DisplayPos.y) * scale.y);
                         if (x1 <= x0 || y1 <= y0)
                             continue;
-                        auto it = m_textures.find(c.GetTexID());
-                        if (it == m_textures.end() || !it->second)
+                        const Vulkan::ImageView *view = uiTexture(c.GetTexID());
+                        if (!view)
                             continue;
                         cmd.set_scissor({{static_cast<int32_t>(x0), static_cast<int32_t>(y0)},
                                          {static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)}});
-                        cmd.set_texture(0, 0, it->second->get_view(), Vulkan::StockSampler::LinearClamp);
+                        cmd.set_texture(0, 0, *view,
+                                        m_nearestTextures.count(static_cast<uint64_t>(c.GetTexID())) ||
+                                                c.GetTexID() == static_cast<ImTextureID>(kMapTexture)
+                                            ? Vulkan::StockSampler::NearestClamp
+                                                                                                    : Vulkan::StockSampler::LinearClamp);
                         cmd.draw_indexed(c.ElemCount, 1, idxBase + c.IdxOffset, static_cast<int32_t>(vtxBase + c.VtxOffset), 0);
                     }
                     vtxBase += static_cast<uint32_t>(list->VtxBuffer.Size);
@@ -1216,6 +1245,308 @@ namespace ps2x::gs
 #else
             void drawUi(Vulkan::CommandBuffer &, float, float) {}
 #endif
+
+            // ---- The second screen (see HostPresenter::setSecondScreen) ----
+        public:
+            void setSecondScreen(void *nativeWindow) override
+            {
+#if defined(__ANDROID__)
+                if (nativeWindow)
+                    ANativeWindow_acquire(static_cast<ANativeWindow *>(nativeWindow));
+                std::lock_guard<std::mutex> lock(m_second.pendingMutex);
+                if (m_second.pendingSet && m_second.pending)
+                    ANativeWindow_release(static_cast<ANativeWindow *>(m_second.pending));
+                m_second.pending = nativeWindow;
+                m_second.pendingSet = true;
+#else
+                (void)nativeWindow;
+#endif
+            }
+
+            bool secondScreenSize(int &width, int &height) const override
+            {
+                const uint64_t size = m_second.size.load();
+                if (!size)
+                    return false;
+                width = static_cast<int>(size >> 32);
+                height = static_cast<int>(size & 0xFFFFFFFFu);
+                return true;
+            }
+
+            void submitSecondScreenUi(void *imguiContext) override { m_second.ui = imguiContext; }
+
+            void setWantMap(bool want) override { m_shared.wantMap = want; }
+
+            bool mapRegion(float uv[4], float &aspect) const override
+            {
+                std::lock_guard<std::mutex> lock(const_cast<std::mutex &>(m_shared.mutex));
+                if (!m_shared.map)
+                    return false;
+                std::memcpy(uv, m_shared.mapUv, sizeof(m_shared.mapUv));
+                aspect = m_shared.mapAspect;
+                return true;
+            }
+
+            uint64_t createUiTexture(const uint8_t *rgba, int width, int height, bool nearest) override
+            {
+                if (!rgba || width <= 0 || height <= 0 || !m_shared.device)
+                    return 0;
+                std::lock_guard<std::mutex> lock(m_shared.mutex);
+                pgsRegisterThread();
+                auto info = Vulkan::ImageCreateInfo::immutable_2d_image(static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+                                                                        VK_FORMAT_R8G8B8A8_UNORM);
+                Vulkan::ImageInitialData init = {rgba, 0, 0};
+                const uint64_t id = ++m_nextTexture;
+                m_textures[id] = m_shared.device->create_image(info, &init);
+                if (nearest)
+                    m_nearestTextures.insert(id);
+                return id;
+            }
+
+        private:
+            struct SecondScreen
+            {
+                std::mutex pendingMutex;
+                void *pending = nullptr; // a new ANativeWindow (acquired), or nullptr
+                bool pendingSet = false;
+                void *window = nullptr; // the ANativeWindow in use (acquired)
+                VkSurfaceKHR surface = VK_NULL_HANDLE;
+                VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+                VkExtent2D extent = {};
+                bool outOfDate = false;
+                std::vector<Vulkan::ImageHandle> images;
+                std::vector<Vulkan::ImageViewHandle> views;
+                std::vector<Vulkan::Semaphore> release; // per image, until it is acquired again
+                std::atomic<uint64_t> size{0};          // width << 32 | height, 0 = none
+                void *ui = nullptr;                     // this frame's ImGui context, if submitted
+            } m_second;
+
+            void destroySecondSwapchain()
+            {
+                Vulkan::Device &dev = *m_shared.device;
+                if (m_second.swapchain == VK_NULL_HANDLE)
+                    return;
+                dev.wait_idle();
+                m_second.views.clear();
+                m_second.images.clear();
+                m_second.release.clear();
+                dev.get_device_table().vkDestroySwapchainKHR(dev.get_device(), m_second.swapchain, nullptr);
+                m_second.swapchain = VK_NULL_HANDLE;
+                m_second.size = 0;
+            }
+
+            void destroySecondScreen()
+            {
+                destroySecondSwapchain();
+#if defined(__ANDROID__)
+                if (m_second.surface != VK_NULL_HANDLE)
+                    vkDestroySurfaceKHR(m_shared.device->get_instance(), m_second.surface, nullptr);
+                m_second.surface = VK_NULL_HANDLE;
+                if (m_second.window)
+                    ANativeWindow_release(static_cast<ANativeWindow *>(m_second.window));
+                m_second.window = nullptr;
+#endif
+            }
+
+            bool createSecondSwapchain()
+            {
+                Vulkan::Device &dev = *m_shared.device;
+                const VkPhysicalDevice gpu = dev.get_physical_device();
+                const auto &queues = m_wsi.get_context().get_queue_info();
+                VkBool32 supported = VK_FALSE;
+                vkGetPhysicalDeviceSurfaceSupportKHR(gpu, queues.family_indices[Vulkan::QUEUE_INDEX_GRAPHICS], m_second.surface,
+                                                     &supported);
+                if (!supported)
+                    return fail("second screen", "the graphics queue can't present to it");
+                VkSurfaceCapabilitiesKHR caps = {};
+                vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu, m_second.surface, &caps);
+                VkExtent2D extent = caps.currentExtent;
+#if defined(__ANDROID__)
+                if (extent.width == 0xFFFFFFFFu)
+                    extent = {static_cast<uint32_t>(ANativeWindow_getWidth(static_cast<ANativeWindow *>(m_second.window))),
+                              static_cast<uint32_t>(ANativeWindow_getHeight(static_cast<ANativeWindow *>(m_second.window)))};
+#endif
+                if (!extent.width || !extent.height)
+                    return false;
+                uint32_t count = 0;
+                vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, m_second.surface, &count, nullptr);
+                std::vector<VkSurfaceFormatKHR> formats(count);
+                vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, m_second.surface, &count, formats.data());
+                if (formats.empty())
+                    return false;
+                VkSurfaceFormatKHR format = formats[0];
+                for (const auto &f : formats)
+                    if (f.format == VK_FORMAT_R8G8B8A8_UNORM || f.format == VK_FORMAT_B8G8R8A8_UNORM)
+                    {
+                        format = f;
+                        break;
+                    }
+                // Never wait for this screen: MAILBOX when there is one, and the acquire below
+                // doesn't block either way.
+                vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_second.surface, &count, nullptr);
+                std::vector<VkPresentModeKHR> modes(count);
+                vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_second.surface, &count, modes.data());
+                const bool mailbox = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end();
+                VkSwapchainCreateInfoKHR info = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+                info.surface = m_second.surface;
+                info.minImageCount = std::max(caps.minImageCount, 3u);
+                if (caps.maxImageCount)
+                    info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
+                info.imageFormat = format.format;
+                info.imageColorSpace = format.colorSpace;
+                info.imageExtent = extent;
+                info.imageArrayLayers = 1;
+                info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                // The compositor turns the picture with the display; no rotated rendering here.
+                info.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+                                        ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                                        : caps.currentTransform;
+                info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+                for (VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+                                                      VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR})
+                    if (caps.supportedCompositeAlpha & a)
+                    {
+                        info.compositeAlpha = a;
+                        break;
+                    }
+                info.presentMode = mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+                info.clipped = VK_TRUE;
+                const auto &table = dev.get_device_table();
+                if (table.vkCreateSwapchainKHR(dev.get_device(), &info, nullptr, &m_second.swapchain) != VK_SUCCESS)
+                {
+                    m_second.swapchain = VK_NULL_HANDLE;
+                    return fail("second screen", "vkCreateSwapchainKHR failed");
+                }
+                table.vkGetSwapchainImagesKHR(dev.get_device(), m_second.swapchain, &count, nullptr);
+                std::vector<VkImage> images(count);
+                table.vkGetSwapchainImagesKHR(dev.get_device(), m_second.swapchain, &count, images.data());
+                auto imageInfo = Vulkan::ImageCreateInfo::render_target(extent.width, extent.height, format.format);
+                imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                for (VkImage image : images)
+                {
+                    m_second.images.push_back(dev.wrap_image(imageInfo, image));
+                    Vulkan::ImageViewCreateInfo view = {};
+                    view.image = m_second.images.back().get();
+                    view.format = format.format;
+                    view.view_type = VK_IMAGE_VIEW_TYPE_2D;
+                    view.levels = 1;
+                    view.layers = 1;
+                    m_second.views.push_back(dev.create_image_view(view));
+                }
+                m_second.release.resize(images.size());
+                m_second.extent = extent;
+                m_second.outOfDate = false;
+                m_second.size = (static_cast<uint64_t>(extent.width) << 32) | extent.height;
+                std::cout << "[presenter] second screen " << extent.width << "x" << extent.height
+                          << (mailbox ? " (mailbox)" : " (fifo)") << std::endl;
+                return true;
+            }
+
+            // With the device lock held, after the main screen's frame.
+            void renderSecondScreen()
+            {
+                Vulkan::Device &dev = *m_shared.device;
+#if defined(__ANDROID__)
+                {
+                    std::lock_guard<std::mutex> lock(m_second.pendingMutex);
+                    if (m_second.pendingSet)
+                    {
+                        destroySecondScreen();
+                        m_second.window = m_second.pending;
+                        m_second.pending = nullptr;
+                        m_second.pendingSet = false;
+                        if (m_second.window)
+                        {
+                            auto create = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(
+                                vkGetInstanceProcAddr(dev.get_instance(), "vkCreateAndroidSurfaceKHR"));
+                            VkAndroidSurfaceCreateInfoKHR info = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
+                            info.window = static_cast<ANativeWindow *>(m_second.window);
+                            if (!create || create(dev.get_instance(), &info, nullptr, &m_second.surface) != VK_SUCCESS)
+                            {
+                                m_second.surface = VK_NULL_HANDLE;
+                                fail("second screen", "vkCreateAndroidSurfaceKHR failed");
+                            }
+                        }
+                    }
+                }
+#endif
+                void *ui = m_second.ui;
+                m_second.ui = nullptr;
+                if (m_second.surface == VK_NULL_HANDLE)
+                    return;
+                if (m_second.outOfDate)
+                    destroySecondSwapchain();
+                if (m_second.swapchain == VK_NULL_HANDLE && !createSecondSwapchain())
+                    return;
+#if defined(PS2X_PGS_PRESENTER_UI)
+                if (!ui)
+                    return;
+                Vulkan::Semaphore acquire = dev.request_semaphore(VK_SEMAPHORE_TYPE_BINARY);
+                uint32_t index = 0;
+                const auto &table = dev.get_device_table();
+                const VkResult acquired = table.vkAcquireNextImageKHR(dev.get_device(), m_second.swapchain, 0,
+                                                                      acquire->get_semaphore(), VK_NULL_HANDLE, &index);
+                if (acquired == VK_ERROR_OUT_OF_DATE_KHR || acquired == VK_ERROR_SURFACE_LOST_KHR)
+                {
+                    m_second.outOfDate = true;
+                    return;
+                }
+                if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR)
+                    return; // no image free yet (the screen is behind): skip it this frame
+                acquire->signal_external();
+                dev.add_wait_semaphore(Vulkan::CommandBuffer::Type::Generic, std::move(acquire),
+                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, true);
+
+                ImGuiContext *previous = ImGui::GetCurrentContext();
+                ImGui::SetCurrentContext(static_cast<ImGuiContext *>(ui));
+                ImDrawData *dd = ImGui::GetDrawData();
+                if (dd)
+                    updateTextures(dd);
+                const Vulkan::Image &image = *m_second.images[index];
+                const float fw = static_cast<float>(m_second.extent.width), fh = static_cast<float>(m_second.extent.height);
+                auto cmd = dev.request_command_buffer();
+                cmd->image_barrier(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                Vulkan::RenderPassInfo rp = {};
+                rp.num_color_attachments = 1;
+                rp.color_attachments[0] = m_second.views[index].get();
+                rp.clear_attachments = 1;
+                rp.store_attachments = 1;
+                cmd->begin_render_pass(rp);
+                drawImGui(*cmd, dd, fw, fh);
+                cmd->end_render_pass();
+                ImGui::SetCurrentContext(previous);
+                cmd->image_barrier(image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                   VK_PIPELINE_STAGE_2_NONE, 0);
+                Vulkan::Semaphore release;
+                dev.submit(cmd, nullptr, 1, &release);
+
+                const VkSemaphore wait = release->get_semaphore();
+                VkResult result = VK_SUCCESS;
+                VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+                present.waitSemaphoreCount = 1;
+                present.pWaitSemaphores = &wait;
+                present.swapchainCount = 1;
+                present.pSwapchains = &m_second.swapchain;
+                present.pImageIndices = &index;
+                present.pResults = &result;
+                const VkQueue queue = m_wsi.get_context().get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS];
+                const PFN_vkQueuePresentKHR presentFn = g_realQueuePresent ? g_realQueuePresent : table.vkQueuePresentKHR;
+                dev.external_queue_lock();
+                const VkResult overall = presentFn(queue, &present);
+                dev.external_queue_unlock();
+                release->wait_external(); // consumed by the present, even when it fails
+                m_second.release[index] = std::move(release);
+                // (SUBOPTIMAL is expected: the compositor turns the unrotated picture.)
+                if (overall == VK_ERROR_OUT_OF_DATE_KHR || overall == VK_ERROR_SURFACE_LOST_KHR)
+                    m_second.outOfDate = true;
+#else
+                (void)ui;
+#endif
+            }
 
             void drawScene(Vulkan::CommandBuffer &cmd, float fw, float fh)
             {
@@ -1331,6 +1662,7 @@ namespace ps2x::gs
                     captureLocked(fw, fh);
                 schedulePresent();
                 m_wsi.end_frame();
+                renderSecondScreen();
             }
 
             // Metal's presented times (from a Metal thread) for the adaptive present lead.
@@ -1593,6 +1925,7 @@ namespace ps2x::gs
             Vulkan::ImageHandle m_cpuFrame; // CPU GS: the uploaded picture
             std::unordered_map<uint64_t, Vulkan::ImageHandle> m_textures; // by ImTextureID
             uint64_t m_nextTexture = 0;
+            std::unordered_set<uint64_t> m_nearestTextures; // createUiTexture(..., nearest)
             float m_pictureAspect = 4.0f / 3.0f;
             uint64_t m_lastTick = 0;
             bool m_latched = false;

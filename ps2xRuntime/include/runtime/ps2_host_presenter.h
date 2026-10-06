@@ -83,6 +83,45 @@ namespace ps2x
         // extra presents repeat the picture (no reprocessing) or carry generated frames.
         virtual void setPresentsPerFrame(uint32_t n) { (void)n; }
 
+        // A second display (Android: a Presentation surface on another screen, such as the AYN
+        // Thor's lower one), drawn entirely by a second ImGui context of the app's. nativeWindow is
+        // an ANativeWindow* (acquired here; nullptr = gone) and may be set from any thread; the
+        // swapchain follows at the next frame. secondScreenSize gives its pixels (false: none).
+        // Each host frame the app wants it drawn, it renders that context (DisplaySize = those
+        // pixels) inside frame()'s drawUi and passes it to submitSecondScreenUi.
+        virtual void setSecondScreen(void *nativeWindow) { (void)nativeWindow; }
+        virtual bool secondScreenSize(int &width, int &height) const
+        {
+            (void)width;
+            (void)height;
+            return false;
+        }
+        virtual void submitSecondScreenUi(void *imguiContext) { (void)imguiContext; }
+        // ImGui texture ids the UI can draw (both screens): the newest game picture as the GS
+        // scanned it out (uv 0..1 = the whole field, before post-processing).
+        static constexpr uint64_t kPictureTexture = 0x7FFF0001u;
+        // The game's map drawn on its own (the hardware GS; the game's map then leaves the main
+        // picture while wanted): its texture id, the part it covers (uv0..uv1) and its shape (width
+        // over height). False when no map was drawn lately (or the GS can't separate it).
+        static constexpr uint64_t kMapTexture = 0x7FFF0002u;
+        virtual void setWantMap(bool want) { (void)want; }
+        virtual bool mapRegion(float uv[4], float &aspect) const
+        {
+            (void)uv;
+            (void)aspect;
+            return false;
+        }
+        // An RGBA8 picture of the app's own for ImGui (both screens), sampled nearest (pixel art)
+        // or linear; 0 if unsupported. Call on the UI thread.
+        virtual uint64_t createUiTexture(const uint8_t *rgba, int width, int height, bool nearest = false)
+        {
+            (void)rgba;
+            (void)width;
+            (void)height;
+            (void)nearest;
+            return 0;
+        }
+
         // The SDL_Window of this presenter, or nullptr (raylib keeps its own).
         virtual void *sdlWindow() { return nullptr; }
 
