@@ -257,6 +257,20 @@ namespace ps2x::gs
                 frag.spec_constant_mask = 0x7; // flags, ATST, alpha-test pass (draw.frag)
                 m_drawProgram = m_dev->request_program(hw_spirv::draw_vert, sizeof(hw_spirv::draw_vert), hw_spirv::draw_frag,
                                                        sizeof(hw_spirv::draw_frag), &vert, &frag);
+                {
+                    // The depth snapshot: the presenter's full-screen triangle and depth_copy.frag.
+                    Vulkan::ResourceLayout fsVert = {};
+                    fsVert.output_mask = 0x1;
+                    Vulkan::ResourceLayout copyFrag = {};
+                    copyFrag.input_mask = 0x1;
+                    copyFrag.output_mask = 0x1;
+                    copyFrag.push_constant_size = 16;
+                    copyFrag.sets[0].sampled_image_mask = 0x1;
+                    copyFrag.sets[0].fp_mask = 0x1;
+                    m_depthCopyProgram = m_dev->request_program(post_spirv::fullscreen_vert, sizeof(post_spirv::fullscreen_vert),
+                                                                hw_spirv::depth_copy_frag, sizeof(hw_spirv::depth_copy_frag), &fsVert,
+                                                                &copyFrag);
+                }
                 if (!m_drawProgram)
                 {
                     error = "shaders";
@@ -323,6 +337,16 @@ namespace ps2x::gs
 
             // ---------------------------------------------------------------- GSRasterBackend
             bool WantsPrimitives() const override { return true; }
+            // Depth for temporal upscalers: taken where the 3D ends (the HUD and the post-pass
+            // overwrite Z), as raw GS Z the scanout's size (PgsShared::depth).
+            bool WantsDepthSnapshot() const override { return m_shared && m_shared->wantDepth.load(std::memory_order_relaxed); }
+            void SnapshotDepth(uint32_t zbp, uint32_t) override
+            {
+                publish(true);
+                m_depthRequestZbp = zbp;
+                m_depthRequested = true;
+                flushPending();
+            }
             // The classifier's HUD/scene verdicts (GSPrimitiveBatch::vertexClass) for the UI mask.
             bool WantsVertexSideband() const override
             {
@@ -551,12 +575,17 @@ namespace ps2x::gs
                         m_batches.push_back(std::move(open));
                     }
                 }
-                if (batches.empty())
+                if (batches.empty() && !m_depthRequested)
                     return;
                 auto cmd = m_dev->request_command_buffer();
                 record(*cmd, batches, vertices);
                 batches.clear();
                 vertices.clear();
+                if (m_depthRequested)
+                {
+                    m_depthRequested = false;
+                    snapshotDepthLocked(*cmd, m_depthRequestZbp);
+                }
                 submitRecorded(cmd);
                 // A device of its own: a frame context per flush (waits for the one a few flushes
                 // back), so the GPU can't fall behind and resources are recycled.
@@ -735,6 +764,8 @@ namespace ps2x::gs
                         outH = scan->get_height();
                         m_shared->scanout = m_scanout[m_scanoutIndex];
                         m_shared->motion = m_motionOut;
+                        if (m_shared->wantDepth.load(std::memory_order_relaxed))
+                            m_shared->depth = m_depthReady; // the newest snapshot (2D frames keep the last 3D's)
                         ++m_shared->presentSerial;
                     }
                     if (scan && request.readback)
@@ -1241,6 +1272,7 @@ namespace ps2x::gs
                 {
                     endPass(cmd, passOpen);
                     auto info = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_D32_SFLOAT);
+                    info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT; // the depth snapshot (temporal upscalers)
                     info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                     d = m_dev->create_image(info);
                     cmd.image_barrier(*d, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
@@ -1977,6 +2009,52 @@ namespace ps2x::gs
                 return out.get();
             }
 
+            void snapshotDepthLocked(Vulkan::CommandBuffer &cmd, uint32_t zbp)
+            {
+                const ScanGeom &g = m_scanGeom;
+                auto it = m_depths.find(zbp);
+                if (it == m_depths.end() || !it->second || !g.outW || !g.outH || !m_depthCopyProgram)
+                    return;
+                const Vulkan::Image &depth = *it->second;
+                m_depthIndex = (m_depthIndex + 1u) % 3u;
+                Vulkan::ImageHandle &out = m_depthOut[m_depthIndex];
+                if (!out || out->get_width() != g.outW || out->get_height() != g.outH)
+                {
+                    auto info = Vulkan::ImageCreateInfo::render_target(g.outW, g.outH, VK_FORMAT_R32_SFLOAT);
+                    info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    out = m_dev->create_image(info);
+                }
+                cmd.image_barrier(depth, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                cmd.image_barrier(*out, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                Vulkan::RenderPassInfo rp = {};
+                rp.num_color_attachments = 1;
+                rp.color_attachments[0] = &out->get_view();
+                rp.store_attachments = 1;
+                cmd.begin_render_pass(rp);
+                cmd.set_program(m_depthCopyProgram);
+                cmd.set_opaque_state();
+                cmd.set_depth_test(false, false);
+                cmd.set_cull_mode(VK_CULL_MODE_NONE);
+                cmd.set_texture(0, 0, depth.get_view(), Vulkan::StockSampler::NearestClamp);
+                const float dw = static_cast<float>(depth.get_width()), dh = static_cast<float>(depth.get_height());
+                const float rect[4] = {g.dbx * g.sx / dw, g.dby * g.sy / dh, g.outW / dw, g.outH / dh};
+                cmd.push_constants(rect, 0, sizeof(rect));
+                cmd.draw(3);
+                cmd.end_render_pass();
+                cmd.image_barrier(*out, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                cmd.image_barrier(depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+                                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
+                                  VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+                m_depthReady = out;
+            }
+
             // The UI mask (PgsShared::ui, the scanout's size): 1 where the frame's HUD and 2D screens
             // drew (the classifier's UI class), so post-processing leaves them as drawn.
             void drawUiMask(Vulkan::CommandBuffer &cmd)
@@ -2195,6 +2273,12 @@ namespace ps2x::gs
             bool m_motionOn = false;
             const Vulkan::Image *m_passMotion = nullptr;
             Vulkan::ImageHandle m_motionScan[3], m_motionOut;
+            // Depth for temporal upscalers (WantsDepthSnapshot): requested by the GS thread where the
+            // HUD starts, copied after the frame's 3D is recorded.
+            Vulkan::Program *m_depthCopyProgram = nullptr;
+            bool m_depthRequested = false;
+            uint32_t m_depthRequestZbp = 0, m_depthIndex = 0;
+            Vulkan::ImageHandle m_depthOut[3], m_depthReady;
             Target m_mapLayers[2];
             uint32_t m_mapIndex = 0, m_mapMissed = 0;
             bool m_mapDrawn = false;
