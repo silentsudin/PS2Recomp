@@ -1426,9 +1426,14 @@ namespace ps2x::gs
                 // Drawn at 4x whatever the game's render scale, so the second screen can enlarge it
                 // sharply (its few hundred triangles cost nothing).
                 constexpr uint32_t kMapScale = 4;
+                // One size for both layers whatever frame buffer the map is drawn with: the game's
+                // two buffers differ in height, and layers of two sizes made the second screen
+                // pair one layer's box with the other's image (the map jumped every frame). The
+                // map lies in the field's 224 lines.
+                constexpr uint32_t kMapLines = 256;
                 const uint32_t sx = std::max(kMapScale, frame.sx), sy = std::max(kMapScale * m_yScale, frame.sy);
                 Target &m = m_mapLayers[m_mapIndex];
-                const bool fresh = !m.color || m.width != frame.width || m.height != frame.height || m.sx != sx || m.sy != sy;
+                const bool fresh = !m.color || m.width != frame.width || m.height != kMapLines || m.sx != sx || m.sy != sy;
                 if (fresh || !m_mapDrawn)
                 {
                     endPass(cmd, passOpen);
@@ -1437,10 +1442,10 @@ namespace ps2x::gs
                         m = Target{};
                         m.fbp = ~0u;
                         m.width = frame.width;
-                        m.height = frame.height;
+                        m.height = kMapLines;
                         m.sx = sx;
                         m.sy = sy;
-                        auto info = Vulkan::ImageCreateInfo::render_target(frame.width * sx, frame.height * sy, VK_FORMAT_R8G8B8A8_UNORM);
+                        auto info = Vulkan::ImageCreateInfo::render_target(frame.width * sx, kMapLines * sy, VK_FORMAT_R8G8B8A8_UNORM);
                         info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
                         info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                         m.color = m_dev->create_image(info);
