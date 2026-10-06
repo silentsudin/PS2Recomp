@@ -6,6 +6,11 @@
 #include <cstdint>
 #include <unordered_map>
 
+namespace ps2x
+{
+    class StateArchive;
+}
+
 namespace ps2x::iop
 {
     class IopHost;
@@ -46,6 +51,8 @@ namespace ps2x::iop::detail
         IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept;
 
         void reset();
+        // Save states: the whole state, written or read through `ar`.
+        void serializeState(ps2x::StateArchive &ar);
         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);

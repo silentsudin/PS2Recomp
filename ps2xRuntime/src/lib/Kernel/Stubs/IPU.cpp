@@ -81,10 +81,11 @@ namespace ps2_stubs
             SET_GPR_U32(&invocation.context, 4, 1u);
             SET_GPR_U32(&invocation.context, 29, 0u);
             SET_GPR_U32(&invocation.context, 31, 0u);
-            invocation.onComplete = [rdram, runtime](const R5900Context &, R5900Context &parent)
-            {
-                completeIpuInit(rdram, &parent, runtime);
-            };
+            invocation.onComplete = {EeContinuationKind::IpuInitDone,
+                                     [rdram, runtime](const R5900Context &, R5900Context &parent)
+                                     {
+                                         completeIpuInit(rdram, &parent, runtime);
+                                     }};
             scheduler.invokeCurrent(std::move(invocation));
         }
 

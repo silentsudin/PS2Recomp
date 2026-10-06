@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include "ps2x/state_archive.h"
 #include <cstdio>
 #include "iop_cdvd.h"
 
@@ -157,6 +158,8 @@ namespace ps2x::iop::detail
 
     class IopCdvd::Impl
     {
+        friend class IopCdvd; // serializeState
+
     public:
         struct Callback
         {
@@ -755,5 +758,23 @@ namespace ps2x::iop::detail
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
     {
         return m_impl->takeCompletionCallback();
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    // The virtual ISO built from the disc files is a cache: not saved.
+    void IopCdvd::serializeState(ps2x::StateArchive &ar)
+    {
+        Impl &d = *m_impl;
+        ar & d.callback.address & d.callback.gp;
+        bool completion = d.completionCallback.has_value();
+        ar & completion;
+        CompletionCallback cb = completion ? *d.completionCallback : CompletionCallback{};
+        ar & cb.address & cb.gp & cb.reason;
+        if (ar.loading())
+            d.completionCallback = completion ? std::optional<CompletionCallback>(cb) : std::nullopt;
+        ar & d.initialized & d.mediaMode & d.currentLsn & d.lastError & d.streamFlag & d.lastReadTimeout;
+        ar & d.interruptEventFlagId;
     }
 }

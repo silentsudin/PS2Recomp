@@ -9,6 +9,11 @@
 #include <string_view>
 #include <vector>
 
+namespace ps2x
+{
+    class StateArchive;
+}
+
 namespace ps2x::iop::detail
 {
     class IopEmulator
@@ -21,6 +26,9 @@ namespace ps2x::iop::detail
         IopEmulator &operator=(const IopEmulator &) = delete;
 
         void reset();
+        // Save states: everything but the SPU2, and the SPU2 alone.
+        void serializeState(ps2x::StateArchive &ar);
+        void serializeSpu2State(ps2x::StateArchive &ar);
         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize);
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);

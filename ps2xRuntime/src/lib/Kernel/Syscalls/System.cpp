@@ -416,10 +416,11 @@ namespace ps2_syscalls
         invocation.context.pc = handler;
         SET_GPR_U32(&invocation.context, 29, scheduler.invocationStackTop());
         SET_GPR_U32(&invocation.context, 31, 0u);
-        invocation.onComplete = [](const R5900Context &completed, R5900Context &parent)
-        {
-            parent.r[2] = completed.r[2];
-        };
+        invocation.onComplete = {EeContinuationKind::SyscallOverrideResult,
+                                 [](const R5900Context &completed, R5900Context &parent)
+                                 {
+                                     parent.r[2] = completed.r[2];
+                                 }};
         scheduler.invokeCurrent(std::move(invocation));
     }
 

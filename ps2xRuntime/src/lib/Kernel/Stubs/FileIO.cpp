@@ -149,3 +149,11 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 }
+
+namespace ps2_stubs
+{
+    void serializeFileIoStubState(ps2x::StateArchive &ar)
+    {
+        serializeSupportState(ar);
+    }
+}

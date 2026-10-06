@@ -275,10 +275,11 @@ namespace ps2_stubs
             SET_GPR_U32(&invocation.context, 7, 0u);
             SET_GPR_U32(&invocation.context, 29, 0u);
             SET_GPR_U32(&invocation.context, 31, 0u);
-            invocation.onComplete = [runtime, packetAddress](const R5900Context &, R5900Context &)
-            {
-                runtime->guestFree(packetAddress);
-            };
+            invocation.onComplete = {EeContinuationKind::SifCommandFree,
+                                     [runtime, packetAddress](const R5900Context &, R5900Context &)
+                                     {
+                                         runtime->guestFree(packetAddress);
+                                     }};
             runtime->eeScheduler().queueInvocation(std::move(invocation));
             return true;
         }
@@ -852,5 +853,24 @@ namespace ps2_stubs
     void sceSifWriteBackDCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
+    }
+}
+
+namespace ps2_stubs
+{
+    void serializeSifState(ps2x::StateArchive &ar)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_sifDmaTransferMutex);
+            ar & g_nextSifDmaTransferId;
+        }
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        const auto u32 = [](ps2x::StateArchive &a, uint32_t &v) { a & v; };
+        ar.unorderedMap(g_sifRegs, u32, u32);
+        ar.unorderedMap(g_sifSregs, u32, u32);
+        ar.unorderedMap(g_sifCmdHandlers, u32, [](ps2x::StateArchive &a, SifCmdHandler &h) { a & h.function & h.argument; });
+        ar & g_sifCmdBuffer;
+        ar & g_sifSysCmdBuffer;
+        ar & g_sifCmdInitialized;
     }
 }

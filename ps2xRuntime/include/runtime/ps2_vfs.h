@@ -14,6 +14,10 @@
 #include <vector>
 
 class PS2RomDevice;
+namespace ps2x
+{
+    class StateArchive;
+}
 
 struct PS2VfsMounts
 {
@@ -68,13 +72,21 @@ public:
     [[nodiscard]] bool resolveHostPath(std::string_view path, const PS2VfsMounts &mounts, std::filesystem::path &result) const;
     [[nodiscard]] std::vector<PS2VfsDescriptorInfo> descriptors() const;
 
+    // Save states: the open files (descriptor, guest path, open flags, position) and the next
+    // descriptor. A load closes every open file and reopens the saved ones at their positions
+    // (never truncating; the files' contents are not in the state); it fails if one can't be.
+    void serializeState(ps2x::StateArchive &ar, const PS2VfsMounts &mounts, const PS2RomDevice &rom);
+
 private:
     struct OpenDescriptor
     {
         std::unique_ptr<IPS2OpenFile> file;
         std::string device;
         std::string path;
+        uint32_t flags = 0;
     };
+    [[nodiscard]] std::unique_ptr<IPS2OpenFile> openFile(std::string_view path, uint32_t flags, const PS2VfsMounts &mounts,
+                                                         const PS2RomDevice &rom, std::string *device) const;
 
     mutable std::mutex m_mutex;
     std::unordered_map<int32_t, OpenDescriptor> m_descriptors;

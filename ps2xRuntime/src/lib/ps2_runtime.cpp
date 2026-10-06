@@ -1,3 +1,4 @@
+#include "runtime/ps2_save_state.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_test_harness.h"
 #include "ps2_audio_out.h"
@@ -1052,6 +1053,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
                                       m_cpuContext.pc,
                                       elfCrc32,
                                       elfCrc32Valid);
+    ps2_save_state::setGameIdentity(elfCrc32Valid ? elfCrc32 : 0u);
 
     RUNTIME_LOG("ELF file loaded successfully. Entry point: 0x" << std::hex << m_cpuContext.pc << std::dec);
     return true;
@@ -2280,10 +2282,11 @@ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
     const uint64_t waitTicks = std::max<uint64_t>(1u, ticks);
     m_eeScheduler->waitVSync(currentTick + waitTicks - 1u,
                              0,
-                             [resumePc](R5900Context &context)
-                             {
-                                 context.pc = resumePc;
-                             });
+                             {EeContinuationKind::VSyncResumePc,
+                              [resumePc](R5900Context &context)
+                              {
+                                  context.pc = resumePc;
+                              }});
 }
 
 void PS2Runtime::addEeExitHandler(int threadId, uint32_t function, uint32_t argument)

@@ -1,6 +1,7 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_guest_clock.h"
 #include "runtime/ps2_test_harness.h"
+#include "runtime/ps2_save_state.h"
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
@@ -170,6 +171,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
                   std::chrono::steady_clock::now() + kVBlankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
+    snapshotProbeStart();
 }
 
 void EeScheduler::run()
@@ -183,6 +185,16 @@ void EeScheduler::run()
         if (m_stopRequested.load(std::memory_order_acquire))
         {
             break;
+        }
+        if (m_snapshotProbe)
+        {
+            snapshotProbeAtLoopTop();
+        }
+        // Save states: a save or load asked for (test socket, menu) is done here, where all guest
+        // state is in RDRAM, the scheduler and the host-side emulation (see ps2_save_state.h).
+        if (ps2_save_state::requested())
+        {
+            ps2_save_state::service(m_runtime);
         }
 
         if (m_currentThreadId == 0)
@@ -349,6 +361,10 @@ void EeScheduler::run()
     m_running.store(false, std::memory_order_release);
     copyMainContextToRuntime();
     publishSnapshot();
+    if (m_snapshotProbe)
+    {
+        snapshotProbeFinish();
+    }
 }
 
 void EeScheduler::requestStop()
@@ -1340,7 +1356,7 @@ uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_
     return previous;
 }
 
-[[noreturn]] void EeScheduler::waitVSync(uint64_t afterTick, int fixedResult, std::function<void(R5900Context &)> completion)
+[[noreturn]] void EeScheduler::waitVSync(uint64_t afterTick, int fixedResult, EeResumeContinuation completion)
 {
     blockCurrent(EeWaitState{
         EeWaitReason::VSync,
@@ -1406,7 +1422,7 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
 [[noreturn]] void EeScheduler::waitExternal(EeWaitReason reason,
                                             uint32_t type,
                                             uint64_t token,
-                                            std::function<void(R5900Context &)> completion)
+                                            EeResumeContinuation completion)
 {
     EeWaitState wait{reason, EeExternalWait{type, token}, std::move(completion)};
     blockCurrent(std::move(wait));
@@ -1588,12 +1604,21 @@ int EeScheduler::allocateThreadId()
 
 GuestThread &EeScheduler::acquireInvocationThread()
 {
+    // The idle dispatcher made first (the highest negative id), not the first in the map's
+    // order: which one runs an invocation must not depend on the standard library's hashing
+    // (save states restore the threads, not the map's internal order).
+    GuestThread *idle = nullptr;
     for (auto &[id, candidate] : m_threads)
     {
-        if (id < 0 && candidate.status == EeThreadStatus::Dormant && candidate.invocations.empty())
+        if (id < 0 && candidate.status == EeThreadStatus::Dormant && candidate.invocations.empty() &&
+            (idle == nullptr || id > idle->id))
         {
-            return candidate;
+            idle = &candidate;
         }
+    }
+    if (idle != nullptr)
+    {
+        return *idle;
     }
 
     GuestThread dispatcher{};

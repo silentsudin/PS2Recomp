@@ -8,6 +8,11 @@
 #include <unordered_map>
 #include <vector>
 
+namespace ps2x
+{
+    class StateArchive;
+}
+
 namespace ps2x::iop::detail
 {
     class Spu2;
@@ -42,6 +47,8 @@ namespace ps2x::iop::detail
         IopMemory();
 
         void reset();
+        // Save states: the whole state, written or read through `ar`.
+        void serializeState(ps2x::StateArchive &ar);
 
         [[nodiscard]] uint8_t read8(uint32_t address) const;
         [[nodiscard]] uint16_t read16(uint32_t address) const;

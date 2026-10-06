@@ -12,6 +12,7 @@
 #include "gs_pgs_shared.h"
 #include "ThreadNaming.h"
 #include "gs_texture_tools.h"
+#include "ps2x/state_archive.h"
 
 #include <algorithm>
 #include <deque>
@@ -422,6 +423,49 @@ namespace ps2x::gs
             }
 
             GSTransferSnapshot GetTransferSnapshot() const override { return m_shadow.GetTransferSnapshot(); }
+
+            // Save states: local memory comes from / goes to the GPU; the CPU shadow keeps the
+            // CLUT and transfer state. paraLLEl-GS's own register file is its extra part (saved
+            // raw, marked dirty on load); its texture cache is dropped. (Its CLUT cache and a
+            // primitive strip left open across packets are not: the game rewrites both every
+            // frame.)
+            bool SerializeState(ps2x::StateArchive &ar) override
+            {
+                if (ar.saving())
+                {
+                    const auto lock = lockDevice();
+                    m_iface.flush();
+                    if (const void *gpu = m_iface.map_vram_read(0, m_vramSize))
+                        std::memcpy(m_vram, gpu, m_vramSize);
+                    m_gpuVramNewer = false;
+                }
+                return m_shadow.SerializeState(ar);
+            }
+
+            uint32_t StateExtrasKind() const override { return ps2x::fourcc("PGS1"); }
+
+            void SerializeStateExtras(ps2x::StateArchive &ar) override
+            {
+                const auto lock = lockDevice();
+                // The register file in the GS's own encoding (64-bit register values).
+                auto &regs = m_iface.get_register_state();
+                for (auto &c : regs.ctx)
+                    ar & c.tex0.bits & c.tex1.bits & c.clamp.bits & c.xyoffset.bits & c.miptbl_1_3.bits & c.miptbl_4_6.bits
+                       & c.scissor.bits & c.alpha.bits & c.test.bits & c.fba.bits & c.frame.bits & c.zbuf.bits;
+                ar & regs.prim.bits & regs.rgbaq.bits & regs.st.bits & regs.uv.bits & regs.fog.bits & regs.prmodecont.bits;
+                ar & regs.texclut.bits & regs.texa.bits & regs.fogcol.bits & regs.dimx.bits & regs.dthe.bits & regs.colclamp.bits;
+                ar & regs.pabe.bits & regs.bitbltbuf.bits & regs.trxpos.bits & regs.trxreg.bits & regs.trxdir.bits & regs.scanmsk.bits;
+                ar & regs.internal_q & regs.cached_cbp;
+            }
+
+            void StateLoaded(bool extras) override
+            {
+                (void)extras; // without them the registers stay as they were: the game rewrites them
+                const auto lock = lockDevice();
+                uploadWholeVramLocked();
+                m_iface.clobber_register_state();
+                m_iface.invalidate_texture_cache();
+            }
 
             PresentationFrame Present(const GSPresentationRequest &request) override
             {

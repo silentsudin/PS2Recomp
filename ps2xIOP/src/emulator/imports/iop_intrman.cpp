@@ -1,4 +1,5 @@
 #include "iop_intrman.h"
+#include "ps2x/state_archive.h"
 #include <cstdlib>
 #include <cstdio>
 
@@ -119,5 +120,15 @@ namespace ps2x::iop::detail
                                                       handler->second.gp,
                                                       100000u);
         return true;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopIntrman::serializeState(ps2x::StateArchive &ar)
+    {
+        const auto id = [](ps2x::StateArchive &a, int &k) { a & k; };
+        ar.orderedMap(m_handlers, id, [](ps2x::StateArchive &a, Handler &h) { a & h.function & h.argument & h.gp; });
+        ar.orderedMap(m_enabled, id, [](ps2x::StateArchive &a, bool &v) { a & v; });
     }
 }

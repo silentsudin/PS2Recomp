@@ -10,6 +10,11 @@
 #include <unordered_set>
 #include <vector>
 
+namespace ps2x
+{
+    class StateArchive;
+}
+
 namespace ps2x::iop::detail
 {
     class IopModuleManager
@@ -18,6 +23,8 @@ namespace ps2x::iop::detail
         IopModuleManager();
 
         void reset();
+        // Save states: the whole state, written or read through `ar`.
+        void serializeState(ps2x::StateArchive &ar);
         void setServiceModuleKeys(std::vector<std::string> keys);
 
         [[nodiscard]] ModuleLoadResult loadHle(std::string_view path);

@@ -1,4 +1,5 @@
 #include "iop_module_manager.h"
+#include "ps2x/state_archive.h"
 
 #include "ps2x/iop/ps2_path.h"
 
@@ -176,5 +177,25 @@ namespace ps2x::iop::detail
             --found->second;
         else
             m_loadedKeyReferences.erase(found);
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopModuleManager::serializeState(ps2x::StateArchive &ar)
+    {
+        const auto str = [](ps2x::StateArchive &a, std::string &s) { a.string(s); };
+        ar.unorderedSet(m_builtinKeys, str);
+        ar.unorderedSet(m_serviceKeys, str);
+        ar.unorderedMap(m_records, [](ps2x::StateArchive &a, int32_t &k) { a & k; },
+                        [&](ps2x::StateArchive &a, Record &r)
+                        {
+                            a.string(r.key);
+                            a & r.references;
+                            a & r.physical;
+                        });
+        ar.unorderedMap(m_hleIdsByKey, str, [](ps2x::StateArchive &a, int32_t &v) { a & v; });
+        ar.unorderedMap(m_loadedKeyReferences, str, [](ps2x::StateArchive &a, uint32_t &v) { a & v; });
+        ar & m_nextHleId;
     }
 }

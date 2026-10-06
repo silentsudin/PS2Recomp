@@ -82,6 +82,9 @@ namespace ps2_test
 
     // Called on the EE thread at the start of every guest vblank.
     void onVblank(PS2Runtime &runtime, uint64_t vblank);
+    // A save state was loaded (EE thread): the game is back at `vblank` (just after its events).
+    // A lockstep client's run ends at the next vblank; a movie replays from there.
+    void onStateLoaded(uint64_t vblank);
 
     // RT_TEST_SOCKET=<path>: a JSON-lines control server on a Unix socket for test drivers (one
     // client at a time). While a client is attached the game runs in lockstep: it parks at a vblank

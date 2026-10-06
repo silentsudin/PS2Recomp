@@ -1,4 +1,5 @@
 #include "iop_imports.h"
+#include "ps2x/state_archive.h"
 
 #include "../core/iop_memory.h"
 
@@ -191,5 +192,20 @@ namespace ps2x::iop::detail
             else
                 ++library;
         }
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopImportRegistry::serializeState(ps2x::StateArchive &ar)
+    {
+        ar.orderedMap(m_libraries, [](ps2x::StateArchive &a, uint32_t &k) { a & k; },
+                      [](ps2x::StateArchive &a, ExportLibrary &l)
+                      {
+                          a & l.tableAddress;
+                          a & l.version;
+                          a.string(l.name);
+                          a.podVector(l.functions);
+                      });
     }
 }

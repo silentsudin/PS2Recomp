@@ -8,6 +8,11 @@
 #include <cstdint>
 #include <map>
 
+namespace ps2x
+{
+    class StateArchive;
+}
+
 namespace ps2x::iop::detail
 {
     class IopMemory;
@@ -51,6 +56,8 @@ namespace ps2x::iop::detail
         explicit IopKernel(IopMemory &memory) noexcept;
 
         void reset();
+        // Save states: the whole state, written or read through `ar`.
+        void serializeState(ps2x::StateArchive &ar);
 
         [[nodiscard]] bool dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         [[nodiscard]] bool dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu);

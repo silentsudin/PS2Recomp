@@ -802,14 +802,15 @@ namespace ps2_stubs
                     runtime->eeScheduler().waitVSync(
                         wakeTick - 1u,
                         -1,
-                        [rdram, runtime, state](R5900Context &resumeContext)
-                        {
-                            if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
-                            {
-                                return;
-                            }
-                            continueCdStRead(rdram, &resumeContext, runtime, state);
-                        });
+                        {EeContinuationKind::CdStreamRead,
+                         [rdram, runtime, state](R5900Context &resumeContext)
+                         {
+                             if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                             {
+                                 return;
+                             }
+                             continueCdStRead(rdram, &resumeContext, runtime, state);
+                         }});
                 }
 
                 uint32_t sectors = std::min(remaining, available);
@@ -1005,5 +1006,16 @@ namespace ps2_stubs
             *status = 0;
         }
         setReturnS32(ctx, 1);
+    }
+}
+
+namespace ps2_stubs
+{
+    void serializeCdState(ps2x::StateArchive &ar)
+    {
+        serializeSupportState(ar);
+        CdStreamTimingState &t = g_cdStreamTiming;
+        ar & t.initialized & t.active & t.paused & t.capacitySectors & t.bankCount & t.sectorsPerBank & t.sectorsPerSecond;
+        ar & t.producedSectors & t.consumedSectors & t.productionRemainder & t.lastVSyncTick;
     }
 }

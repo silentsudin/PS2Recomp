@@ -1,4 +1,5 @@
 #include "iop_ioman.h"
+#include "ps2x/state_archive.h"
 
 #include "../core/iop_cpu.h"
 #include "../core/iop_memory.h"
@@ -87,5 +88,18 @@ namespace ps2x::iop::detail
         default:
             return false;
         }
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopIoman::serializeState(ps2x::StateArchive &ar)
+    {
+        ar.sequence(m_devices, [](ps2x::StateArchive &a, Device &d)
+                    {
+                        a & d.address;
+                        a & d.gp;
+                        a.string(d.name);
+                    });
     }
 }

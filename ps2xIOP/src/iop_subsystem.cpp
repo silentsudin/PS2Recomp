@@ -1,4 +1,5 @@
 #include "ps2x/iop/iop_subsystem.h"
+#include "ps2x/state_archive.h"
 
 #include "iop_service.h"
 #include "iop_module_manager.h"
@@ -112,6 +113,21 @@ namespace ps2x::iop
         m_impl->emulator.reset();
         m_impl->refreshServiceModuleKeys();
         m_impl->rebuildRoutes();
+    }
+
+    // The core services (mcserv, dbcman, libsd) only keep log counters; the routes follow from
+    // the loaded modules and are rebuilt.
+    void IopSubsystem::serializeState(ps2x::StateArchive &ar)
+    {
+        m_impl->moduleManager.serializeState(ar);
+        m_impl->emulator.serializeState(ar);
+        if (ar.loading())
+            m_impl->rebuildRoutes();
+    }
+
+    void IopSubsystem::serializeSpu2State(ps2x::StateArchive &ar)
+    {
+        m_impl->emulator.serializeSpu2State(ar);
     }
 
     ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)

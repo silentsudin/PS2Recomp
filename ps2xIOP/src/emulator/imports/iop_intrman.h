@@ -3,6 +3,11 @@
 #include <cstdint>
 #include <map>
 
+namespace ps2x
+{
+    class StateArchive;
+}
+
 namespace ps2x::iop::detail
 {
     struct IopCpuState;
@@ -15,6 +20,8 @@ namespace ps2x::iop::detail
         explicit IopIntrman(IopMemory &memory) noexcept;
 
         void reset();
+        // Save states: the whole state, written or read through `ar`.
+        void serializeState(ps2x::StateArchive &ar);
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
         [[nodiscard]] bool dispatchInterrupt(int irq, IopGuestExecutor &executor) const;
 

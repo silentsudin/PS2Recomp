@@ -8,6 +8,11 @@
 #include <string_view>
 #include <vector>
 
+namespace ps2x
+{
+    class StateArchive;
+}
+
 namespace ps2x::iop::detail
 {
     class IopMemory;
@@ -25,6 +30,8 @@ namespace ps2x::iop::detail
         explicit IopImportRegistry(IopMemory &memory) noexcept;
 
         void reset();
+        // Save states: the whole state, written or read through `ar`.
+        void serializeState(ps2x::StateArchive &ar);
         [[nodiscard]] std::optional<IopImportCall> decode(uint32_t pc) const;
         [[nodiscard]] bool registerExportTable(uint32_t address);
         [[nodiscard]] bool releaseExportTable(uint32_t address);

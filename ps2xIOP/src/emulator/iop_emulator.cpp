@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include "iop_emulator.h"
+#include "ps2x/state_archive.h"
 #include "imports/iop_cdvd.h"
 #include "core/iop_cpu.h"
 #include "imports/iop_heaplib.h"
@@ -798,6 +799,44 @@ namespace ps2x::iop::detail
     void IopEmulator::reset()
     {
         m_impl->reset();
+    }
+
+    void IopEmulator::serializeState(ps2x::StateArchive &ar)
+    {
+        Impl &d = *m_impl;
+        if (ar.saving() && (d.activeCpu != nullptr || d.callDepth != 0u))
+            ar.fail("IOP code is running");
+        d.memory.serializeState(ar);
+        d.kernel.serializeState(ar);
+        d.cdvd.serializeState(ar);
+        d.rpc.serializeState(ar);
+        d.intrman.serializeState(ar);
+        d.timrman.serializeState(ar);
+        d.ioman.serializeState(ar);
+        d.imports.serializeState(ar);
+        ar.orderedMap(d.modules, [](ps2x::StateArchive &a, int &k) { a & k; },
+                      [](ps2x::StateArchive &a, Impl::Module &m)
+                      {
+                          a & m.id;
+                          a.string(m.path);
+                          a.string(m.name);
+                          a & m.base & m.size & m.entry & m.gp & m.resident;
+                      });
+        ar.orderedMap(d.pendingDmaInterrupts, [](ps2x::StateArchive &a, int &k) { a & k; },
+                      [](ps2x::StateArchive &a, uint64_t &v) { a & v; });
+        ar.orderedMap(d.pendingGuestCallbacks, [](ps2x::StateArchive &a, uint64_t &k) { a & k; },
+                      [](ps2x::StateArchive &a, Impl::ScheduledGuestCallback &v) { a & v.function & v.gp & v.argument; });
+        ar & d.nextModuleId & d.moduleCursor & d.totalCycles & d.totalInstructions & d.eeCycleCarry;
+        ar & d.pendingIopCycles & d.spu2Cycles;
+        ar.string(d.lastError);
+        ar & d.servicingDmaInterrupts & d.servicingGuestCallbacks;
+        for (Impl::GuestCallback *cb : {&d.secrMcCommandHandler, &d.secrMcDevIdHandler, &d.checkKelfPathCallback})
+            ar & cb->function & cb->gp;
+    }
+
+    void IopEmulator::serializeSpu2State(ps2x::StateArchive &ar)
+    {
+        m_impl->spu2.serializeState(ar);
     }
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)

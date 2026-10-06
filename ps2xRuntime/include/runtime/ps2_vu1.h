@@ -74,6 +74,16 @@ public:
     // True if the last run ended the program (E-bit/halt) rather than running out of budget.
     bool lastRunEnded() const { return m_lastRunEnded; }
 
+    // Save states: the free-running cycle counter. Pipeline ready times count from it, so setting
+    // it also empties the pipelines (only between programs, as a state is taken).
+    uint64_t cycle() const { return m_cycle; }
+    void restoreCycle(uint64_t cycle)
+    {
+        m_cycle = cycle;
+        m_state.cycles = cycle;
+        resetScheduler();
+    }
+
 private:
     enum Pipeline : uint8_t
     {

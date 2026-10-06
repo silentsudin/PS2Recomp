@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/ps2_gs_common.h"
 #include "runtime/ps2_test_harness.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
@@ -160,6 +161,7 @@ void GS::reset()
     m_trxpos = {};
     m_trxreg = {};
     m_trxdir = 3;
+    m_hostTransferBitsLeft.store(0u, std::memory_order_relaxed);
     m_vtxCount = 0;
     m_vtxIndex = 0;
     m_preferredDisplaySourceFrame = {};
@@ -1578,6 +1580,16 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        {
+            uint64_t bits = 0u;
+            if (m_trxdir == 0u)
+            {
+                const uint8_t psm = m_bitbltbuf.dpsm;
+                const uint32_t bpp = (psm == GS_PSM_CT24 || psm == GS_PSM_Z24) ? 24u : GSInternal::bitsPerPixel(psm);
+                bits = static_cast<uint64_t>(m_trxreg.rrw) * m_trxreg.rrh * bpp;
+            }
+            m_hostTransferBitsLeft.store(bits, std::memory_order_relaxed);
+        }
 
         if (m_backend)
         {
@@ -2042,6 +2054,9 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    const uint64_t left = m_hostTransferBitsLeft.load(std::memory_order_relaxed);
+    const uint64_t bits = static_cast<uint64_t>(sizeBytes) * 8u;
+    m_hostTransferBitsLeft.store(left > bits ? left - bits : 0u, std::memory_order_relaxed);
     if (m_backend)
         m_backend->UploadImage(data, sizeBytes);
 }

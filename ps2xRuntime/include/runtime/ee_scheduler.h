@@ -9,12 +9,19 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <variant>
 #include <vector>
+
+namespace ps2x
+{
+    class StateArchive;
+}
 
 // This exception is the EE equivalent of a longjmp to the dispatcher.  It is
 // not an error and must only be caught at EeScheduler::run().
@@ -74,11 +81,66 @@ using EeWaitPayload = std::variant<std::monostate,
                                    EeVSyncWait,
                                    EeExternalWait>;
 
+// What a host-side continuation does, named at its creation site. A save state can only be taken
+// while every live continuation is one it knows how to write down and rebuild ({kind, args}); for
+// now none is (EeScheduler::canSnapshot reports them by kind).
+enum class EeContinuationKind : uint8_t
+{
+    None,
+    VSyncResumePc,         // PS2Runtime::eeWaitVSyncTicks: resume at a guest pc
+    CdStreamRead,          // sceCdStRead waiting for buffered sectors: read the rest
+    MpegPictureWait,       // sceMpegGetPicture waiting for a decoded frame: retry
+    MpegPictureVSync,      // sceMpegGetPicture waiting for the frame's tick: retry
+    IpuInitDone,           // sceIpuInit after the guest's SETD4_CHCR call
+    SifCommandFree,        // after a guest SIF command handler: free its packet copy
+    RpcServerReturn,       // SifCallRpc after the guest server function: copy back, end function
+    RpcEndCallback,        // SifCallRpc after the guest end function: complete the client
+    SyscallOverrideResult, // after a guest syscall override: copy its v0 to the caller
+    ExitHandlerChain,      // after a thread's exit handlers: exit (and delete) the thread
+    MpegCallbackFree,      // after a guest MPEG callback: free its data block
+    Count,
+};
+
+[[nodiscard]] const char *eeContinuationKindName(EeContinuationKind kind) noexcept;
+// Counts continuations made, per kind (diagnostics: RT_SNAPSHOT_PROBE reports them).
+void eeNoteContinuationCreated(EeContinuationKind kind) noexcept;
+[[nodiscard]] uint64_t eeContinuationsCreated(EeContinuationKind kind) noexcept;
+
+// A host continuation (std::function) that carries its kind. Built only with a kind, so every
+// creation site says what it is.
+template <class Signature>
+class EeContinuation;
+
+template <class R, class... Args>
+class EeContinuation<R(Args...)>
+{
+public:
+    EeContinuation() = default;
+    template <class F>
+    EeContinuation(EeContinuationKind kind, F &&fn) : m_kind(kind), m_fn(std::forward<F>(fn))
+    {
+        eeNoteContinuationCreated(kind);
+    }
+
+    explicit operator bool() const noexcept { return static_cast<bool>(m_fn); }
+    R operator()(Args... args) const { return m_fn(std::forward<Args>(args)...); }
+    [[nodiscard]] EeContinuationKind kind() const noexcept { return m_fn ? m_kind : EeContinuationKind::None; }
+
+private:
+    EeContinuationKind m_kind = EeContinuationKind::None;
+    std::function<R(Args...)> m_fn;
+};
+
+// Runs when a waiting thread is resumed (before its guest code).
+using EeResumeContinuation = EeContinuation<void(R5900Context &)>;
+// Runs when a guest invocation returns: (the invocation's context, the context it returns to).
+using EeInvocationContinuation = EeContinuation<void(const R5900Context &, R5900Context &)>;
+
 struct EeWaitState
 {
     EeWaitReason reason = EeWaitReason::None;
     EeWaitPayload payload{};
-    std::function<void(R5900Context &)> completion;
+    EeResumeContinuation completion;
 };
 
 enum class GuestInvocationKind : uint8_t
@@ -99,7 +161,7 @@ struct GuestInvocation
     uint64_t sequence = 0;
     uint64_t tag = 0;
     R5900Context context{};
-    std::function<void(const R5900Context &, R5900Context &)> onComplete;
+    EeInvocationContinuation onComplete;
 };
 
 struct GuestThread
@@ -121,7 +183,7 @@ struct GuestThread
     bool ownsStack = false;
     uint32_t tlsBase = 0;
     EeWaitState wait{};
-    std::function<void(R5900Context &)> resumeCompletion;
+    EeResumeContinuation resumeCompletion;
     std::vector<GuestInvocation> invocations;
 
     [[nodiscard]] R5900Context &activeContext()
@@ -245,6 +307,30 @@ struct EeEvent
     uint64_t value = 0;
 };
 
+// Why a save state can't be taken at this scheduler loop top (EeScheduler::canSnapshot).
+enum EeSnapshotBlocker : uint32_t
+{
+    kSnapshotContinuation = 1u << 0,   // a live host continuation (see kinds)
+    kSnapshotPath3Fifo = 1u << 1,      // PATH3 packets held while PATH3 is masked
+    kSnapshotDmaPending = 1u << 2,     // GIF/VIF DMA transfers not processed yet
+    kSnapshotVif1Path2Image = 1u << 3, // VIF1 DIRECT image data split across DMA transfers
+    kSnapshotGifArbiter = 1u << 4,     // GIF arbiter packets not handed to the GS
+    kSnapshotGsTransfer = 1u << 5,     // a GS host<->local transfer half done
+    kSnapshotMemoryCard = 1u << 6,     // a memory card file open
+    kSnapshotMpeg = 1u << 7,           // an MPEG movie playing
+};
+
+struct EeSnapshotCheck
+{
+    uint32_t blockers = 0;                 // EeSnapshotBlocker bits
+    uint32_t continuationKinds = 0;        // bit (1 << EeContinuationKind) per live kind
+    uint16_t waitContinuations = 0;        // in waiting threads' wait states
+    uint16_t resumeContinuations = 0;      // ready threads about to run one
+    uint16_t invocationContinuations = 0;  // on threads' invocation stacks
+    uint16_t pendingInvocationContinuations = 0;
+    [[nodiscard]] bool ok() const noexcept { return blockers == 0u; }
+};
+
 struct EeThreadCreateParams
 {
     uint32_t attr = 0;
@@ -341,10 +427,10 @@ public:
     [[nodiscard]] int64_t lastVBlankHostNs() const noexcept { return m_lastVblankHostNs.load(std::memory_order_relaxed); }
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
-    [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, EeResumeContinuation completion = {});
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
-    [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, EeResumeContinuation completion = {});
 
     [[nodiscard]] GuestThread *thread(int id);
     [[nodiscard]] const GuestThread *thread(int id) const;
@@ -364,6 +450,21 @@ public:
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
     void publishSnapshot();
+
+    // Whether a save state could be taken now (only meaningful at the top of run()). With
+    // `hostState`, also checks the GIF/GS path (waits for the GIF/VIF1 worker first), the memory
+    // card and MPEG; otherwise only the scheduler's continuations.
+    [[nodiscard]] EeSnapshotCheck canSnapshot(bool hostState);
+    // Save states (SaveState.cpp): the scheduler's whole state (threads, queues, kernel objects,
+    // handlers, invocations, deadlines, counters). Writing needs canSnapshot() ok unless `hashOnly`
+    // (a digest, any time on the executor); reading rebases host deadlines on now.
+    void serializeState(ps2x::StateArchive &ar, bool hashOnly = false);
+    // The host-relative part (scheduled events' wall-clock deadlines, relative to now), apart so
+    // the rest of a state is the same bytes however long after a load it is saved again.
+    void serializeHostTiming(ps2x::StateArchive &ar, bool hashOnly = false);
+    // Save states: every place a guest context will resume (threads that aren't dormant, their
+    // invocation stacks, pending invocations) whose pc `valid` rejects, as "thread 3 pc 0x1234".
+    [[nodiscard]] std::vector<std::string> invalidResumePcs(const std::function<bool(uint32_t)> &valid) const;
 
 private:
     std::atomic<int64_t> m_vblankNudgeNs{0};
@@ -412,6 +513,17 @@ private:
     void copyMainContextToRuntime();
     void publishDebugContext(const R5900Context &context);
     void publishIdleDebugContext();
+
+    // RT_SNAPSHOT_PROBE (EeSnapshotProbe.cpp): per-vblank canSnapshot() statistics.
+    struct SnapshotProbe;
+    struct SnapshotProbeDeleter
+    {
+        void operator()(SnapshotProbe *probe) const noexcept;
+    };
+    std::unique_ptr<SnapshotProbe, SnapshotProbeDeleter> m_snapshotProbe;
+    void snapshotProbeStart();
+    void snapshotProbeAtLoopTop();
+    void snapshotProbeFinish();
 
     PS2Runtime &m_runtime;
     uint8_t *m_rdram = nullptr;

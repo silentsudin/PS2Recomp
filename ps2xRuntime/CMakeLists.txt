@@ -562,6 +562,33 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+
+# Zstandard (BSD-3-Clause), compressing save-state files. The whole library, pinned by the
+# release tarball's hash; named `zstd` so a libchdr added later (its copy only decodes) uses it.
+if(NOT TARGET zstd)
+    enable_language(C)
+    include(FetchContent)
+    FetchContent_Declare(
+        zstd
+        URL "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz"
+        URL_HASH SHA256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_GetProperties(zstd)
+    if(NOT zstd_POPULATED)
+        FetchContent_Populate(zstd)
+    endif()
+    file(GLOB _ps2x_zstd_sources
+        "${zstd_SOURCE_DIR}/lib/common/*.c"
+        "${zstd_SOURCE_DIR}/lib/compress/*.c"
+        "${zstd_SOURCE_DIR}/lib/decompress/*.c")
+    add_library(zstd STATIC ${_ps2x_zstd_sources})
+    target_include_directories(zstd SYSTEM PUBLIC "${zstd_SOURCE_DIR}/lib")
+    # Portable C only (no x86-64 Huffman assembly), single-threaded.
+    target_compile_definitions(zstd PRIVATE ZSTD_DISABLE_ASM=1)
+    set_target_properties(zstd PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+endif()
+target_link_libraries(ps2_runtime PRIVATE zstd)
 if(APPLE)
     # The display's refresh clock (CVDisplayLink), for vblank phase locking.
     enable_language(OBJCXX)

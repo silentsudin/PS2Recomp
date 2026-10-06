@@ -1961,3 +1961,34 @@ namespace
         return PS2_SCRATCHPAD_BASE + kGsParamScratchOffset;
     }
 }
+
+namespace
+{
+    // Save states: this file's copy of the helpers' globals above (each stub source has its own,
+    // in an anonymous namespace). Indexes built from the disc are left alone: they don't change
+    // while the game runs. Open host files can't be saved: their count must match.
+    [[maybe_unused]] void serializeSupportState(ps2x::StateArchive &ar)
+    {
+        ar & g_nextPseudoLbn;
+        ar & g_lastCdError;
+        ar & g_cdMode;
+        ar & g_cdStreamingLbn;
+        ar & g_cdStreamingEndLbn;
+        ar & g_cdInitialized;
+        ar & g_next_file_handle;
+        {
+            std::lock_guard<std::mutex> lock(g_file_mutex);
+            size_t open = g_file_map.size();
+            ar.size(open);
+            if (ar.loading() && open != g_file_map.size())
+                ar.fail("open stub file handles differ (" + std::to_string(open) + " saved, " +
+                        std::to_string(g_file_map.size()) + " now)");
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_dmaStubMutex);
+            ar.unorderedMap(g_dmaPendingPolls, [](ps2x::StateArchive &a, uint32_t &k) { a & k; },
+                            [](ps2x::StateArchive &a, uint32_t &v) { a & v; });
+        }
+        ar & g_gparam.interlace & g_gparam.omode & g_gparam.ffmode & g_gparam.version;
+    }
+}

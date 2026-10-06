@@ -11,6 +11,11 @@
 #include <functional>
 #include <vector>
 
+namespace ps2x
+{
+    class StateArchive;
+}
+
 namespace ps2x::iop::detail
 {
     class Spu2
@@ -24,6 +29,8 @@ namespace ps2x::iop::detail
 
         Spu2();
         void reset();
+        // Save states: the whole state, written or read through `ar`.
+        void serializeState(ps2x::StateArchive &ar);
 
         [[nodiscard]] uint16_t read16(uint32_t physicalAddress);
         void write16(uint32_t physicalAddress, uint16_t value);

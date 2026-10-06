@@ -76,6 +76,7 @@ namespace ps2_stubs
         bool g_padConnected[kPadPortCount]{true, true};
         PadPortState g_padPorts[kPadPortCount]{};
         int g_padReadLogCount = 0;
+        std::atomic<uint32_t> g_padFrameCount{0}; // scePadGetFrameCount
 
         // RT_PAD_TRACE=1: logs the game's pad commands (mode, actuators, state changes).
         bool padTrace()
@@ -453,8 +454,7 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
-        static std::atomic<uint32_t> frameCount{0};
-        setReturnU32(ctx, frameCount++);
+        setReturnU32(ctx, g_padFrameCount++);
     }
 
     void scePadGetModVersion(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -996,5 +996,30 @@ namespace ps2_stubs
         for (PadInputState &state : g_padOverrideState)
             state = PadInputState{};
         g_padConnected[0] = g_padConnected[1] = true;
+    }
+}
+
+namespace ps2_stubs
+{
+    void serializePadState(ps2x::StateArchive &ar)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_padOverrideMutex);
+            ar & g_padOverrideEnabled;
+            for (PadInputState &s : g_padOverrideState)
+                ar & s.buttons & s.rx & s.ry & s.lx & s.ly;
+            ar & g_padConnected;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_padStateMutex);
+            for (PadPortState &p : g_padPorts)
+            {
+                ar & p.open & p.analogMode & p.pressureEnabled & p.lastUsedOverride & p.lastUsedBackend & p.lastReadOk;
+                ar & p.buttonMask & p.dmaAddr & p.reqState & p.transientState;
+                ar & p.lastInput.buttons & p.lastInput.rx & p.lastInput.ry & p.lastInput.lx & p.lastInput.ly;
+                ar & p.lastData & p.readCount & p.lastReadDataAddr & p.actAlign & p.smallMotor & p.largeMotor;
+            }
+        }
+        ar.property<uint32_t>([] { return g_padFrameCount.load(); }, [](uint32_t v) { g_padFrameCount.store(v); });
     }
 }

@@ -1,4 +1,5 @@
 #include "runtime/ps2_vfs.h"
+#include "ps2x/state_archive.h"
 #include "runtime/ps2_guest_clock.h"
 
 #include "runtime/ps2_memory.h"
@@ -157,55 +158,110 @@ namespace
 
 PS2Vfs::~PS2Vfs() = default;
 
-int32_t PS2Vfs::open(std::string_view path, uint32_t flags, const PS2VfsMounts &mounts, const PS2RomDevice &rom)
+std::unique_ptr<IPS2OpenFile> PS2Vfs::openFile(std::string_view path, uint32_t flags, const PS2VfsMounts &mounts,
+                                              const PS2RomDevice &rom, std::string *device) const
 {
     const ps2x::iop::ParsedPs2Path parsed = ps2x::iop::parsePs2Path(path);
     if (!parsed)
-        return -1;
+        return nullptr;
+    if (device)
+        *device = parsed.deviceName;
 
-    std::unique_ptr<IPS2OpenFile> file;
     if (parsed.device == ps2x::iop::Ps2PathDevice::Rom0)
     {
         const uint32_t access = flags & PS2_FIO_O_RDWR;
         if (access != PS2_FIO_O_RDONLY || (flags & (PS2_FIO_O_CREAT | PS2_FIO_O_TRUNC)) != 0u)
-            return -1;
+            return nullptr;
         std::vector<uint8_t> bytes;
         if (!rom.readFile(parsed.path, bytes))
-            return -1;
-        file = std::make_unique<MemoryOpenFile>(std::move(bytes));
+            return nullptr;
+        return std::make_unique<MemoryOpenFile>(std::move(bytes));
     }
-    else
+
+    std::filesystem::path hostPath;
+    if (!resolveHostPath(path, mounts, hostPath))
+        return nullptr;
+
+    std::error_code existsError;
+    const bool exists = std::filesystem::exists(hostPath, existsError);
+    if (existsError || (exists && (flags & (PS2_FIO_O_CREAT | PS2_FIO_O_EXCL)) == (PS2_FIO_O_CREAT | PS2_FIO_O_EXCL)))
     {
-        std::filesystem::path hostPath;
-        if (!resolveHostPath(path, mounts, hostPath))
-            return -1;
-
-        std::error_code existsError;
-        const bool exists = std::filesystem::exists(hostPath, existsError);
-        if (existsError || (exists && (flags & (PS2_FIO_O_CREAT | PS2_FIO_O_EXCL)) == (PS2_FIO_O_CREAT | PS2_FIO_O_EXCL)))
-        {
-            return -1;
-        }
-
-        FILE *stream = std::fopen(hostPath.string().c_str(), hostMode(flags));
-        const uint32_t access = flags & PS2_FIO_O_RDWR;
-        if (!stream && !exists && (flags & PS2_FIO_O_CREAT) != 0u &&
-            access == PS2_FIO_O_RDWR &&
-            (flags & (PS2_FIO_O_TRUNC | PS2_FIO_O_APPEND)) == 0u)
-        {
-            stream = std::fopen(hostPath.string().c_str(), "w+b");
-        }
-        if (!stream)
-            return -1;
-        file = std::make_unique<HostOpenFile>(stream);
+        return nullptr;
     }
+
+    FILE *stream = std::fopen(hostPath.string().c_str(), hostMode(flags));
+    const uint32_t access = flags & PS2_FIO_O_RDWR;
+    if (!stream && !exists && (flags & PS2_FIO_O_CREAT) != 0u &&
+        access == PS2_FIO_O_RDWR &&
+        (flags & (PS2_FIO_O_TRUNC | PS2_FIO_O_APPEND)) == 0u)
+    {
+        stream = std::fopen(hostPath.string().c_str(), "w+b");
+    }
+    if (!stream)
+        return nullptr;
+    return std::make_unique<HostOpenFile>(stream);
+}
+
+int32_t PS2Vfs::open(std::string_view path, uint32_t flags, const PS2VfsMounts &mounts, const PS2RomDevice &rom)
+{
+    std::string device;
+    std::unique_ptr<IPS2OpenFile> file = openFile(path, flags, mounts, rom, &device);
+    if (!file)
+        return -1;
 
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_nextDescriptor < 3)
         m_nextDescriptor = 3;
     const int32_t descriptor = m_nextDescriptor++;
-    m_descriptors.emplace(descriptor, OpenDescriptor{std::move(file), parsed.deviceName, std::string(path)});
+    m_descriptors.emplace(descriptor, OpenDescriptor{std::move(file), std::move(device), std::string(path), flags});
     return descriptor;
+}
+
+void PS2Vfs::serializeState(ps2x::StateArchive &ar, const PS2VfsMounts &mounts, const PS2RomDevice &rom)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    ar & m_nextDescriptor;
+    std::vector<int32_t> ids;
+    for (const auto &[descriptor, entry] : m_descriptors)
+        ids.push_back(descriptor);
+    std::sort(ids.begin(), ids.end());
+    size_t count = ids.size();
+    ar.size(count);
+    if (ar.saving())
+    {
+        for (int32_t descriptor : ids)
+        {
+            OpenDescriptor &d = m_descriptors.at(descriptor);
+            int64_t position = d.file->seek(0, SEEK_CUR);
+            ar & descriptor;
+            ar.string(d.path);
+            ar & d.flags & position;
+        }
+        return;
+    }
+    m_descriptors.clear();
+    for (size_t i = 0; i < count && ar.ok(); ++i)
+    {
+        int32_t descriptor = 0;
+        std::string path;
+        uint32_t flags = 0;
+        int64_t position = 0;
+        ar & descriptor;
+        ar.string(path);
+        ar & flags & position;
+        if (!ar.ok())
+            break;
+        // Reopened as it was, but never truncated or created anew: the file is the one written.
+        const uint32_t reopen = flags & ~(PS2_FIO_O_TRUNC | PS2_FIO_O_EXCL);
+        std::string device;
+        std::unique_ptr<IPS2OpenFile> file = openFile(path, reopen, mounts, rom, &device);
+        if (!file || (position >= 0 && file->seek(position, SEEK_SET) != position))
+        {
+            ar.fail("can't reopen the game's file " + path);
+            break;
+        }
+        m_descriptors.emplace(descriptor, OpenDescriptor{std::move(file), std::move(device), std::move(path), flags});
+    }
 }
 
 int32_t PS2Vfs::close(int32_t descriptor)

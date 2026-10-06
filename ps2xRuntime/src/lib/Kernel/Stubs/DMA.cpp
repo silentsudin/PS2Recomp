@@ -234,3 +234,13 @@ namespace ps2_stubs
         TODO_NAMED("sceDmaWatch", rdram, ctx, runtime);
     }
 }
+
+namespace ps2_stubs
+{
+    void serializeDmaStubState(ps2x::StateArchive &ar)
+    {
+        serializeSupportState(ar);
+        SceDmaEnv &e = g_dmaCurrentEnv;
+        ar & e.sts & e.std & e.mfd & e.rele & e.pcr & e.sqwc & e.rbor & e.rbsr;
+    }
+}

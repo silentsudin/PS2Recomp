@@ -1,5 +1,7 @@
 #include "Common.h"
 #include "RPC.h"
+#include "ps2x/state_archive.h"
+#include "../Stubs/StubState.h"
 #include "../../ps2_iop_transport.h"
 
 namespace ps2_syscalls
@@ -698,10 +700,11 @@ namespace ps2_syscalls
             SET_GPR_U32(&callback.context, 4, endParameter);
             SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
             SET_GPR_U32(&callback.context, 31, 0u);
-            callback.onComplete = [completeClient](const R5900Context &, R5900Context &base)
-            {
-                completeClient(base, true);
-            };
+            callback.onComplete = {EeContinuationKind::RpcEndCallback,
+                                   [completeClient](const R5900Context &, R5900Context &base)
+                                   {
+                                       completeClient(base, true);
+                                   }};
             runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
 
@@ -717,10 +720,11 @@ namespace ps2_syscalls
             SET_GPR_U32(&invocation.context, 7, guestA3);
             SET_GPR_U32(&invocation.context, 29, runtime->eeScheduler().invocationStackTop());
             SET_GPR_U32(&invocation.context, 31, 0u);
-            invocation.onComplete = [finishCall](const R5900Context &completed, R5900Context &parent)
-            {
-                finishCall(&completed, parent);
-            };
+            invocation.onComplete = {EeContinuationKind::RpcServerReturn,
+                                     [finishCall](const R5900Context &completed, R5900Context &parent)
+                                     {
+                                         finishCall(&completed, parent);
+                                     }};
             runtime->eeScheduler().invokeCurrent(std::move(invocation));
         }
         finishCall(nullptr, *ctx);
@@ -1028,5 +1032,29 @@ namespace ps2_syscalls
     {
         uint32_t queuePtr = getRegU32(ctx, 4);
         setReturnS32(ctx, static_cast<int32_t>(queuePtr));
+    }
+}
+
+namespace ps2_syscalls
+{
+    // The EE-side SIF RPC bookkeeping (Helpers/State.h); the debug history is left out.
+    void serializeRpcState(ps2x::StateArchive &ar)
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_mutex);
+        const auto u32 = [](ps2x::StateArchive &a, uint32_t &v) { a & v; };
+        ar.unorderedMap(g_rpc_servers, u32, [](ps2x::StateArchive &a, RpcServerState &v) { a & v.sid & v.sd_ptr; });
+        ar.unorderedMap(g_rpc_clients, u32, [](ps2x::StateArchive &a, RpcClientState &v) { a & v.busy & v.last_rpc & v.sid; });
+        ar & g_rpc_initialized;
+        ar & g_rpc_next_id;
+        ar & g_rpc_packet_index;
+        ar & g_rpc_server_index;
+        ar & g_rpc_active_queue;
+        ar & g_bootmode_initialized;
+        ar & g_bootmode_pool_offset;
+        ar.unorderedMap(g_bootmode_addresses, [](ps2x::StateArchive &a, uint8_t &k) { a & k; }, u32);
+        ar & g_tls_index;
+        ar & g_osd_config_initialized;
+        ar & g_osd_config_raw;
+        ar & g_osd_config2_raw;
     }
 }

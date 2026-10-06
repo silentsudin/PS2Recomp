@@ -1613,10 +1613,11 @@ namespace ps2_stubs
             GuestInvocation invocation{};
             invocation.kind = GuestInvocationKind::RpcCallback;
             invocation.context = callbackCtx;
-            invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
-            {
-                runtime->guestFree(cbDataAddr);
-            };
+            invocation.onComplete = {EeContinuationKind::MpegCallbackFree,
+                                     [runtime, cbDataAddr](const R5900Context &, R5900Context &)
+                                     {
+                                         runtime->guestFree(cbDataAddr);
+                                     }};
             runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
 
@@ -1766,6 +1767,12 @@ namespace ps2_stubs
     {
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         resetMpegStubStateUnlocked();
+    }
+
+    bool mpegPlaybackActive()
+    {
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        return !g_mpeg_stub_state.playbackByMpeg.empty();
     }
 
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr)
@@ -2312,14 +2319,15 @@ namespace ps2_stubs
                     EeWaitReason::Mpeg,
                     kMpegPictureWaitType,
                     mpegAddr,
-                    [rdram, runtime](R5900Context &resumeContext)
-                    {
-                        if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
-                        {
-                            return;
-                        }
-                        sceMpegGetPicture(rdram, &resumeContext, runtime);
-                    });
+                    {EeContinuationKind::MpegPictureWait,
+                     [rdram, runtime](R5900Context &resumeContext)
+                     {
+                         if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                         {
+                             return;
+                         }
+                         sceMpegGetPicture(rdram, &resumeContext, runtime);
+                     }});
             }
 
             if (!playback.decodedFrames.empty())
@@ -2348,14 +2356,15 @@ namespace ps2_stubs
                     runtime->eeScheduler().waitVSync(
                         eligibleTick - 1u,
                         -1,
-                        [rdram, runtime](R5900Context &resumeContext)
-                        {
-                            if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
-                            {
-                                return;
-                            }
-                            sceMpegGetPicture(rdram, &resumeContext, runtime);
-                        });
+                        {EeContinuationKind::MpegPictureVSync,
+                         [rdram, runtime](R5900Context &resumeContext)
+                         {
+                             if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                             {
+                                 return;
+                             }
+                             sceMpegGetPicture(rdram, &resumeContext, runtime);
+                         }});
                 }
 
                 frame = std::move(playback.decodedFrames.front());

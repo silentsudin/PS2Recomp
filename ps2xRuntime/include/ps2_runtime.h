@@ -43,6 +43,10 @@ namespace ps2x::iop
 {
     class IopSubsystem;
 }
+namespace ps2x
+{
+    class StateArchive;
+}
 
 class PS2IopHostAdapter;
 class PS2IopTransport;
@@ -506,6 +510,11 @@ public:
     inline const PS2RomDevice &romDevice() const { return m_romDevice; }
     inline PS2Vfs &vfs() { return m_vfs; }
     inline const PS2Vfs &vfs() const { return m_vfs; }
+
+    // Save states (SaveState.cpp): the runtime's own EE-side state (main context, exit handlers,
+    // syscall overrides, guest heap, callback stacks). The IOP is reached through iopSubsystem().
+    void serializeState(ps2x::StateArchive &ar);
+    ps2x::iop::IopSubsystem *iopSubsystem() { return m_iopSubsystem.get(); }
 
 private:
     struct GuestHeapBlock

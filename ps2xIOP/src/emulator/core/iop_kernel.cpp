@@ -1,4 +1,5 @@
 #include "iop_kernel.h"
+#include "ps2x/state_archive.h"
 
 #include "iop_memory.h"
 #include "../iop_emulator_const.h"
@@ -751,6 +752,35 @@ namespace ps2x::iop::detail
             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
             if (pc >= base && pc < base + size)
                 thread.state = IopThreadState::Dead;
+        }
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopKernel::serializeState(ps2x::StateArchive &ar)
+    {
+        const auto id = [](ps2x::StateArchive &a, int &k) { a & k; };
+        ar.orderedMap(m_threads, id, [](ps2x::StateArchive &a, IopThread &t)
+                      {
+                          a & t.id & t.state;
+                          IopCpuState &c = t.cpu;
+                          a & c.gpr & c.hi & c.lo & c.pc & c.cop0 & c.pendingLoadReg & c.pendingLoadValue & c.pendingLoad;
+                          a & c.branchPending & c.branchTarget & c.stopped & c.yielded & c.exception;
+                          a & t.entry & t.stackBase & t.stackSize & t.priority & t.initialPriority & t.option & t.attr;
+                          a & t.wakeCycle & t.waitId & t.waitBits & t.waitMode & t.waitResultAddress & t.wakeupCount;
+                      });
+        ar.orderedMap(m_semaphores, id, [](ps2x::StateArchive &a, Semaphore &s) { a & s.id & s.attr & s.option & s.current & s.maximum; });
+        ar.orderedMap(m_eventFlags, id, [](ps2x::StateArchive &a, EventFlag &e) { a & e.id & e.bits & e.attr & e.option; });
+        ar & m_nextThreadId;
+        ar & m_nextSemaphoreId;
+        ar & m_nextEventFlagId;
+        int current = m_currentThread ? m_currentThread->id : 0;
+        ar & current;
+        if (ar.loading())
+        {
+            const auto it = m_threads.find(current);
+            m_currentThread = (current != 0 && it != m_threads.end()) ? &it->second : nullptr;
         }
     }
 }

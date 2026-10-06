@@ -1,4 +1,5 @@
 #include "iop_spu2.h"
+#include "ps2x/state_archive.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -700,5 +701,35 @@ namespace ps2x::iop::detail
         const bool pending = m_interruptPending;
         m_interruptPending = false;
         return pending;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void Spu2::serializeState(ps2x::StateArchive &ar)
+    {
+        ar.podVector(m_ram);
+        ar & m_regs;
+        for (Core &core : m_cores)
+        {
+            for (Voice &v : core.voices)
+            {
+                ar & v.volL & v.volR & v.pitch & v.adsr1 & v.adsr2 & v.ssa & v.lsa & v.nax & v.lsaWritten & v.phase;
+                ar & v.level & v.envCounter & v.counter & v.decoded & v.decodedPos & v.hist1 & v.hist2 & v.prev & v.cur;
+            }
+            ar & core.vmixl & core.vmixr & core.vmixel & core.vmixer & core.pmon & core.non;
+            ar & core.endx & core.irqa & core.tsa;
+            ar & core.attr & core.mmix & core.admas & core.statx;
+            ar & core.mvolL & core.mvolR & core.avolL & core.avolR & core.bvolL & core.bvolR;
+            ar.podDeque(core.admaL);
+            ar.podDeque(core.admaR);
+            ar & core.irqFired;
+            ar & core.reverbX & core.reverbPhase & core.wetInL & core.wetInR;
+            ar & core.revPrevL & core.revPrevR & core.revCurL & core.revCurR;
+        }
+        ar & m_irqInfo;
+        ar & m_interruptPending;
+        ar & m_cycleCarry;
+        ar.podVector(m_out);
     }
 }

@@ -1552,3 +1552,67 @@ namespace ps2_stubs
         setReturnS32(ctx, 1);
     }
 }
+
+namespace ps2_stubs
+{
+    // Card files are normally closed when a state is taken (canSnapshot waits while one is
+    // open: the game is in the middle of a card operation); any that are open are saved as
+    // (fd, port, path, position) and reopened read/write on load.
+    void serializeMemoryCardState(ps2x::StateArchive &ar)
+    {
+        std::lock_guard<std::mutex> lock(g_mcStateMutex);
+        ar & g_mcNextFd;
+        ar & g_mcLastCmd;
+        ar & g_mcCommandPending;
+        ar & g_mcLastResult;
+        ar & g_cvMcFileCursor;
+        for (McPortState &port : g_mcPorts)
+        {
+            ar.string(port.currentDir);
+            ar & port.formatted;
+        }
+        std::vector<int32_t> fds;
+        for (const auto &[fd, file] : g_mcFiles)
+            fds.push_back(fd);
+        std::sort(fds.begin(), fds.end());
+        size_t open = fds.size();
+        ar.size(open);
+        if (ar.saving())
+        {
+            for (int32_t fd : fds)
+            {
+                McOpenFile &f = g_mcFiles[fd];
+                std::string path = f.hostPath.string();
+                int64_t position = f.file ? static_cast<int64_t>(std::ftell(f.file)) : -1;
+                ar & fd & f.port;
+                ar.string(path);
+                ar & position;
+            }
+            return;
+        }
+        for (auto &[fd, f] : g_mcFiles)
+            if (f.file)
+                std::fclose(f.file);
+        g_mcFiles.clear();
+        for (size_t i = 0; i < open && ar.ok(); ++i)
+        {
+            int32_t fd = 0, port = 0;
+            std::string path;
+            int64_t position = 0;
+            ar & fd & port;
+            ar.string(path);
+            ar & position;
+            if (!ar.ok())
+                break;
+            FILE *file = std::fopen(path.c_str(), "r+b");
+            if (!file || (position >= 0 && std::fseek(file, static_cast<long>(position), SEEK_SET) != 0))
+            {
+                if (file)
+                    std::fclose(file);
+                ar.fail("can't reopen the memory card file " + path);
+                break;
+            }
+            g_mcFiles.emplace(fd, McOpenFile{file, port, path});
+        }
+    }
+}

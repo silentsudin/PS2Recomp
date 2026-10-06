@@ -5,6 +5,8 @@
 namespace ps2_stubs
 {
     void resetMpegStubState();
+    // An MPEG decoder exists (sceMpegCreate .. sceMpegDelete): a movie is playing.
+    bool mpegPlaybackActive();
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr);
     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);

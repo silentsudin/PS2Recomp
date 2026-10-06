@@ -688,6 +688,17 @@ namespace ps2_stubs
         setReturnS32(ctx, result >= 0 ? 0 : -1); // PS2 might expect 0/-1 rather than EOF
     }
 
+    namespace
+    {
+        // What each fopen handle was opened as (save states reopen them).
+        struct OpenedHostFile
+        {
+            std::string path;
+            std::string mode;
+        };
+        std::unordered_map<uint32_t, OpenedHostFile> g_fileOpened; // under g_file_mutex
+    }
+
     void fopen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t pathAddr = getRegU32(ctx, 4); // $a0
@@ -708,6 +719,7 @@ namespace ps2_stubs
                 std::lock_guard<std::mutex> lock(g_file_mutex);
                 file_handle = generate_file_handle();
                 g_file_map[file_handle] = fp;
+                g_fileOpened[file_handle] = OpenedHostFile{hostPath, hostMode};
                 RUNTIME_LOG("  -> handle=0x" << std::hex << file_handle << std::dec);
             }
             else
@@ -740,6 +752,7 @@ namespace ps2_stubs
                 FILE *fp = it->second;
                 ret = ::fclose(fp);
                 g_file_map.erase(it);
+                g_fileOpened.erase(file_handle);
             }
             else
             {
@@ -1192,4 +1205,64 @@ namespace ps2_stubs
         setReturnU64(ctx, static_cast<uint64_t>(num / den));
     }
 
+}
+
+namespace ps2_stubs
+{
+    // Save states: the libc stub's open host files (handle, path, mode, position), reopened on
+    // load at their positions ("w" modes as "r+": the file is the one written, not a new one).
+    void serializeLibcFileState(ps2x::StateArchive &ar)
+    {
+        std::lock_guard<std::mutex> lock(g_file_mutex);
+        ar & g_next_file_handle;
+        std::vector<uint32_t> handles;
+        for (const auto &[handle, fp] : g_file_map)
+            handles.push_back(handle);
+        std::sort(handles.begin(), handles.end());
+        size_t count = handles.size();
+        ar.size(count);
+        if (ar.saving())
+        {
+            for (uint32_t handle : handles)
+            {
+                OpenedHostFile info = g_fileOpened.count(handle) ? g_fileOpened[handle] : OpenedHostFile{};
+                int64_t position = static_cast<int64_t>(std::ftell(g_file_map[handle]));
+                ar & handle;
+                ar.string(info.path);
+                ar.string(info.mode);
+                ar & position;
+            }
+            return;
+        }
+        for (auto &[handle, fp] : g_file_map)
+            if (fp)
+                ::fclose(fp);
+        g_file_map.clear();
+        g_fileOpened.clear();
+        for (size_t i = 0; i < count && ar.ok(); ++i)
+        {
+            uint32_t handle = 0;
+            OpenedHostFile info;
+            int64_t position = 0;
+            ar & handle;
+            ar.string(info.path);
+            ar.string(info.mode);
+            ar & position;
+            if (!ar.ok())
+                break;
+            std::string mode = info.mode;
+            if (!mode.empty() && mode[0] == 'w')
+                mode = mode.find('b') != std::string::npos ? "r+b" : "r+";
+            FILE *fp = info.path.empty() ? nullptr : ::fopen(info.path.c_str(), mode.c_str());
+            if (!fp || (position >= 0 && std::fseek(fp, static_cast<long>(position), SEEK_SET) != 0))
+            {
+                if (fp)
+                    ::fclose(fp);
+                ar.fail("can't reopen the game's host file " + info.path);
+                break;
+            }
+            g_file_map[handle] = fp;
+            g_fileOpened[handle] = info;
+        }
+    }
 }

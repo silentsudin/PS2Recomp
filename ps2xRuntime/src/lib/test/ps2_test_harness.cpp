@@ -2,6 +2,8 @@
 
 #include "ps2_runtime.h"
 #include "Stubs/Pad.h"
+#include "runtime/ps2_save_state.h"
+#include "ps2x/state_archive.h"
 
 #include <algorithm>
 #include <cmath>
@@ -289,6 +291,22 @@ namespace ps2_test
 
         void logStateHash(PS2Runtime &runtime, uint64_t vblank)
         {
+            // RT_STATE_HASH_FULL=1: one hash per save-state chunk (scheduler, VRAM, VU1, IOP,
+            // SPU2, HLE stubs... see ps2_save_state.h).
+            static const bool full = [] { const char *e = std::getenv("RT_STATE_HASH_FULL"); return e && *e == '1'; }();
+            if (full)
+            {
+                std::string line = std::to_string(vblank);
+                char buf[40];
+                for (const auto &[name, hash] : ps2_save_state::chunkHashes(runtime))
+                {
+                    std::snprintf(buf, sizeof(buf), " %s=%016llx", name.c_str(), static_cast<unsigned long long>(hash));
+                    line += buf;
+                }
+                std::fprintf(g_hashLog, "%s\n", line.c_str());
+                std::fflush(g_hashLog);
+                return;
+            }
             PS2Memory &memory = runtime.memory();
             memory.syncGifVif1();
             const uint64_t ee = hashBytes(memory.getRDRAM(), PS2_RAM_SIZE);
@@ -466,6 +484,17 @@ namespace ps2_test
             std::fprintf(stderr, "[test] reached vblank %llu, stopping\n", static_cast<unsigned long long>(vblank));
             runtime.requestStop();
         }
+    }
+
+    void onStateLoaded(uint64_t vblank)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_currentVblank = vblank;
+        if (g_serverEnabled && !g_liveSocket && g_attached)
+            g_runTarget = vblank + 1u;
+        // A movie plays from the start again up to the vblank.
+        g_movieIndex = 0;
+        g_moviePads = Pads{};
     }
 
     namespace
@@ -748,6 +777,157 @@ namespace ps2_test
                     else if (const uint8_t *src = memorySpace(runtime, space, addr, len))
                         std::memcpy(buffer.data(), src, len);
                     reply += std::string(first ? "" : ",") + "\"" + toHex(buffer.data(), len) + "\"";
+                    first = false;
+                }
+                return reply + "]}";
+            }
+            if (cmd == "save_state" || cmd == "load_state")
+            {
+                // Save into / load from the in-memory slot, or the file "path", at the next savable
+                // scheduler loop top, running vblank by vblank (at most "max_vblanks", default 120)
+                // until it happened. A file save then waits for the file to be written ("raw":
+                // true stores it uncompressed); a file load that is refused (damaged, another game,
+                // a newer version) runs nothing. Load options: "resave_path" saves the machine
+                // again right after loading; "test_fail": true makes the load fail its last check
+                // (the machine is put back).
+                const auto esc = [](const std::string &in)
+                {
+                    std::string out;
+                    for (char c : in)
+                    {
+                        if (c == '"' || c == '\\')
+                            out += '\\';
+                        out += (static_cast<unsigned char>(c) < 0x20) ? ' ' : c;
+                    }
+                    return out;
+                };
+                const std::string path = jsonValue(line, "path");
+                const uint64_t before = ps2_save_state::lastResult().sequence;
+                const uint64_t writesBefore = ps2_save_state::lastWrite().sequence;
+                if (cmd == "save_state")
+                {
+                    if (path.empty())
+                        ps2_save_state::request(ps2_save_state::Op::Save);
+                    else
+                        ps2_save_state::requestSaveFile(path, jsonValue(line, "raw") != "true");
+                }
+                else if (path.empty())
+                    ps2_save_state::request(ps2_save_state::Op::Load);
+                else
+                {
+                    std::string error;
+                    if (!ps2_save_state::requestLoadFile(path, error, jsonValue(line, "resave_path")))
+                        return "{\"ok\":false,\"refused\":true,\"vblank\":" + std::to_string(g_parkedAt) + ",\"error\":\"" +
+                               esc(error) + "\"}";
+                    if (jsonValue(line, "test_fail") == "true") // (the game is parked: set before it runs)
+                        ps2_save_state::failNextLoadForTest();
+                }
+                const uint64_t limit = jsonNumber(line, "max_vblanks", 120);
+                std::string ran;
+                for (uint64_t i = 0; i <= limit; ++i)
+                {
+                    ran = handle(runtime, "{\"cmd\":\"run\",\"vblanks\":1}");
+                    if (ran.find("\"ok\":true") == std::string::npos || ps2_save_state::lastResult().sequence != before)
+                        break;
+                }
+                const ps2_save_state::Result r = ps2_save_state::lastResult();
+                if (r.sequence == before)
+                {
+                    ps2_save_state::cancel();
+                    return "{\"ok\":false,\"error\":\"no savable point\",\"blockers\":\"" + r.blockers + "\"}";
+                }
+                std::string write;
+                if (r.ok && ((cmd == "save_state" && !path.empty()) || !jsonValue(line, "resave_path").empty()))
+                {
+                    ps2_save_state::waitForWrites();
+                    const ps2_save_state::WriteResult w = ps2_save_state::lastWrite();
+                    char wbuf[256];
+                    std::snprintf(wbuf, sizeof(wbuf), ",\"written\":%s,\"file_bytes\":%llu,\"write_ms\":%.2f,\"write_error\":\"%s\"",
+                                  (w.sequence != writesBefore && w.ok) ? "true" : "false",
+                                  static_cast<unsigned long long>(w.fileBytes), w.ms, esc(w.error).c_str());
+                    write = wbuf;
+                }
+                char buf[768];
+                std::snprintf(buf, sizeof(buf),
+                              "{\"ok\":%s,\"vblank\":%llu,\"state_vblank\":%llu,\"loop_tops\":%llu,\"bytes\":%zu,"
+                              "\"ms\":%.2f,\"order_mismatches\":%u,\"reserialized_equal\":%s,\"rolled_back\":%s,\"skipped\":\"%s\",\"blockers\":\"%s\",\"error\":\"%s\"",
+                              r.ok ? "true" : "false", static_cast<unsigned long long>(g_parkedAt),
+                              static_cast<unsigned long long>(r.vblank), static_cast<unsigned long long>(r.loopTops), r.bytes, r.ms,
+                              r.orderMismatches, r.reserializedEqual ? "true" : "false", r.rolledBack ? "true" : "false",
+                              r.skipped.c_str(), r.blockers.c_str(), esc(r.error).c_str());
+                return std::string(buf) + write + "}";
+            }
+            if (cmd == "state_info")
+            {
+                // A state file's header: game, vblank, metadata and chunks.
+                ps2_save_state::FileInfo info;
+                std::string error;
+                if (!ps2_save_state::readStateFileInfo(jsonValue(line, "path"), info, error))
+                    return "{\"ok\":false,\"error\":\"" + error + "\"}";
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                              "{\"ok\":true,\"format\":%u,\"game_crc\":\"%08X\",\"vblank\":%llu,\"saved\":%lld,\"raw_bytes\":%llu,"
+                              "\"file_bytes\":%llu,\"meta\":{",
+                              info.formatVersion, info.gameCrc, static_cast<unsigned long long>(info.vblank),
+                              static_cast<long long>(info.savedUnixTime), static_cast<unsigned long long>(info.rawSize),
+                              static_cast<unsigned long long>(info.fileSize));
+                std::string reply = buf;
+                bool first = true;
+                for (const auto &[k, v] : info.metadata)
+                {
+                    reply += std::string(first ? "" : ",") + "\"" + k + "\":\"" + v + "\"";
+                    first = false;
+                }
+                reply += "},\"chunks\":[";
+                first = true;
+                for (const auto &c : info.chunks)
+                {
+                    char cb[192];
+                    std::snprintf(cb, sizeof(cb), "%s{\"name\":\"%s\",\"version\":%u,\"size\":%llu,\"hash\":\"%016llx\",\"digest\":\"%016llx\"}",
+                                  first ? "" : ",", ps2x::fourccName(c.id).c_str(), c.version, static_cast<unsigned long long>(c.size),
+                                  static_cast<unsigned long long>(c.hash), static_cast<unsigned long long>(c.digest));
+                    reply += cb;
+                    first = false;
+                }
+                return reply + "]}";
+            }
+            if (cmd == "state_hash")
+            {
+                // Per-chunk hashes of the state now (the game parked at a vblank).
+                std::string reply = "{\"ok\":true,\"vblank\":" + std::to_string(g_parkedAt) + ",\"hashes\":{";
+                bool first = true;
+                for (const auto &[name, hash] : ps2_save_state::chunkHashes(runtime))
+                {
+                    char buf[64];
+                    std::snprintf(buf, sizeof(buf), "%s\"%s\":\"%016llx\"", first ? "" : ",", name.c_str(),
+                                  static_cast<unsigned long long>(hash));
+                    reply += buf;
+                    first = false;
+                }
+                return reply + "}}";
+            }
+            if (cmd == "state_dump")
+            {
+                // One chunk's bytes (as hashed by state_hash) to a file.
+                const std::vector<uint8_t> bytes = ps2_save_state::chunkBytes(runtime, jsonValue(line, "chunk"));
+                FILE *f = std::fopen(jsonValue(line, "path").c_str(), "wb");
+                if (!f)
+                    return "{\"ok\":false,\"error\":\"cannot write\"}";
+                std::fwrite(bytes.data(), 1, bytes.size(), f);
+                std::fclose(f);
+                return "{\"ok\":true,\"size\":" + std::to_string(bytes.size()) + "}";
+            }
+            if (cmd == "state_chunks")
+            {
+                // The slot's chunks: name, size, hash.
+                std::string reply = "{\"ok\":true,\"chunks\":[";
+                bool first = true;
+                for (const auto &[name, info] : ps2_save_state::slotChunks())
+                {
+                    char buf[128];
+                    std::snprintf(buf, sizeof(buf), "%s{\"name\":\"%s\",\"size\":%zu,\"hash\":\"%016llx\"}", first ? "" : ",",
+                                  name.c_str(), info.first, static_cast<unsigned long long>(info.second));
+                    reply += buf;
                     first = false;
                 }
                 return reply + "]}";

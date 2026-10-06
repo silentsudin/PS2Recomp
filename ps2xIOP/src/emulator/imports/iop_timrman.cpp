@@ -1,4 +1,5 @@
 #include "iop_timrman.h"
+#include "ps2x/state_archive.h"
 
 #include "../core/iop_cpu.h"
 #include "../services/iop_rpc.h"
@@ -472,5 +473,23 @@ namespace ps2x::iop::detail
             next = std::min(next, timer.overflowCycle);
         }
         return next;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopTimrman::serializeState(ps2x::StateArchive &ar)
+    {
+        for (Timer &t : m_timers)
+        {
+            // address .. users describe the hardware timer (fixed); the rest is its programming.
+            ar & t.address & t.sources & t.width & t.maxPrescale & t.irq & t.users;
+            ar & t.source & t.prescale & t.setupMode & t.liveMode & t.counterBase & t.compare;
+            ar & t.counterBaseCycle & t.compareCycle & t.overflowCycle & t.configured & t.running;
+            ar & t.compareCallback.function & t.compareCallback.common & t.compareCallback.gp;
+            ar & t.overflowCallback.function & t.overflowCallback.common & t.overflowCallback.gp;
+        }
+        ar & m_holdMode;
+        ar & m_servicing;
     }
 }

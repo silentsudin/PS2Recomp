@@ -1,4 +1,5 @@
 #include "../spu2/iop_spu2.h"
+#include "ps2x/state_archive.h"
 #include <cstdio>
 #include <cstdlib>
 #include "iop_memory.h"
@@ -431,5 +432,29 @@ namespace ps2x::iop::detail
             result.push_back(ch);
         }
         return result;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopMemory::serializeState(ps2x::StateArchive &ar)
+    {
+        ar.podVector(m_ram);
+        ar.podVector(m_owned);
+        ar.podVector(m_scratch);
+        const auto u32 = [](ps2x::StateArchive &a, uint32_t &v) { a & v; };
+        ar.unorderedMap(m_hardware, u32, u32);
+        ar.sequence(m_allocations, [](ps2x::StateArchive &a, Allocation &x) { a & x.address & x.size; });
+        ar & m_heapCursor;
+        ar & m_interruptStatus;
+        ar & m_interruptMask;
+        ar & m_interruptControl;
+        bool dma = m_dmaStart.has_value();
+        ar & dma;
+        DmaStart start = dma ? *m_dmaStart : DmaStart{};
+        ar & start.irq & start.delayCycles;
+        if (ar.loading())
+            m_dmaStart = dma ? std::optional<DmaStart>(start) : std::nullopt;
+        ar & m_lowArenaBase;
     }
 }

@@ -1544,3 +1544,11 @@ namespace ps2_stubs
         setReturnU32(ctx, terminatePacketBuilderState(rdram, ctx, runtime));
     }
 }
+
+namespace ps2_stubs
+{
+    void serializeGsStubState(ps2x::StateArchive &ar)
+    {
+        serializeSupportState(ar);
+    }
+}

@@ -1,4 +1,5 @@
 #include "iop_rpc.h"
+#include "ps2x/state_archive.h"
 
 #include "../core/iop_cpu.h"
 #include "../core/iop_kernel.h"
@@ -345,5 +346,17 @@ namespace ps2x::iop::detail
     {
         const auto server = m_servers.find(sid);
         return server != m_servers.end() && server->second.function != 0u;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopRpcBridge::serializeState(ps2x::StateArchive &ar)
+    {
+        ar.unorderedMap(m_servers, [](ps2x::StateArchive &a, uint32_t &k) { a & k; },
+                        [](ps2x::StateArchive &a, RpcServer &v)
+                        { a & v.sid & v.serverData & v.function & v.gp & v.buffer & v.callback & v.callbackBuffer & v.queue; });
+        ar & m_nextDmaId;
+        ar & m_sifInitialized;
     }
 }

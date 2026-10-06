@@ -27,4 +27,6 @@
 #include <limits>
 
 #include "ps2_host_backend.h"
+#include "ps2x/state_archive.h"
+#include "StubState.h"
 #include "Helpers/Support.h"

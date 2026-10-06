@@ -27,6 +27,10 @@
 #endif
 
 class GS;
+namespace ps2x
+{
+    class StateArchive;
+}
 
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
@@ -350,6 +354,19 @@ public:
     const uint8_t *getVU0Data() const { return m_vu0Data; }
 
     bool isPath3Masked() const { return m_path3Masked; }
+    // GIF/VIF state a save state can't hold yet (call after syncGifVif1(), on the EE thread).
+    struct GifPathPending
+    {
+        bool path3MaskedFifo = false; // PATH3 packets held while PATH3 is masked
+        bool dmaTransfers = false;    // GIF/VIF0/VIF1 transfers not processed yet
+        bool vif1Path2Image = false;  // a VIF1 DIRECT image continuing in the next transfer
+    };
+    [[nodiscard]] GifPathPending gifPathPending() const
+    {
+        return {!m_path3MaskedFifo.empty(),
+                !m_pendingGifTransfers.empty() || !m_pendingVif0Transfers.empty() || !m_pendingVif1Transfers.empty(),
+                m_vif1PendingPath2ImageQwc != 0u};
+    }
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false);
@@ -386,6 +403,11 @@ public:
     [[nodiscard]] uint64_t gsThreadBusyNanos() const { return m_gsBusyNs.load(std::memory_order_relaxed); }
 
     int pollDmaRegisters();
+
+    // Save states (SaveState.cpp): EE hardware registers, DMA/VIF/GIF path state, timers, TLB,
+    // GS privileged registers. RDRAM, scratchpad, VU memories and VRAM are separate chunks. Call
+    // after syncGifVif1(); loading bumps the VU code generations.
+    void serializeState(ps2x::StateArchive &ar);
 
     // Track code modifications for self-modifying code
     void registerCodeRegion(uint32_t start, uint32_t end);

@@ -14,6 +14,11 @@
 #include "runtime/gs/gs_wide_layout.h"
 #include "runtime/gs/gs_motion.h"
 
+namespace ps2x
+{
+    class StateArchive;
+}
+
 struct GSDebugSnapshot
 {
     GSContext ctx[2]{};
@@ -155,6 +160,20 @@ public:
         return m_ctx[(index != 0) ? 1 : 0].frame;
     }
     GSDebugSnapshot getDebugSnapshot() const;
+    // A host->local transfer still waiting for image data, or local->host data not read yet (a
+    // save state needs neither). Read after PS2Memory::syncGifVif1().
+    bool transferPending() const
+    {
+        if (m_hostTransferBitsLeft.load(std::memory_order_relaxed) != 0u)
+            return true;
+        return m_backend && m_backend->GetTransferSnapshot().localToHostPendingBytes != 0u;
+    }
+    // Save states (SaveState.cpp): the GS registers and the drawing/transfer state the GIF stream
+    // builds up (not presentation, motion or widescreen bookkeeping), then the backend's own
+    // (local memory, CLUT) and its own extra part. False if the backend can't (the hardware GS).
+    bool serializeState(ps2x::StateArchive &ar);
+    // The backend's state layout (GSBackend::StateExtrasKind: 0 = the CPU GS's).
+    uint32_t stateBackendKind();
     std::vector<GSDebugHistoryEntry> getDebugHistory() const;
     void clearDebugHistory();
     bool isDebugHistoryPaused() const;
@@ -276,6 +295,8 @@ private:
     GSTrxPos m_trxpos{};
     GSTrxReg m_trxreg{};
     uint32_t m_trxdir = 3;
+    // Image data the current host->local transfer still expects (TRXREG x PSM bits), in bits.
+    std::atomic<uint64_t> m_hostTransferBitsLeft{0};
 
 
     // RT_GS_BATCH_LOG=<file>: one line per run of similar draws (path, target, primitive,

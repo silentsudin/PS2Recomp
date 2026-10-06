@@ -5,6 +5,11 @@
 #include <cstdint>
 #include <vector>
 
+namespace ps2x
+{
+    class StateArchive;
+}
+
 // Implemented by backends that consume the raw GS command stream (e.g. a GPU GS that parses
 // GIF packets itself) instead of the frontend's decoded primitives.
 class GSPacketMirror
@@ -77,4 +82,17 @@ public:
     virtual void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) = 0;
     virtual void SnapshotVram(std::vector<uint8_t> &out) const = 0;
     virtual GSTransferSnapshot GetTransferSnapshot() const = 0;
+    // Save states: the GS state every backend shares (local memory, CLUT, transfer), written or
+    // read through `ar`. False when the backend can't (the default).
+    virtual bool SerializeState(ps2x::StateArchive &ar)
+    {
+        (void)ar;
+        return false;
+    }
+    // A backend's own extra state (a fourcc naming its layout, 0 = none), stored apart so a state
+    // saved with one backend loads with another (which then rebuilds that part itself).
+    virtual uint32_t StateExtrasKind() const { return 0; }
+    virtual void SerializeStateExtras(ps2x::StateArchive &ar) { (void)ar; }
+    // After a load: `extras` says whether SerializeStateExtras read this backend's own part.
+    virtual void StateLoaded(bool extras) { (void)extras; }
 };

@@ -6,6 +6,8 @@
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
+#include "ps2x/state_archive.h"
+#include "gs_state_io.h"
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -696,6 +698,34 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
     }
     out.resize(m_vramSize);
     std::memcpy(out.data(), m_vram, m_vramSize);
+}
+
+bool GSCpuBackend::SerializeState(ps2x::StateArchive &ar)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    // Local memory is the frontend's (PS2Memory's GS VRAM), written here so it travels with the GS.
+    uint32_t size = m_vram ? m_vramSize : 0u;
+    ar & size;
+    if (ar.loading() && size != (m_vram ? m_vramSize : 0u))
+    {
+        ar.fail("GS local memory size differs");
+        return false;
+    }
+    if (m_vram)
+        ar.bytes(m_vram, size);
+    ar & m_clut;
+    ar & m_clutCbp;
+    ps2x::gs_state::io(ar, m_transfer);
+    ps2x::gs_state::io(ar, m_transferState);
+    ar.podVector(m_localToHostBuffer);
+    size_t readPos = m_localToHostReadPos;
+    ar.size(readPos);
+    if (ar.loading())
+    {
+        m_localToHostReadPos = readPos;
+        m_texturePageCache.Invalidate();
+    }
+    return true;
 }
 
 GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const

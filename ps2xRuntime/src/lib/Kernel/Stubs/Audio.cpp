@@ -655,3 +655,17 @@ namespace ps2_stubs
         TODO_NAMED("sceSynthSizerLfoTriangle", rdram, ctx, runtime);
     }
 }
+
+namespace ps2_stubs
+{
+    void serializeAudioStubState(ps2x::StateArchive &ar)
+    {
+        std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
+        AudioStubState &s = g_audio_stub_state;
+        ar & s.initialized;
+        for (VoiceTransferState &v : s.voiceTransfers)
+            ar & v.sourceAddress & v.destinationAddress & v.size & v.mode & v.completed;
+        for (BlockTransferState &b : s.blockTransfers)
+            ar & b.base & b.size & b.pauseBase & b.offset & b.statusTraceCount & b.mode & b.active & b.loop;
+    }
+}
