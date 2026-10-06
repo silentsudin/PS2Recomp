@@ -300,6 +300,15 @@ namespace ps2x::gs
                 return {m_packs.packSize(), m_packs.replacedCount()};
             }
             void setAnisotropy(uint32_t level) override { m_anisotropy = std::clamp<uint32_t>(level, 1u, 16u); }
+            void setDecodeHook(DecodeHook hook) override
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_hookMutex);
+                    m_decodeHook = std::move(hook);
+                }
+                m_dropDecoded = true; // decode (and so repaint) everything again
+                ++m_epoch;
+            }
 
             // ---------------------------------------------------------------- GSRasterBackend
             bool WantsPrimitives() const override { return true; }
@@ -1063,6 +1072,8 @@ namespace ps2x::gs
                 }
 
                 const uint64_t now = m_frame.load();
+                if (m_dropDecoded.exchange(false))
+                    m_textures.clear();
                 auto it = m_textures.find(key);
                 if (it != m_textures.end())
                 {
@@ -1088,6 +1099,22 @@ namespace ps2x::gs
                         for (uint32_t x = 0; x < w; ++x)
                             data[l][static_cast<size_t>(y) * w + x] = texel(s, tex.psm, lv[l].tbp, lv[l].tbw, x, y);
                     init[l] = {data[l].data(), 0, 0};
+                }
+                {
+                    // The app may repaint the top level (PgsControl::setDecodeHook).
+                    std::lock_guard<std::mutex> lock(m_hookMutex);
+                    if (m_decodeHook)
+                    {
+                        DecodedTexture d;
+                        d.psm = tex.psm;
+                        d.width = 1u << tw;
+                        d.height = 1u << th;
+                        d.rgba = data[0].data();
+                        const uint32_t psm = tex.psm, tbp = lv[0].tbp, tbw = lv[0].tbw;
+                        d.index = [this, psm, tbp, tbw](uint32_t x, uint32_t y)
+                        { return GSMem::ReadTexture(m_pageCache, m_vram, psm, tbp, tbw, x, y) & 0xFFu; };
+                        m_decodeHook(d);
+                    }
                 }
                 auto info = Vulkan::ImageCreateInfo::immutable_2d_image(1u << tw, 1u << th, VK_FORMAT_R8G8B8A8_UNORM);
                 info.levels = levels;
@@ -1804,6 +1831,10 @@ namespace ps2x::gs
             std::unordered_map<uint32_t, UploadExtent> m_uploads; // GS thread: uploads by base address
             std::unordered_set<uint64_t> m_submitted;             // GS thread: textures handed to the tools
             std::atomic<bool> m_resubmit{false};
+            // The app's repaint of decoded textures (setDecodeHook); m_dropDecoded: decode all again.
+            std::mutex m_hookMutex;
+            DecodeHook m_decodeHook;
+            std::atomic<bool> m_dropDecoded{false};
             std::atomic<uint32_t> m_anisotropy{16};
             uint32_t m_samplerAnisotropy = 0; // recording: the level m_anisoSamplers were made for
             Vulkan::SamplerHandle m_anisoSamplers[4];

@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <string>
 
 namespace ps2x
@@ -62,6 +63,20 @@ namespace ps2x::gs
         virtual TexturePackStats texturePackStats() const = 0;
         // Anisotropic filtering of texture-pack images (1 = trilinear only, up to 16).
         virtual void setAnisotropy(uint32_t level) = 0;
+
+        // A decoded texture's top level as the backend is about to use it: the app may repaint it
+        // (Road Trip: the button glyphs in its font atlas, for the pad in use). `index(x, y)` reads
+        // a paletted texture's raw index (palette-independent, to recognise it in any palette).
+        struct DecodedTexture
+        {
+            uint32_t psm = 0, width = 0, height = 0;
+            uint32_t *rgba = nullptr; // width * height, RGBA8 little-endian, PS2 alpha (0x80 = opaque)
+            std::function<uint32_t(uint32_t x, uint32_t y)> index;
+        };
+        using DecodeHook = std::function<void(DecodedTexture &)>;
+        // Sets (or clears) the hook and decodes every texture again. Backends that decode on the GPU
+        // (paraLLEl-GS) don't call it. Any thread.
+        virtual void setDecodeHook(DecodeHook hook) { (void)hook; }
     };
 
     // Returns nullptr (and fills `error`) if paraLLEl-GS isn't compiled in or Vulkan init fails.
