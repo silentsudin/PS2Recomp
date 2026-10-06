@@ -1287,7 +1287,9 @@ namespace ps2x::gs
             // screen shows the map itself.
             void noteMapBox(const Batch &b, const std::vector<HwVertex> &vertices)
             {
-                if (!b.state.prim.ctxt)
+                // The map itself, not what moves on it: the track and streets are flat-shaded, the
+                // cars' markers Gouraud (a marker at the track's edge would move the box).
+                if (!b.state.prim.ctxt || b.state.prim.iip)
                     return;
                 const GSScissorReg &sc = b.state.context.scissor;
                 float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
@@ -1312,6 +1314,16 @@ namespace ps2x::gs
                 const Target &m = m_mapLayers[m_mapIndex];
                 if (m_mapDrawn && m.color && m_mapBox[2] > m_mapBox[0])
                 {
+                    // Steady while the same map is shown: the box only grows (frames where part of the
+                    // map is clipped or drawn later don't shrink it), and starts again once the map
+                    // has been gone a while.
+                    if (m_mapStable[2] > m_mapStable[0])
+                        for (int i = 0; i < 2; ++i)
+                        {
+                            m_mapBox[i] = std::min(m_mapBox[i], m_mapStable[i]);
+                            m_mapBox[i + 2] = std::max(m_mapBox[i + 2], m_mapStable[i + 2]);
+                        }
+                    std::memcpy(m_mapStable, m_mapBox, sizeof(m_mapBox));
                     // Sampled by the presenter from here on (back to an attachment when reused).
                     cmd.image_barrier(*m.color, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -1329,7 +1341,10 @@ namespace ps2x::gs
                     m_mapMissed = 0;
                 }
                 else if (++m_mapMissed > 10)
+                {
                     m_shared->map.reset(); // no map for a while: none to show
+                    m_mapStable[0] = m_mapStable[2] = 0; // the next map (another course or town) starts afresh
+                }
                 m_mapDrawn = false;
             }
 
@@ -2080,6 +2095,7 @@ namespace ps2x::gs
             uint32_t m_mapIndex = 0, m_mapMissed = 0;
             bool m_mapDrawn = false;
             float m_mapBox[4] = {};
+            float m_mapStable[4] = {}; // the box so far for the map on show (grow-only)
             uint32_t m_scanoutIndex = 0;
             Vulkan::BufferHandle m_readback;
             static constexpr uint32_t kVboRing = 8;

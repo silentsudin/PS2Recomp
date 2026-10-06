@@ -284,6 +284,7 @@ namespace ps2x::gs
                 m_fxaa = post(post_spirv::fxaa_frag, sizeof(post_spirv::fxaa_frag), 8, 0x1);
                 m_easu = post(post_spirv::fsr_easu_frag, sizeof(post_spirv::fsr_easu_frag), 80, 0);
                 m_rcas = post(post_spirv::fsr_rcas_frag, sizeof(post_spirv::fsr_rcas_frag), 32, 0);
+                m_sgsr1 = post(post_spirv::sgsr1_frag, sizeof(post_spirv::sgsr1_frag), 16, 0x1);
                 m_smaaEdges = post(post_spirv::smaa_edges_frag, sizeof(post_spirv::smaa_edges_frag), 16, 0x1, 0x1);
                 m_smaaWeights = post(post_spirv::smaa_weights_frag, sizeof(post_spirv::smaa_weights_frag), 16, 0x1, 0x7);
                 m_smaaBlend = post(post_spirv::smaa_blend_frag, sizeof(post_spirv::smaa_blend_frag), 16, 0x1, 0x3);
@@ -703,6 +704,14 @@ namespace ps2x::gs
                     offscreenPass(cmd, m_upImage, rect.extent.width, rect.extent.height, m_easu, *m_final, &push, sizeof(push));
                     m_final = m_upImage.get();
                     m_finalRcas = true;
+                }
+                if (m_post.scaling == PostProcess::Scaling::SnapdragonGsr1 && m_sgsr1 && rect.extent.width > sw)
+                {
+                    // Snapdragon GSR 1: upscaling and sharpening in one pass (no RCAS after it).
+                    const float push[4] = {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh), static_cast<float>(sw),
+                                           static_cast<float>(sh)};
+                    offscreenPass(cmd, m_upImage, rect.extent.width, rect.extent.height, m_sgsr1, *m_final, push, sizeof(push));
+                    m_final = m_upImage.get();
                 }
             }
 
@@ -1234,9 +1243,7 @@ namespace ps2x::gs
                         cmd.set_scissor({{static_cast<int32_t>(x0), static_cast<int32_t>(y0)},
                                          {static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)}});
                         cmd.set_texture(0, 0, *view,
-                                        m_nearestTextures.count(static_cast<uint64_t>(c.GetTexID())) ||
-                                                c.GetTexID() == static_cast<ImTextureID>(kMapTexture)
-                                            ? Vulkan::StockSampler::NearestClamp
+                                        m_nearestTextures.count(static_cast<uint64_t>(c.GetTexID())) ? Vulkan::StockSampler::NearestClamp
                                                                                                     : Vulkan::StockSampler::LinearClamp);
                         cmd.draw_indexed(c.ElemCount, 1, idxBase + c.IdxOffset, static_cast<int32_t>(vtxBase + c.VtxOffset), 0);
                     }
@@ -1855,7 +1862,7 @@ namespace ps2x::gs
             PgsShared m_shared;
             Vulkan::WSI m_wsi; // after m_shared: destroyed first, with the device
             Vulkan::Program *m_program = nullptr;
-            Vulkan::Program *m_fxaa = nullptr, *m_easu = nullptr, *m_rcas = nullptr;
+            Vulkan::Program *m_fxaa = nullptr, *m_easu = nullptr, *m_rcas = nullptr, *m_sgsr1 = nullptr;
             PostProcess m_post;
             Vulkan::ImageHandle m_aaImage, m_upImage; // intermediate pictures
             Vulkan::Program *m_depthView = nullptr, *m_motionView = nullptr, *m_taa = nullptr;
