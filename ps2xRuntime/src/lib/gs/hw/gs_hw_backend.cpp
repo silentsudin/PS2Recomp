@@ -1223,8 +1223,12 @@ namespace ps2x::gs
             // Present, so the presenter samples a finished one).
             Target &mapLayer(const Target &frame, Vulkan::CommandBuffer &cmd, bool &passOpen)
             {
+                // Drawn at 4x whatever the game's render scale, so the second screen can enlarge it
+                // sharply (its few hundred triangles cost nothing).
+                constexpr uint32_t kMapScale = 4;
+                const uint32_t sx = std::max(kMapScale, frame.sx), sy = std::max(kMapScale * m_yScale, frame.sy);
                 Target &m = m_mapLayers[m_mapIndex];
-                const bool fresh = !m.color || m.width != frame.width || m.height != frame.height || m.sx != frame.sx || m.sy != frame.sy;
+                const bool fresh = !m.color || m.width != frame.width || m.height != frame.height || m.sx != sx || m.sy != sy;
                 if (fresh || !m_mapDrawn)
                 {
                     endPass(cmd, passOpen);
@@ -1234,10 +1238,9 @@ namespace ps2x::gs
                         m.fbp = ~0u;
                         m.width = frame.width;
                         m.height = frame.height;
-                        m.sx = frame.sx;
-                        m.sy = frame.sy;
-                        auto info = Vulkan::ImageCreateInfo::render_target(frame.color->get_width(), frame.color->get_height(),
-                                                                           VK_FORMAT_R8G8B8A8_UNORM);
+                        m.sx = sx;
+                        m.sy = sy;
+                        auto info = Vulkan::ImageCreateInfo::render_target(frame.width * sx, frame.height * sy, VK_FORMAT_R8G8B8A8_UNORM);
                         info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
                         info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                         m.color = m_dev->create_image(info);
