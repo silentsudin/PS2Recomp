@@ -313,6 +313,8 @@ namespace ps2x::gs
 
             // ---------------------------------------------------------------- GSRasterBackend
             bool WantsPrimitives() const override { return true; }
+            // The classifier's HUD/scene verdicts (GSPrimitiveBatch::vertexClass) for the UI mask.
+            bool WantsVertexSideband() const override { return m_shared && m_shared->wantUi.load(std::memory_order_relaxed); }
 
             void Initialize(uint8_t *vram, uint32_t vramSize) override
             {
@@ -452,6 +454,13 @@ namespace ps2x::gs
                     for (int i = 0; i < 3; ++i)
                         m_stage.push_back(convert(batch.vertices[i], state.prim.iip ? batch.vertices[i] : flat));
                 }
+                // The UI mask: the HUD's triangles, drawn into a mask at Present.
+                if (batch.vertexClass == 1u)
+                {
+                    const size_t n = type == GS_PRIM_SPRITE ? 6u : 3u;
+                    for (size_t i = m_stage.size() - n; i < m_stage.size(); ++i)
+                        m_uiStage.push_back({m_stage[i].x, m_stage[i].y});
+                }
                 if (m_stage.size() >= 1536u)
                     publish(false);
             }
@@ -491,6 +500,8 @@ namespace ps2x::gs
                             m_open = true;
                         }
                         m_vertices.insert(m_vertices.end(), m_stage.begin(), m_stage.end());
+                        m_uiVerts.insert(m_uiVerts.end(), m_uiStage.begin(), m_uiStage.end());
+                        m_uiStage.clear();
                         m_batches.back().vertexCount += static_cast<uint32_t>(m_stage.size());
                         m_stage.clear();
                     }
@@ -682,6 +693,8 @@ namespace ps2x::gs
                             closeBatch();
                         batches.swap(m_batches);
                         vertices.swap(m_vertices);
+                        m_uiDraw.swap(m_uiVerts);
+                        m_uiVerts.clear();
                     }
                     if (m_rescale.exchange(false))
                         m_targets.clear(), m_depths.clear();
@@ -696,7 +709,10 @@ namespace ps2x::gs
                     batches.clear();
                     vertices.clear();
                     const Vulkan::Image *scan = scanout(*cmd, request);
-                    publishMap();
+                    publishMap(*cmd);
+                    if (scan && m_shared && m_shared->wantUi.load(std::memory_order_relaxed))
+                        drawUiMask(*cmd);
+                    m_uiDraw.clear();
                     if (scan)
                     {
                         outW = scan->get_width();
@@ -1245,7 +1261,7 @@ namespace ps2x::gs
                         info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                         m.color = m_dev->create_image(info);
                     }
-                    cmd.image_barrier(*m.color, fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+                    cmd.image_barrier(*m.color, VK_IMAGE_LAYOUT_UNDEFINED, // cleared: its old contents don't matter
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_CLEAR_BIT,
                                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -1289,13 +1305,17 @@ namespace ps2x::gs
             }
 
             // At Present: hands this frame's map (if one was drawn) to the second screen.
-            void publishMap()
+            void publishMap(Vulkan::CommandBuffer &cmd)
             {
                 if (!m_shared)
                     return;
                 const Target &m = m_mapLayers[m_mapIndex];
                 if (m_mapDrawn && m.color && m_mapBox[2] > m_mapBox[0])
                 {
+                    // Sampled by the presenter from here on (back to an attachment when reused).
+                    cmd.image_barrier(*m.color, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
                     m_shared->map = m.color;
                     m_shared->mapUv[0] = m_mapBox[0] / m.width;
                     m_shared->mapUv[1] = m_mapBox[1] / m.height;
@@ -1815,6 +1835,7 @@ namespace ps2x::gs
                 }
                 const uint32_t sx = t.sx, sy = t.sy;
                 const uint32_t outW = w * sx, outH = h * sy;
+                m_scanGeom = {dbx, dby, sx, sy, outW, outH};
 
                 m_scanoutIndex = (m_scanoutIndex + 1u) % 3u;
                 Vulkan::ImageHandle &out = m_scanout[m_scanoutIndex];
@@ -1841,6 +1862,78 @@ namespace ps2x::gs
                                   VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                                   VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
                 return out.get();
+            }
+
+            // The UI mask (PgsShared::ui, the scanout's size): 1 where the frame's HUD and 2D screens
+            // drew (the classifier's UI class), so post-processing leaves them as drawn.
+            void drawUiMask(Vulkan::CommandBuffer &cmd)
+            {
+                const ScanGeom &g = m_scanGeom;
+                Vulkan::ImageHandle &mask = m_uiMask[m_scanoutIndex];
+                if (!mask || mask->get_width() != g.outW || mask->get_height() != g.outH)
+                {
+                    auto info = Vulkan::ImageCreateInfo::render_target(g.outW, g.outH, VK_FORMAT_R8G8B8A8_UNORM);
+                    info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    mask = m_dev->create_image(info);
+                }
+                // Positions relative to the scanned-out part of the frame; white, no texture, no test.
+                std::vector<HwVertex> verts(m_uiDraw.size());
+                for (size_t i = 0; i < m_uiDraw.size(); ++i)
+                {
+                    verts[i] = HwVertex{};
+                    verts[i].x = m_uiDraw[i][0] - static_cast<float>(g.dbx);
+                    verts[i].y = m_uiDraw[i][1] - static_cast<float>(g.dby);
+                    verts[i].rgba = 0xFFFFFFFFu;
+                    verts[i].q = 1.0f;
+                }
+                cmd.image_barrier(*mask, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                Vulkan::RenderPassInfo rp = {};
+                rp.num_color_attachments = 1;
+                rp.color_attachments[0] = &mask->get_view();
+                rp.clear_attachments = 1;
+                rp.store_attachments = 1;
+                cmd.begin_render_pass(rp);
+                if (!verts.empty())
+                {
+                    cmd.set_program(m_drawProgram);
+                    cmd.set_opaque_state();
+                    cmd.set_cull_mode(VK_CULL_MODE_NONE);
+                    cmd.set_depth_test(false, false);
+                    cmd.set_blend_enable(false);
+                    cmd.set_primitive_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+                    cmd.set_vertex_attrib(0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(HwVertex, x));
+                    cmd.set_vertex_attrib(1, 0, VK_FORMAT_R32_SFLOAT, offsetof(HwVertex, z));
+                    cmd.set_vertex_attrib(2, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(HwVertex, rgba));
+                    cmd.set_vertex_attrib(3, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(HwVertex, s));
+                    cmd.set_vertex_attrib(4, 0, VK_FORMAT_R32_SFLOAT, offsetof(HwVertex, fog));
+                    auto *dst = static_cast<HwVertex *>(cmd.allocate_vertex_data(0, verts.size() * sizeof(HwVertex), sizeof(HwVertex)));
+                    std::memcpy(dst, verts.data(), verts.size() * sizeof(HwVertex));
+                    cmd.set_texture(0, 0, m_white->get_view(), sampler(false, false, false, false, false));
+                    cmd.set_texture(0, 1, m_white->get_view(), sampler(false, false, false, false, false));
+                    cmd.set_uniform_buffer(0, 2, *m_noRecolor);
+                    Push p = {};
+                    const float w = static_cast<float>(g.outW), h = static_cast<float>(g.outH);
+                    p.posScale[0] = 2.0f * g.sx / w;
+                    p.posScale[1] = 2.0f * g.sy / h;
+                    p.posScale[2] = 1.0f / w - 1.0f;
+                    p.posScale[3] = 1.0f / h - 1.0f;
+                    p.fogColor[3] = 255.0f;
+                    p.mode[3] = 2u; // no alpha test
+                    cmd.set_color_write_mask(0xF);
+                    cmd.set_specialization_constant_mask(0x7);
+                    cmd.set_specialization_constant(0, 0u);
+                    cmd.set_specialization_constant(1, 0u);
+                    cmd.set_specialization_constant(2, 2u);
+                    cmd.push_constants(&p, 0, sizeof(p));
+                    cmd.draw(static_cast<uint32_t>(verts.size()));
+                }
+                cmd.end_render_pass();
+                cmd.image_barrier(*mask, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                m_shared->ui = mask;
             }
 
             void readbackCopy(Vulkan::CommandBuffer &cmd, const Vulkan::Image &image)
@@ -1975,6 +2068,14 @@ namespace ps2x::gs
             std::unordered_map<uint32_t, Vulkan::ImageHandle> m_depths;
             const Vulkan::Image *m_passColor = nullptr, *m_passDepth = nullptr;
             Vulkan::ImageHandle m_scanout[3];
+            // The UI mask: the HUD's triangles (GS frame coordinates), staged by the GS thread,
+            // handed over with the batches, drawn at Present; the scanout's geometry they map to.
+            std::vector<std::array<float, 2>> m_uiStage, m_uiVerts, m_uiDraw;
+            Vulkan::ImageHandle m_uiMask[3];
+            struct ScanGeom
+            {
+                uint32_t dbx = 0, dby = 0, sx = 1, sy = 1, outW = 0, outH = 0;
+            } m_scanGeom;
             Target m_mapLayers[2];
             uint32_t m_mapIndex = 0, m_mapMissed = 0;
             bool m_mapDrawn = false;

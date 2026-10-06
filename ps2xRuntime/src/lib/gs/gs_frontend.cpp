@@ -696,6 +696,7 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
     }
 
     const bool sideband = m_backend->WantsVertexSideband();
+    m_packetKicks = 0; // vertexClasses() index of the next kick in this packet
     if (m_wide.active() || m_backend->WantsDepthSnapshot() || sideband)
     {
         // Widescreen: narrow the HUD in a copy, which both the mirror and the parse below see.
@@ -1898,6 +1899,10 @@ void GS::vertexKick(bool drawing)
 {
     ++m_vtxCount;
     ++m_vtxIndex;
+    // The classifier's verdict on this vertex (classes are recorded in kick order per packet).
+    const auto &classes = m_wide.vertexClasses();
+    const uint32_t kick = m_packetKicks++;
+    const uint8_t vertexClass = kick < classes.size() ? static_cast<uint8_t>(classes[kick]) : 0u;
     if (drawing)
     {
         logBatchVertex(m_vtxQueue[(m_vtxCount - 1) % kMaxVerts]);
@@ -1963,6 +1968,7 @@ void GS::vertexKick(bool drawing)
             batch.stateSerial = ++m_drawBatchSerialOut;
         }
         batch.vertexCount = static_cast<uint8_t>(std::min(needed, 3));
+        batch.vertexClass = vertexClass;
         for (int i = 0; i < batch.vertexCount; ++i)
             batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[i];
         updatePreferredDisplaySourceForDraw(batch);

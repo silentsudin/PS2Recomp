@@ -310,6 +310,8 @@ namespace ps2x::gs
                     m_showDepth = true;
                     m_shared.wantDepth = true;
                 }
+                if (const char *e = std::getenv("RT_SHOW_UI"); e && *e == '1')
+                    m_showUi = true; // the UI mask in place of the picture
 #if defined(__APPLE__)
                 // MetalFX through MoltenVK's Metal objects.
                 {
@@ -731,7 +733,7 @@ namespace ps2x::gs
                 // Any post-processing (and frame generation) spares the UI (the GS marks where the HUD and 2D
                 // screens drew).
                 m_shared.wantUi = m_post.aa != PostProcess::AntiAliasing::None || m_post.scaling != PostProcess::Scaling::Bilinear ||
-                                  m_fg.factor > 1; // generated frames keep the current frame's HUD
+                                  m_fg.factor > 1 || m_showUi; // generated frames keep the current frame's HUD
             }
 
             // A shadow frame (frame generation, half a frame ahead) blended with the real frame's
@@ -1606,6 +1608,8 @@ namespace ps2x::gs
                 else if (fresh || !m_lastPicture)
                 {
                     preparePicture(cmd, fw, fh);
+                    if (m_showUi && m_shared.ui)
+                        m_final = m_shared.ui.get(), m_finalRcas = false;
                     m_lastPicture = m_final;
                     m_lastRcas = m_finalRcas;
                 }
@@ -1905,7 +1909,7 @@ namespace ps2x::gs
             bool m_frame2D = false;
             uint64_t m_realSerial = 0; // PgsShared::presentSerial of the real frame on show
             bool m_progressiveFields = true; // GS::progressiveFields, read each frame
-            bool m_showDepth = false, m_showMotion = false;
+            bool m_showDepth = false, m_showMotion = false, m_showUi = false;
             Vulkan::Program *m_smaaEdges = nullptr, *m_smaaWeights = nullptr, *m_smaaBlend = nullptr;
             Vulkan::ImageHandle m_smaaArea, m_smaaSearch, m_smaaEdgeImage, m_smaaWeightImage;
             const Vulkan::Image *m_final = nullptr;   // what the final pass draws this frame

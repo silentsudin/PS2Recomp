@@ -257,6 +257,9 @@ struct GSPrimitiveBatch
     // Changes whenever a register that feeds `state` is written (0 = unknown): equal serials mean
     // equal states, so backends can skip comparing them.
     uint64_t stateSerial = 0;
+    // What the widescreen classifier made of it (with WantsVertexSideband): 0 the 3D scene, 1 the
+    // UI (HUD, 2D screens), 2 neither (full-screen fades and post passes).
+    uint8_t vertexClass = 0;
 };
 
 struct GSTransferCommand

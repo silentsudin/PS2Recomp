@@ -104,6 +104,18 @@ void ps2AudioOutStop()
     UnloadAudioStream(g_stream);
 }
 
+namespace
+{
+    std::atomic<float> g_gain{1.0f};
+    std::atomic<bool> g_mono{false};
+}
+
+void ps2AudioOutSetMix(float gain, bool mono)
+{
+    g_gain = std::clamp(gain, 0.0f, 1.0f);
+    g_mono = mono;
+}
+
 void ps2AudioOutSubmit(const int16_t *interleavedStereo, size_t frames)
 {
     // RT_AUDIO_DUMP=<file>: also write everything as raw s16le 48 kHz stereo (diagnostics).
@@ -119,6 +131,9 @@ void ps2AudioOutSubmit(const int16_t *interleavedStereo, size_t frames)
     ps2_test::onAudio(interleavedStereo, frames);
     if (!g_started.load(std::memory_order_relaxed))
         return;
+    const float gain = g_gain.load(std::memory_order_relaxed);
+    const bool mono = g_mono.load(std::memory_order_relaxed);
+    const bool mix = mono || gain < 0.999f;
     std::lock_guard<std::mutex> lock(g_mutex);
     for (size_t i = 0; i < frames; ++i)
     {
@@ -129,8 +144,17 @@ void ps2AudioOutSubmit(const int16_t *interleavedStereo, size_t frames)
             --g_count;
             g_droppedFrames.fetch_add(1, std::memory_order_relaxed);
         }
-        g_ring[g_write * 2] = interleavedStereo[i * 2];
-        g_ring[g_write * 2 + 1] = interleavedStereo[i * 2 + 1];
+        int16_t l = interleavedStereo[i * 2], r = interleavedStereo[i * 2 + 1];
+        if (mix)
+        {
+            float fl = l * gain, fr = r * gain;
+            if (mono)
+                fl = fr = (fl + fr) * 0.5f;
+            l = static_cast<int16_t>(std::clamp(fl, -32768.0f, 32767.0f));
+            r = static_cast<int16_t>(std::clamp(fr, -32768.0f, 32767.0f));
+        }
+        g_ring[g_write * 2] = l;
+        g_ring[g_write * 2 + 1] = r;
         g_write = (g_write + 1) % kCapacityFrames;
         ++g_count;
     }
