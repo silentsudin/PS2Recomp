@@ -6,6 +6,7 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -1893,6 +1894,32 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+    {
+        // RT_VBLANK_JITTER=1: how evenly vblanks really happen (host time between them), every
+        // 5 s: late ones (> 20 ms after the last), bunched ones (< 12 ms), the longest gap.
+        static const bool jitter = [] { const char *e = std::getenv("RT_VBLANK_JITTER"); return e && *e == '1'; }();
+        if (jitter)
+        {
+            static auto last = std::chrono::steady_clock::now(), windowStart = last;
+            static uint32_t late = 0, bunched = 0, count = 0;
+            static double longest = 0;
+            const auto now = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+            last = now;
+            ++count;
+            late += ms > 20.0;
+            bunched += ms < 12.0;
+            longest = std::max(longest, ms);
+            if (now - windowStart > std::chrono::seconds(5))
+            {
+                std::fprintf(stderr, "[vblank] %u in 5 s: %u late (>20 ms), %u bunched (<12 ms), longest gap %.1f ms\n", count,
+                             late, bunched, longest);
+                windowStart = now;
+                late = bunched = count = 0;
+                longest = 0;
+            }
+        }
+    }
         ++m_vsyncTick;
         ps2_guest_clock::g_vblanks.store(m_vsyncTick, std::memory_order_relaxed);
         ps2_test::onVblank(m_runtime, m_vsyncTick);
