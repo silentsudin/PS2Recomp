@@ -297,7 +297,8 @@ struct Vu1Native
     // reader can see), the clip flag (a small ring here) and XGKICK, whose packet is copied whole at
     // the kick and handed to the GIF when PATH1 would have finished it. A store into a part PATH1
     // hasn't read yet deopts before it lands. A deopt rebuilds the interpreter's pipeline state
-    // from the node's static timing (LeanNode) and continues there.
+    // from the node's static timing (LeanNode) and continues there. The common operations run on
+    // registers cached in locals (see "cached registers" below).
 
     struct LeanCtx
     {
@@ -763,6 +764,739 @@ struct Vu1Native
                 addr = static_cast<uint32_t>(static_cast<uint16_t>(viT != 0u ? static_cast<int16_t>(s.vi[viT] - 1) : s.vi[viT])) * 16u;
             else // ISWR
                 addr = static_cast<uint32_t>(static_cast<uint16_t>(s.vi[viS])) * 16u;
+        }
+        return addr & (dataSize - 1u);
+    }
+
+    // ------------------------------------------------------------------ cached registers
+    // Lean code keeps the VF/VI registers, ACC, Q and I it touches in locals (LeanR, promoted to
+    // host registers by the compiler) and writes every change through to VU1State at once, so
+    // the state in memory is always current: everything that reads it (deopts, the end of the
+    // program, the interpreter operations the generator doesn't emit itself) works unchanged,
+    // and only the registers such an operation may write are reloaded after it. The operations
+    // below are execUpperFast/execLower's, verbatim, on the locals. `K` says which input lanes
+    // are known to be clamped already (the generator proves it: FMAC results are clamped, so
+    // clamping them again is the identity), so their clamp can be skipped.
+
+    using f4 = ps2x_vu1_fast::f4;
+    using i4 = ps2x_vu1_fast::i4;
+
+    struct LeanR
+    {
+        f4 v[32];
+        f4 acc;
+        int32_t vi[16];
+        float q, i;
+    };
+
+    __attribute__((always_inline)) static inline f4 rLoad(const float *p)
+    {
+        f4 v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    }
+    __attribute__((always_inline)) static inline void rPut(float *dst, f4 v) { std::memcpy(dst, &v, sizeof(v)); }
+    __attribute__((always_inline)) static inline void leanLoadRegs(LeanR &R, const VU1State &s)
+    {
+        for (int r = 0; r < 32; ++r)
+            R.v[r] = rLoad(s.vf[r]);
+        R.acc = rLoad(s.acc);
+        for (int r = 0; r < 16; ++r)
+            R.vi[r] = s.vi[r];
+        R.q = s.q;
+        R.i = s.i;
+    }
+    // A masked write, as ps2x_vu1_fast::store does it (the old lanes are the cached ones).
+    template <uint8_t D>
+    __attribute__((always_inline)) static inline f4 rSel(f4 old, f4 value)
+    {
+        if constexpr (D == 0xFu)
+            return value;
+        else
+        {
+            const i4 mask = {(D & 8u) ? -1 : 0, (D & 4u) ? -1 : 0, (D & 2u) ? -1 : 0, (D & 1u) ? -1 : 0};
+            i4 oldBits, newBits;
+            std::memcpy(&oldBits, &old, sizeof(oldBits));
+            std::memcpy(&newBits, &value, sizeof(newBits));
+            const i4 out = (newBits & mask) | (oldBits & ~mask);
+            f4 r;
+            std::memcpy(&r, &out, sizeof(r));
+            return r;
+        }
+    }
+    template <uint8_t D>
+    __attribute__((always_inline)) static inline void rSetVf(LeanR &R, VU1State &s, uint32_t reg, f4 value)
+    {
+        R.v[reg] = rSel<D>(R.v[reg], value);
+        rPut(s.vf[reg], R.v[reg]);
+    }
+    template <uint8_t D>
+    __attribute__((always_inline)) static inline void rSetAcc(LeanR &R, VU1State &s, f4 value)
+    {
+        R.acc = rSel<D>(R.acc, value);
+        rPut(s.acc, R.acc);
+    }
+    __attribute__((always_inline)) static inline void rSetVi(LeanR &R, VU1State &s, uint32_t reg, int32_t value)
+    {
+        R.vi[reg] = value;
+        s.vi[reg] = value;
+    }
+    __attribute__((always_inline)) static inline f4 rProd(f4 a, f4 b) { return a * b; } // not contracted into an add
+    __attribute__((always_inline)) static inline float rClampS(float v)
+    {
+        return std::clamp(v, -3.402823466e+38f, 3.402823466e+38f);
+    }
+    // std::clamp on four lanes (a NaN stays a NaN, unlike clampv): broadcasts of one register's
+    // lanes share it.
+    __attribute__((always_inline)) static inline f4 rClampLanes(f4 v)
+    {
+        const f4 lo = (f4)(-3.402823466e+38f), hi = (f4)(3.402823466e+38f);
+        return v < lo ? lo : (hi < v ? hi : v);
+    }
+
+    // Can leanUpperR do this upper word (else the generator calls leanUpper on memory)?
+    static constexpr bool leanUpperRHandled(uint32_t instr)
+    {
+        const uint32_t op = instr & 0x3Fu;
+        const uint32_t ft = (instr >> 16) & 0x1Fu, fd = (instr >> 6) & 0x1Fu;
+        if (op < 0x3Cu)
+            return op <= 0x2Fu && fd != 0u;
+        const uint32_t sop = (instr & 0x3u) | ((instr >> 4) & 0x7Cu);
+        const bool toFt = (sop >= 0x10u && sop <= 0x17u) || sop == 0x1Du;
+        if (toFt && ft == 0u)
+            return false;
+        return sop <= 0x1Eu || (sop >= 0x20u && sop <= 0x2Au) || (sop >= 0x2Cu && sop <= 0x30u);
+    }
+    // Lanes of the result the upper word writes (0: none), and its destination: 0 VF[fd], 1 VF[ft], 2 ACC.
+    static constexpr uint32_t leanUpperRTarget(uint32_t instr)
+    {
+        const uint32_t op = instr & 0x3Fu;
+        if (op < 0x3Cu)
+            return 0u;
+        const uint32_t sop = (instr & 0x3u) | ((instr >> 4) & 0x7Cu);
+        if ((sop >= 0x10u && sop <= 0x17u) || sop == 0x1Du)
+            return 1u;
+        if (sop == 0x2Fu || sop == 0x30u)
+            return 3u; // NOP
+        return 2u;
+    }
+
+    // execUpperFast<false> on the cached registers. K: bits 0-3 VF[fs] lanes (x = 8), 4-7 VF[ft],
+    // 8-11 ACC, 12 Q, 13 I known clamped.
+    template <uint32_t U, uint32_t K>
+    __attribute__((always_inline)) static inline void leanUpperR(LeanR &R, VU1State &s)
+    {
+        using namespace ps2x_vu1_fast;
+        constexpr uint8_t dest = static_cast<uint8_t>((U >> 21) & 0xFu);
+        constexpr uint32_t ft = (U >> 16) & 0x1Fu, fs = (U >> 11) & 0x1Fu, fd = (U >> 6) & 0x1Fu;
+        constexpr uint32_t op = U & 0x3Fu;
+        constexpr uint32_t sop = (U & 0x3u) | ((U >> 4) & 0x7Cu);
+        static_assert(leanUpperRHandled(U), "leanUpperR: not a fast-path upper op");
+        // Which lanes of the operands matter: lane-wise ops only read the lanes they write.
+        constexpr bool laneWise = op < 0x3Cu ? op != 0x2Eu : sop != 0x2Eu;
+        constexpr uint32_t need = laneWise ? dest : 0xFu;
+        constexpr bool ks = (K & need) == need, kt = ((K >> 4) & need) == need, ka = ((K >> 8) & need) == need;
+        auto vs = [&]() __attribute__((always_inline)) { if constexpr (ks) return R.v[fs]; else return clampv(R.v[fs]); };
+        auto vt = [&]() __attribute__((always_inline)) { if constexpr (kt) return R.v[ft]; else return clampv(R.v[ft]); };
+        auto acc = [&]() __attribute__((always_inline)) { if constexpr (ka) return R.acc; else return clampv(R.acc); };
+        auto bc = [&](uint32_t c) __attribute__((always_inline))
+        {
+            if ((K >> 4) & (8u >> (c & 3u)))
+                return splat(R.v[ft][c & 3u]);
+            return splat(rClampLanes(R.v[ft])[c & 3u]);
+        };
+        auto qv = [&]() __attribute__((always_inline)) { if constexpr ((K >> 12) & 1u) return splat(R.q); else return splat(rClampS(R.q)); };
+        auto iv = [&]() __attribute__((always_inline)) { if constexpr ((K >> 13) & 1u) return splat(R.i); else return splat(rClampS(R.i)); };
+        auto toFd = [&](f4 r) __attribute__((always_inline)) { rSetVf<dest>(R, s, fd, clampv(r)); };
+        auto toFdRaw = [&](f4 r) __attribute__((always_inline)) { rSetVf<dest>(R, s, fd, r); };
+        auto toAcc = [&](f4 r) __attribute__((always_inline)) { rSetAcc<dest>(R, s, clampv(r)); };
+        auto opRotate = [&](f4 a, f4 b) __attribute__((always_inline)) { return rProd((f4){a.y, a.z, a.x, 0.0f}, (f4){b.z, b.x, b.y, 0.0f}); };
+
+        if constexpr (op < 0x3Cu)
+        {
+            switch (op)
+            {
+            case 0x00: case 0x01: case 0x02: case 0x03: toFd(vs() + bc(op)); return;
+            case 0x04: case 0x05: case 0x06: case 0x07: toFd(vs() - bc(op)); return;
+            case 0x08: case 0x09: case 0x0A: case 0x0B: toFd(acc() + vs() * bc(op)); return;
+            case 0x0C: case 0x0D: case 0x0E: case 0x0F: toFd(acc() - vs() * bc(op)); return;
+            case 0x10: case 0x11: case 0x12: case 0x13: toFdRaw(__builtin_elementwise_max(vs(), bc(op))); return;
+            case 0x14: case 0x15: case 0x16: case 0x17: toFdRaw(__builtin_elementwise_min(vs(), bc(op))); return;
+            case 0x18: case 0x19: case 0x1A: case 0x1B: toFd(vs() * bc(op)); return;
+            case 0x1C: toFd(vs() * qv()); return;
+            case 0x1D: toFdRaw(__builtin_elementwise_max(vs(), iv())); return;
+            case 0x1E: toFd(vs() * iv()); return;
+            case 0x1F: toFdRaw(__builtin_elementwise_min(vs(), iv())); return;
+            case 0x20: toFd(vs() + qv()); return;
+            case 0x21: toFd(acc() + vs() * qv()); return;
+            case 0x22: toFd(vs() + iv()); return;
+            case 0x23: toFd(acc() + vs() * iv()); return;
+            case 0x24: toFd(vs() - qv()); return;
+            case 0x25: toFd(acc() - vs() * qv()); return;
+            case 0x26: toFd(vs() - iv()); return;
+            case 0x27: toFd(acc() - vs() * iv()); return;
+            case 0x28: toFd(vs() + vt()); return;
+            case 0x29: toFd(acc() + vs() * vt()); return;
+            case 0x2A: toFd(vs() * vt()); return;
+            case 0x2B: toFdRaw(__builtin_elementwise_max(vs(), vt())); return;
+            case 0x2C: toFd(vs() - vt()); return;
+            case 0x2D: toFd(acc() - vs() * vt()); return;
+            case 0x2E: toFd((f4){acc().x, acc().y, acc().z, 0.0f} - opRotate(vs(), vt())); return;
+            case 0x2F: toFdRaw(__builtin_elementwise_min(vs(), vt())); return;
+            default: return;
+            }
+        }
+        else
+        {
+            switch (sop)
+            {
+            case 0x00: case 0x01: case 0x02: case 0x03: toAcc(vs() + bc(sop)); return;
+            case 0x04: case 0x05: case 0x06: case 0x07: toAcc(vs() - bc(sop)); return;
+            case 0x08: case 0x09: case 0x0A: case 0x0B: toAcc(acc() + vs() * bc(sop)); return;
+            case 0x0C: case 0x0D: case 0x0E: case 0x0F: toAcc(acc() - vs() * bc(sop)); return;
+            case 0x10: case 0x11: case 0x12: case 0x13: // ITOF0/4/12/15
+            {
+                static constexpr float kScale[4] = {1.0f, 1.0f / 16.0f, 1.0f / 4096.0f, 1.0f / 32768.0f};
+                i4 ivec;
+                std::memcpy(&ivec, &R.v[fs], sizeof(ivec));
+                rSetVf<dest>(R, s, ft, __builtin_convertvector(ivec, f4) * splat(kScale[sop & 3u]));
+                return;
+            }
+            case 0x14: case 0x15: case 0x16: case 0x17: // FTOI0/4/12/15 (truncate, saturate)
+            {
+                static constexpr float kScale[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+                const f4 scaled = vs() * splat(kScale[sop & 3u]);
+                const i4 ivec = __builtin_convertvector(scaled, i4);
+                // The same per-lane saturation as execUpperFast, as selects (lanes out of range,
+                // or NaN, take INT32_MIN when negative, else INT32_MAX).
+                const i4 inRange = (scaled < 2147483648.0f) & (scaled >= -2147483648.0f);
+                const i4 limit = (scaled < 0.0f) ? (i4)(INT32_MIN) : (i4)(INT32_MAX);
+                const i4 sat = inRange != 0 ? ivec : limit;
+                f4 bits;
+                std::memcpy(&bits, &sat, sizeof(bits));
+                rSetVf<dest>(R, s, ft, bits);
+                return;
+            }
+            case 0x18: case 0x19: case 0x1A: case 0x1B: toAcc(vs() * bc(sop)); return;
+            case 0x1C: toAcc(vs() * qv()); return;
+            case 0x1D: rSetVf<dest>(R, s, ft, __builtin_elementwise_abs(R.v[fs])); return;
+            case 0x1E: toAcc(vs() * iv()); return;
+            case 0x20: toAcc(vs() + qv()); return;
+            case 0x21: toAcc(acc() + vs() * qv()); return;
+            case 0x22: toAcc(vs() + iv()); return;
+            case 0x23: toAcc(acc() + vs() * iv()); return;
+            case 0x24: toAcc(vs() - qv()); return;
+            case 0x25: toAcc(acc() - vs() * qv()); return;
+            case 0x26: toAcc(vs() - iv()); return;
+            case 0x27: toAcc(acc() - vs() * iv()); return;
+            case 0x28: toAcc(vs() + vt()); return;
+            case 0x29: toAcc(acc() + vs() * vt()); return;
+            case 0x2A: toAcc(vs() * vt()); return;
+            case 0x2C: toAcc(vs() - vt()); return;
+            case 0x2D: toAcc(acc() - vs() * vt()); return;
+            case 0x2E: toAcc(opRotate(vs(), vt())); return; // OPMULA
+            default: return;                                // NOP
+            }
+        }
+    }
+
+    // execLower on the cached registers, for the plain loads, stores, moves and integer ops.
+    static constexpr bool leanLowerRHandled(uint32_t instr)
+    {
+        const uint32_t opHi = (instr >> 25) & 0x7Fu;
+        switch (opHi)
+        {
+        case 0x00: case 0x01: case 0x04: case 0x05: case 0x08: case 0x09:
+            return true;
+        case 0x40:
+        {
+            const uint32_t funct = instr & 0x3Fu;
+            if (funct == 0x30u || funct == 0x31u || funct == 0x32u || funct == 0x34u || funct == 0x35u)
+                return true;
+            if (funct < 0x3Cu)
+                return false;
+            const uint32_t f2 = (instr & 0x3u) | ((instr >> 4) & 0x7Cu);
+            return (f2 >= 0x30u && f2 <= 0x37u && f2 != 0x32u && f2 != 0x33u) || f2 == 0x3Cu || f2 == 0x3Du || f2 == 0x3Eu ||
+                   f2 == 0x3Fu;
+        }
+        default:
+            return false;
+        }
+    }
+
+    template <uint8_t D>
+    __attribute__((always_inline)) static inline void rStoreWords(uint8_t *mem, uint32_t addr, const uint32_t words[4])
+    {
+        // applyStore with the lean code's data memory (0x4000 bytes, addr already masked).
+        uint32_t oldWords[4]{};
+        std::memcpy(oldWords, mem + addr, sizeof(oldWords));
+        for (uint32_t component = 0; component < 4u; ++component)
+            if ((D & (1u << (3u - component))) != 0u)
+                oldWords[component] = words[component];
+        std::memcpy(mem + addr, oldWords, sizeof(oldWords));
+    }
+    template <uint8_t D>
+    __attribute__((always_inline)) static inline void rLoadQ(LeanR &R, VU1State &s, uint32_t reg, const uint8_t *mem, uint32_t addr)
+    {
+        // applyDest of the loaded qword (lanes outside D keep their value).
+        float tmp[4];
+        std::memcpy(tmp, mem + addr, 16);
+        f4 v = R.v[reg];
+        if (D & 0x8u) v[0] = tmp[0];
+        if (D & 0x4u) v[1] = tmp[1];
+        if (D & 0x2u) v[2] = tmp[2];
+        if (D & 0x1u) v[3] = tmp[3];
+        R.v[reg] = v;
+        rPut(s.vf[reg], v);
+    }
+    template <uint8_t D>
+    __attribute__((always_inline)) static inline int32_t rIlw(const uint8_t *mem, uint32_t addr)
+    {
+        constexpr int comp = (D & 0x8) ? 0 : (D & 0x4) ? 1 : (D & 0x2) ? 2 : 3;
+        uint32_t v;
+        std::memcpy(&v, mem + addr + comp * 4, 4);
+        return (int32_t)(int16_t)(v & 0xFFFF);
+    }
+
+    template <uint32_t L>
+    __attribute__((always_inline)) static inline void leanLowerR(LeanR &R, VU1State &s, uint8_t *mem)
+    {
+        static_assert(leanLowerRHandled(L), "leanLowerR: not a cached-register lower op");
+        constexpr uint32_t dataSize = 0x4000u;
+        constexpr uint32_t opHi = (L >> 25) & 0x7Fu;
+        constexpr uint8_t dest = static_cast<uint8_t>((L >> 21) & 0xFu);
+        constexpr uint32_t vfT = (L >> 16) & 0x1Fu, vfS = (L >> 11) & 0x1Fu;
+        constexpr uint32_t viT = (L >> 16) & 0xFu, viS = (L >> 11) & 0xFu, viD = (L >> 6) & 0xFu;
+        constexpr int16_t imm11 = static_cast<int16_t>(static_cast<int32_t>(L << 21) >> 21);
+        if constexpr (opHi == 0x00u) // LQ
+        {
+            const uint32_t addr = ((uint32_t)(int32_t)(R.vi[viS] + imm11) * 16u) & (dataSize - 1u);
+            rLoadQ<dest>(R, s, vfT, mem, addr);
+        }
+        else if constexpr (opHi == 0x01u) // SQ
+        {
+            const uint32_t addr = ((uint32_t)(int32_t)(R.vi[viT] + imm11) * 16u) & (dataSize - 1u);
+            uint32_t words[4];
+            std::memcpy(words, &R.v[vfS], sizeof(words));
+            rStoreWords<dest>(mem, addr, words);
+        }
+        else if constexpr (opHi == 0x04u) // ILW
+        {
+            const uint32_t addr = ((uint32_t)(int32_t)(R.vi[viS] + imm11) * 16u) & (dataSize - 1u);
+            const int32_t v = rIlw<dest>(mem, addr);
+            if constexpr (viT != 0u)
+                rSetVi(R, s, viT, v);
+        }
+        else if constexpr (opHi == 0x05u) // ISW
+        {
+            const uint32_t addr = ((uint32_t)(int32_t)(R.vi[viS] + imm11) * 16u) & (dataSize - 1u);
+            const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(R.vi[viT] & 0xFFFF));
+            const uint32_t words[4] = {val, val, val, val};
+            rStoreWords<dest>(mem, addr, words);
+        }
+        else if constexpr (opHi == 0x08u || opHi == 0x09u) // IADDIU / ISUBIU
+        {
+            constexpr int16_t imm = static_cast<int16_t>((int16_t)(L & 0x7FF) | ((L >> 10) & 0x7800));
+            if constexpr (viT != 0u)
+                rSetVi(R, s, viT, opHi == 0x08u ? (int16_t)(R.vi[viS] + imm) : (int16_t)(R.vi[viS] - imm));
+        }
+        else
+        {
+            constexpr uint32_t funct = L & 0x3Fu;
+            constexpr uint32_t f2 = (L & 0x3u) | ((L >> 4) & 0x7Cu);
+            if constexpr (funct == 0x30u) // IADD
+            {
+                if constexpr (viD != 0u)
+                    rSetVi(R, s, viD, (int16_t)(R.vi[viS] + R.vi[viT]));
+            }
+            else if constexpr (funct == 0x31u) // ISUB
+            {
+                if constexpr (viD != 0u)
+                    rSetVi(R, s, viD, (int16_t)(R.vi[viS] - R.vi[viT]));
+            }
+            else if constexpr (funct == 0x32u) // IADDI
+            {
+                constexpr int16_t imm5 = (int16_t)((int32_t)((L >> 6) & 0x1F) << 27 >> 27);
+                if constexpr (viT != 0u)
+                    rSetVi(R, s, viT, (int16_t)(R.vi[viS] + imm5));
+            }
+            else if constexpr (funct == 0x34u) // IAND
+            {
+                if constexpr (viD != 0u)
+                    rSetVi(R, s, viD, R.vi[viS] & R.vi[viT]);
+            }
+            else if constexpr (funct == 0x35u) // IOR
+            {
+                if constexpr (viD != 0u)
+                    rSetVi(R, s, viD, R.vi[viS] | R.vi[viT]);
+            }
+            else if constexpr (f2 == 0x30u) // MOVE
+            {
+                const f4 v = R.v[vfS];
+                f4 t = R.v[vfT];
+                if (dest & 0x8u) t[0] = v[0];
+                if (dest & 0x4u) t[1] = v[1];
+                if (dest & 0x2u) t[2] = v[2];
+                if (dest & 0x1u) t[3] = v[3];
+                R.v[vfT] = t;
+                rPut(s.vf[vfT], t);
+            }
+            else if constexpr (f2 == 0x31u) // MR32
+            {
+                const f4 v = R.v[vfS];
+                f4 t = R.v[vfT];
+                if (dest & 0x8u) t[0] = v[1];
+                if (dest & 0x4u) t[1] = v[2];
+                if (dest & 0x2u) t[2] = v[3];
+                if (dest & 0x1u) t[3] = v[0];
+                R.v[vfT] = t;
+                rPut(s.vf[vfT], t);
+            }
+            else if constexpr (f2 == 0x34u) // LQI
+            {
+                const uint32_t addr = ((uint32_t)(uint16_t)R.vi[viS] * 16u) & (dataSize - 1u);
+                rLoadQ<dest>(R, s, vfT, mem, addr);
+                if constexpr (viS != 0u)
+                    rSetVi(R, s, viS, (int16_t)(R.vi[viS] + 1));
+            }
+            else if constexpr (f2 == 0x35u) // SQI
+            {
+                const uint32_t addr = ((uint32_t)(uint16_t)R.vi[viT] * 16u) & (dataSize - 1u);
+                uint32_t words[4];
+                std::memcpy(words, &R.v[vfS], sizeof(words));
+                rStoreWords<dest>(mem, addr, words);
+                if constexpr (viT != 0u)
+                    rSetVi(R, s, viT, (int16_t)(R.vi[viT] + 1));
+            }
+            else if constexpr (f2 == 0x36u) // LQD
+            {
+                if constexpr (viS != 0u)
+                    rSetVi(R, s, viS, (int16_t)(R.vi[viS] - 1));
+                const uint32_t addr = ((uint32_t)(uint16_t)R.vi[viS] * 16u) & (dataSize - 1u);
+                rLoadQ<dest>(R, s, vfT, mem, addr);
+            }
+            else if constexpr (f2 == 0x37u) // SQD
+            {
+                if constexpr (viT != 0u)
+                    rSetVi(R, s, viT, (int16_t)(R.vi[viT] - 1));
+                const uint32_t addr = ((uint32_t)(uint16_t)R.vi[viT] * 16u) & (dataSize - 1u);
+                uint32_t words[4];
+                std::memcpy(words, &R.v[vfS], sizeof(words));
+                rStoreWords<dest>(mem, addr, words);
+            }
+            else if constexpr (f2 == 0x3Cu) // MTIR
+            {
+                constexpr uint32_t comp = (L >> 21) & 0x3u;
+                uint32_t fval;
+                const float lane = R.v[vfS][comp];
+                std::memcpy(&fval, &lane, 4);
+                if constexpr (viT != 0u)
+                    rSetVi(R, s, viT, (int32_t)(int16_t)(fval & 0xFFFF));
+            }
+            else if constexpr (f2 == 0x3Du) // MFIR
+            {
+                const int32_t val = (int32_t)(int16_t)(R.vi[viS] & 0xFFFF);
+                float f;
+                std::memcpy(&f, &val, 4);
+                f4 t = R.v[vfT];
+                if (dest & 0x8u) t[0] = f;
+                if (dest & 0x4u) t[1] = f;
+                if (dest & 0x2u) t[2] = f;
+                if (dest & 0x1u) t[3] = f;
+                R.v[vfT] = t;
+                rPut(s.vf[vfT], t);
+            }
+            else if constexpr (f2 == 0x3Eu) // ILWR
+            {
+                const uint32_t addr = ((uint32_t)(uint16_t)R.vi[viS] * 16u) & (dataSize - 1u);
+                const int32_t v = rIlw<dest>(mem, addr);
+                if constexpr (viT != 0u)
+                    rSetVi(R, s, viT, v);
+            }
+            else // 0x3F ISWR
+            {
+                const uint32_t addr = ((uint32_t)(uint16_t)R.vi[viS] * 16u) & (dataSize - 1u);
+                const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(R.vi[viT] & 0xFFFF));
+                const uint32_t words[4] = {val, val, val, val};
+                rStoreWords<dest>(mem, addr, words);
+            }
+        }
+    }
+
+    // VU1Interpreter::clipFlags on four lanes at once (same result): +x -x +y -y +z -z exceed
+    // |w|, compared as sign-magnitude integers against w's magnitude (denormal w: 0x7FFFFF).
+    __attribute__((always_inline)) static inline uint32_t clipFlagsV(f4 vs, f4 vt)
+    {
+        i4 bits;
+        std::memcpy(&bits, &vs, sizeof(bits));
+        uint32_t wBits;
+        const float w = vt[3];
+        std::memcpy(&wBits, &w, sizeof(wBits));
+        const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+        const i4 pos = bits > limit;                                       // -1 where set
+        const i4 neg = (bits ^ static_cast<int32_t>(0x80000000u)) > limit; // -1 where set
+        const i4 m = (pos & (i4){0x01, 0x04, 0x10, 0}) | (neg & (i4){0x02, 0x08, 0x20, 0});
+        return static_cast<uint32_t>(m[0] | m[1] | m[2]);
+    }
+
+    // execUpper<false> (the exact path: shadowed and I-bit pairs use it) on the cached registers,
+    // for the FMAC arithmetic ops. Its rare slow path (normalizeFmacValue) reads s, which still
+    // holds the operands: nothing is written before the result.
+    static constexpr bool leanUpperExactRHandled(uint32_t instr)
+    {
+        const uint32_t op = instr & 0x3Fu;
+        const uint32_t fd = (instr >> 6) & 0x1Fu;
+        if (op >= 0x3Cu || fd == 0u)
+            return false;
+        return op <= 0x0Fu || (op >= 0x18u && op <= 0x1Cu) || op == 0x1Eu || (op >= 0x20u && op <= 0x2Au) || op == 0x2Cu ||
+               op == 0x2Du;
+    }
+    // Clamped values (see K) are also normalized (normalizeOperand leaves them alone) where FMAC
+    // results never are denormal: with FPCR.FZ, which beginExecute sets on AArch64 only.
+#if defined(__aarch64__)
+    static constexpr bool kClampedIsNormal = true;
+#else
+    static constexpr bool kClampedIsNormal = false;
+#endif
+
+    // K: as for leanUpperR (lanes of VF[fs], VF[ft], ACC, Q, I known clamped).
+    template <uint32_t U, uint32_t K = 0u>
+    __attribute__((always_inline)) static inline void leanUpperExactR(VU1Interpreter &vu, LeanR &R, VU1State &s)
+    {
+        static_assert(leanUpperExactRHandled(U), "leanUpperExactR: not an exact-path FMAC op");
+        constexpr uint8_t dest = static_cast<uint8_t>((U >> 21) & 0xFu);
+        constexpr uint32_t ft = (U >> 16) & 0x1Fu, fs = (U >> 11) & 0x1Fu, fd = (U >> 6) & 0x1Fu;
+        constexpr uint32_t op = U & 0x3Fu;
+        // The lanes the result's dest lanes read (lane-wise ops; a broadcast reads one VF[ft] lane).
+        constexpr uint32_t needT = op <= 0x1Bu ? (8u >> (op & 3u)) : dest;
+        constexpr uint32_t k = kClampedIsNormal ? K : 0u;
+        constexpr bool ks = (k & dest) == dest, kt = ((k >> 4) & needT) == needT, ka = ((k >> 8) & dest) == dest;
+        vu.m_currentUpperInstruction = U;
+        float rawVs[4], rawVt[4], rawAcc[4];
+        std::memcpy(rawVs, &R.v[fs], 16);
+        std::memcpy(rawVt, &R.v[ft], 16);
+        std::memcpy(rawAcc, &R.acc, 16);
+        float vs[4], vt[4], acc[4];
+        if constexpr (ks)
+            std::memcpy(vs, rawVs, 16);
+        else
+            ps2x_vu1_exec_detail::normalizeOperand4(rawVs, vs);
+        if constexpr (kt)
+            std::memcpy(vt, rawVt, 16);
+        else
+            ps2x_vu1_exec_detail::normalizeOperand4(rawVt, vt);
+        if constexpr (ka)
+            std::memcpy(acc, rawAcc, 16);
+        else
+            ps2x_vu1_exec_detail::normalizeOperand4(rawAcc, acc);
+        const float q = ((k >> 12) & 1u) ? R.q : vu.normalizeOperand(R.q);
+        const float i = ((k >> 13) & 1u) ? R.i : vu.normalizeOperand(R.i);
+        float result[4];
+        if constexpr (op <= 0x03u) // ADDbc
+        {
+            float bc = vu.broadcast(vt, op & 3);
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] + bc;
+        }
+        else if constexpr (op <= 0x07u) // SUBbc
+        {
+            float bc = vu.broadcast(vt, op & 3);
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] - bc;
+        }
+        else if constexpr (op <= 0x0Bu) // MADDbc
+        {
+            float bc = vu.broadcast(vt, op & 3);
+            for (int c = 0; c < 4; c++)
+                result[c] = acc[c] + vs[c] * bc;
+        }
+        else if constexpr (op <= 0x0Fu) // MSUBbc
+        {
+            float bc = vu.broadcast(vt, op & 3);
+            for (int c = 0; c < 4; c++)
+                result[c] = acc[c] - vs[c] * bc;
+        }
+        else if constexpr (op <= 0x1Bu) // MULbc
+        {
+            float bc = vu.broadcast(vt, op & 3);
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] * bc;
+        }
+        else if constexpr (op == 0x1Cu) // MULq
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] * q;
+        }
+        else if constexpr (op == 0x1Eu) // MULi
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] * i;
+        }
+        else if constexpr (op == 0x20u) // ADDq
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] + q;
+        }
+        else if constexpr (op == 0x21u) // MADDq
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = acc[c] + vs[c] * q;
+        }
+        else if constexpr (op == 0x22u) // ADDi
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] + i;
+        }
+        else if constexpr (op == 0x23u) // MADDi
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = acc[c] + vs[c] * i;
+        }
+        else if constexpr (op == 0x24u) // SUBq
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] - q;
+        }
+        else if constexpr (op == 0x25u) // MSUBq
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = acc[c] - vs[c] * q;
+        }
+        else if constexpr (op == 0x26u) // SUBi
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] - i;
+        }
+        else if constexpr (op == 0x27u) // MSUBi
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = acc[c] - vs[c] * i;
+        }
+        else if constexpr (op == 0x28u) // ADD
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] + vt[c];
+        }
+        else if constexpr (op == 0x29u) // MADD
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = acc[c] + vs[c] * vt[c];
+        }
+        else if constexpr (op == 0x2Au) // MUL
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] * vt[c];
+        }
+        else if constexpr (op == 0x2Cu) // SUB
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] - vt[c];
+        }
+        else // 0x2D MSUB
+        {
+            for (int c = 0; c < 4; c++)
+                result[c] = acc[c] - vs[c] * vt[c];
+        }
+        vu.normalizeFmacValue(result, dest, U);
+        // applyDest: only the dest lanes change.
+        f4 t = R.v[fd];
+        if (dest & 0x8u) t[0] = result[0];
+        if (dest & 0x4u) t[1] = result[1];
+        if (dest & 0x2u) t[2] = result[2];
+        if (dest & 0x1u) t[3] = result[3];
+        R.v[fd] = t;
+        rPut(s.vf[fd], t);
+    }
+
+    // fdivResult (DIV / SQRT / RSQRT) on the cached registers. K: bits 0-3 VF[fs] lanes, 4-7 VF[ft]
+    // lanes known clamped (normalized: see kClampedIsNormal).
+    template <uint32_t L, uint32_t K = 0u>
+    __attribute__((always_inline)) static inline void leanFdivR(VU1Interpreter &vu, LeanCtx &c, const LeanR &R)
+    {
+        constexpr uint32_t vfT = (L >> 16) & 0x1Fu, vfS = (L >> 11) & 0x1Fu;
+        constexpr uint32_t funct2 = (L & 0x3u) | ((L >> 4) & 0x7Cu);
+        constexpr int fsf = (L >> 21) & 0x3, ftf = (L >> 23) & 0x3;
+        constexpr uint32_t k = kClampedIsNormal ? K : 0u;
+        constexpr bool ks = (k & (8u >> fsf)) != 0u, kt = ((k >> 4) & (8u >> ftf)) != 0u;
+        auto opS = [&]() __attribute__((always_inline)) { return ks ? R.v[vfS][fsf] : vu.normalizeOperand(R.v[vfS][fsf]); };
+        auto opT = [&]() __attribute__((always_inline)) { return kt ? R.v[vfT][ftf] : vu.normalizeOperand(R.v[vfT][ftf]); };
+        uint32_t ignoredFlags = 0u;
+        if constexpr (funct2 == 0x38u) // DIV
+        {
+            const float num = opS();
+            const float den = opT();
+            uint32_t statusDi = 0u;
+            float result = 0.0f;
+            if (den == 0.0f)
+            {
+                statusDi = num == 0.0f ? 0x10u : 0x20u;
+                result = std::signbit(num) != std::signbit(den) ? -std::numeric_limits<float>::max()
+                                                               : std::numeric_limits<float>::max();
+            }
+            else
+                result = num / den;
+            c.qPend = vu.normalizeResult(result, ignoredFlags);
+            c.qDi = statusDi & 0x30u;
+        }
+        else if constexpr (funct2 == 0x39u) // SQRT
+        {
+            const float val = opT();
+            c.qPend = vu.normalizeResult(std::sqrt(std::fabs(val)), ignoredFlags);
+            c.qDi = val < 0.0f ? 0x10u : 0u;
+        }
+        else // RSQRT
+        {
+            const float num = opS();
+            const float radicand = opT();
+            const float den = std::sqrt(std::fabs(radicand));
+            uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
+            float result = 0.0f;
+            if (den != 0.0f)
+                result = num / den;
+            else
+            {
+                statusDi = num == 0.0f ? 0x10u : 0x20u;
+                result = std::signbit(num) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+            }
+            c.qPend = vu.normalizeResult(result, ignoredFlags);
+            c.qDi = statusDi & 0x30u;
+        }
+    }
+
+    // CLIP on the cached registers.
+    __attribute__((always_inline)) static inline void leanClipR(LeanCtx &c, f4 vs, f4 vt, uint64_t cyc)
+    {
+        const uint32_t flags = clipFlagsV(vs, vt);
+        c.wclip = ((c.wclip << 6) | (flags & 0x3Fu)) & 0xFFFFFFu;
+        leanClipPush(c, cyc);
+    }
+
+    // Q lands (leanCommitQ) with Q cached.
+    __attribute__((always_inline)) static inline void leanCommitQR(VU1Interpreter &vu, LeanCtx &c, LeanR &R, uint64_t at)
+    {
+        leanCommitQ(vu, c, at);
+        R.q = c.qPend;
+    }
+
+    // leanStoreAddr on the cached VI registers.
+    __attribute__((always_inline)) static inline uint32_t leanStoreAddrR(const LeanR &R, uint32_t lower, uint32_t dataSize)
+    {
+        const uint32_t opHi = (lower >> 25) & 0x7Fu;
+        const uint8_t viT = VIT(lower), viS = VIS(lower);
+        uint32_t addr = 0u;
+        if (opHi == 0x01u) // SQ
+            addr = static_cast<uint32_t>(static_cast<int32_t>(R.vi[viT] + IMM11(lower))) * 16u;
+        else if (opHi == 0x05u) // ISW
+            addr = static_cast<uint32_t>(static_cast<int32_t>(R.vi[viS] + IMM11(lower))) * 16u;
+        else
+        {
+            const uint8_t funct2 = static_cast<uint8_t>((lower & 0x3u) | ((lower >> 4) & 0x7Cu));
+            if (funct2 == 0x35u) // SQI
+                addr = static_cast<uint32_t>(static_cast<uint16_t>(R.vi[viT])) * 16u;
+            else if (funct2 == 0x37u) // SQD
+                addr = static_cast<uint32_t>(static_cast<uint16_t>(viT != 0u ? static_cast<int16_t>(R.vi[viT] - 1) : R.vi[viT])) * 16u;
+            else // ISWR
+                addr = static_cast<uint32_t>(static_cast<uint16_t>(R.vi[viS])) * 16u;
         }
         return addr & (dataSize - 1u);
     }
