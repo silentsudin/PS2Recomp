@@ -163,5 +163,6 @@ void main()
     }
 
     outColor = vec4(rgb / 255.0, clamp(a / 128.0, 0.0, 1.0));
-    outMotion = vec4(vMotion, 0.0, 0.0);
+    // Alpha as the colour's: a blended draw (As, 1 - As) writes its motion where it is opaque.
+    outMotion = vec4(vMotion, 0.0, outColor.a);
 }

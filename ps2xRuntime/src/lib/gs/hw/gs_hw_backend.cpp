@@ -1844,8 +1844,11 @@ namespace ps2x::gs
                         unsupported("FBA");
 
                     cmd.set_vertex_binding(0, *vbo, 0, sizeof(HwVertex));
-                    // Motion from opaque draws only (blending would blend it); the HUD writes its zero.
-                    cmd.set_color_write_mask(mask | (motionImage && !s.prim.abe ? 0x30u : 0u));
+                    // Motion from unblended draws and the usual blend, Cs * As + Cd * (1 - As) (ALPHA 0x44,
+                    // the motion output carries the colour's alpha); other blends (additive effects)
+                    // leave it. The HUD writes its zero.
+                    const bool motionWrite = motionImage && (!s.prim.abe || (ctx.alpha & 0xFFu) == 0x44u);
+                    cmd.set_color_write_mask(mask | (motionWrite ? 0x30u : 0u));
                     cmd.set_specialization_constant_mask(0x7);
                     cmd.set_specialization_constant(0, p.mode[0]);
                     cmd.set_specialization_constant(1, p.mode[1]);
