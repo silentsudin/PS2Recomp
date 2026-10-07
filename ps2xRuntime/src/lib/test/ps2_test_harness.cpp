@@ -972,6 +972,13 @@ namespace ps2_test
                 g_audioLrDiff = 0.0;
                 return reply;
             }
+            if (cmd == "pause")
+            {
+                // {"cmd":"pause","on":1|0}: holds the game as the app's in-game menu does
+                // (setPaused). It parks at the next vblank only without lockstep (RT_TEST_LIVE=1).
+                setPaused(jsonNumber(line, "on", 1) != 0);
+                return "{\"ok\":true,\"vblank\":" + std::to_string(currentVblank()) + "}";
+            }
             if (cmd == "quit")
             {
                 g_quitRequested.store(true);

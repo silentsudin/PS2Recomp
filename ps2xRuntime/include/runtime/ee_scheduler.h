@@ -500,6 +500,7 @@ private:
     void applyPendingPreemption();
     void processPendingEvents();
     void processDueDeadlines();
+    void resyncHostDeadlines();
     void processEvent(const EeEvent &event);
     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
     [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);

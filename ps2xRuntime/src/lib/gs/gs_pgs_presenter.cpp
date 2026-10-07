@@ -443,14 +443,63 @@ namespace ps2x::gs
                 pumpEvents();
 
                 updateTemporal(runtime);
+                const auto latchStart = std::chrono::steady_clock::now();
                 latch(runtime);
+                m_latchMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - latchStart).count();
                 m_pictureAspect = pictureAspect(runtime, *this);
                 m_frame2D = runtime.gsUnsynced().lastFrameWas2D();
                 m_uiFrame = false;
                 if (drawUi)
                     drawUi();
                 waitForDrawable();
+                const auto renderStart = std::chrono::steady_clock::now();
                 render();
+                notePacing(runtime, renderStart);
+            }
+
+            // RT_PRESENT_DEBUG=1: where each present's work falls against the guest's vblanks, and
+            // how long it holds (and waits for) the device lock the GS thread needs, every 2 s.
+            // A present that keeps landing where the game's frame needs the GS can hold the game at
+            // 30 fps until the phase moves (a pause does).
+            void notePacing(PS2Runtime &runtime, std::chrono::steady_clock::time_point start)
+            {
+                static const bool debug = std::getenv("RT_PRESENT_DEBUG") != nullptr;
+                if (!debug)
+                    return;
+                const auto end = std::chrono::steady_clock::now();
+                const double renderMs = std::chrono::duration<double, std::milli>(end - start).count();
+                const int64_t vblank = runtime.eeScheduler().lastVBlankHostNs();
+                const int64_t startNs = std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
+                double phase = vblank ? std::fmod(static_cast<double>(startNs - vblank) / 1e6, 16.667) : -1.0;
+                if (vblank && phase < 0.0)
+                    phase += 16.667;
+                m_pacing.n++;
+                m_pacing.latchSum += m_latchMs;
+                m_pacing.latchMax = std::max(m_pacing.latchMax, m_latchMs);
+                m_pacing.renderSum += renderMs;
+                m_pacing.renderMax = std::max(m_pacing.renderMax, renderMs);
+                m_pacing.waitSum += m_lockWaitMs;
+                m_pacing.waitMax = std::max(m_pacing.waitMax, m_lockWaitMs);
+                m_pacing.heldSum += m_lockHeldMs;
+                m_pacing.heldMax = std::max(m_pacing.heldMax, m_lockHeldMs);
+                if (phase >= 0.0)
+                {
+                    m_pacing.phases++;
+                    m_pacing.phaseSum += phase;
+                    m_pacing.phaseMin = std::min(m_pacing.phaseMin, phase);
+                    m_pacing.phaseMax = std::max(m_pacing.phaseMax, phase);
+                }
+                if (end - m_pacing.since < std::chrono::seconds(2))
+                    return;
+                const double n = static_cast<double>(m_pacing.n);
+                std::fprintf(stderr,
+                             "[pacing] %u presents: latch (the GS's Present) %.2f ms (max %.2f), render %.2f ms (max %.2f), device "
+                             "lock held %.2f (max %.2f), waited for %.2f (max %.2f); starts %.1f ms after a vblank (%.1f..%.1f)\n",
+                             m_pacing.n, m_pacing.latchSum / n, m_pacing.latchMax, m_pacing.renderSum / n, m_pacing.renderMax, m_pacing.heldSum / n, m_pacing.heldMax,
+                             m_pacing.waitSum / n, m_pacing.waitMax, m_pacing.phaseSum / std::max(1u, m_pacing.phases), m_pacing.phaseMin,
+                             m_pacing.phaseMax);
+                m_pacing = {};
+                m_pacing.since = end;
             }
 
             void frameUi(const std::function<void()> &drawUi) override
@@ -704,10 +753,19 @@ namespace ps2x::gs
                     return;
                 }
 #endif
-                // Shadow frames (frame generation) can't go through GSR 2 or ASR (their history is the
-                // real frames'): FSR 1, which looks close.
+                // Shadow frames (frame generation) don't feed GSR 2's history (it stays a sequence of
+                // real frames): GSR 2 blends the shadow with the real frame's output moved on half a
+                // frame (upscaleSgsr2Shadow), so the two pictures of each guest frame look alike. On
+                // FSR 1 alone the shadows were sharp and aliased between soft GSR 2 frames, and at
+                // 120 Hz the difference flickered at every moving edge (the "trails" behind fast
+                // cars). ASR (a library) and a shadow GSR 2 can't run: FSR 1, which looks close.
+                // RT_SGSR2_SHADOW=0 keeps FSR 1 for GSR 2's shadows too (A/B).
+                static const bool shadowSgsr2 = [] { const char *e = std::getenv("RT_SGSR2_SHADOW"); return !(e && *e == '0'); }();
                 const bool temporalUpscaler = m_post.scaling == PostProcess::Scaling::SnapdragonGsr2 ||
                                               m_post.scaling == PostProcess::Scaling::ArmAsr;
+                if (shadowSgsr2 && m_noTemporal && m_post.scaling == PostProcess::Scaling::SnapdragonGsr2 && rect.extent.width > sw &&
+                    upscaleSgsr2Shadow(cmd, sw, sh, rect.extent.width, rect.extent.height))
+                    return;
                 if ((m_post.scaling == PostProcess::Scaling::Fsr1 || (m_noTemporal && temporalUpscaler)) && rect.extent.width > sw)
                 {
                     struct
@@ -786,7 +844,7 @@ namespace ps2x::gs
             void temporalAntiAliasingShadow(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh)
             {
                 const Vulkan::ImageHandle &history = m_taaHistory[m_taaIndex ^ 1]; // the real frame's output
-                if (!m_taaValid || !history || history->get_width() != sw || history->get_height() != sh || !m_shared.motion ||
+                if (!m_taaValid || m_taaSerial != m_shared.pictureSerial || !history || history->get_width() != sw || history->get_height() != sh || !m_shared.motion ||
                     m_shared.motion->get_width() != sw || m_shared.motion->get_height() != sh)
                     return;
                 struct
@@ -796,10 +854,11 @@ namespace ps2x::gs
                     float rcpSize[2];
                     float blend;
                     float historyValid;
-                } push = {{0.5f / 640.0f, 0.5f / 224.0f}, {m_jitter[0] - m_jitter[2], m_jitter[1] - m_jitter[3]},
+                } push = {{m_shadowT / 640.0f, m_shadowT / 224.0f}, {0.0f, 0.0f},
                           {1.0f / static_cast<float>(sw), 1.0f / static_cast<float>(sh)}, 0.1f, 1.0f};
-                // Half the motion: a point at x in the shadow (frame N + 1/2) was at x - m/2 in
-                // frame N, whose TAA output is the history here.
+                // t of the motion: a point at x in the shadow (frame N + t) was at x - t m in frame
+                // N, whose TAA output (at frame N's jitter) is the history here. The jitter step stays
+                // in: the shadow GS moved every vertex by t m, the camera's jitter step included.
                 const PassInput inputs[3] = {{m_final, Vulkan::StockSampler::NearestClamp},
                                              {history.get(), Vulkan::StockSampler::LinearClamp},
                                              {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp}};
@@ -829,6 +888,65 @@ namespace ps2x::gs
                 return serial == ~0ull || gap > 4 ? 0.0f : static_cast<float>(gap);
             }
 
+            // GSR 2's parameters for a picture of sw x sh to w x h, with the motion of `steps` frames
+            // (GS pixels of one frame in the motion buffer).
+            Sgsr2Push sgsr2Push(uint32_t sw, uint32_t sh, uint32_t w, uint32_t h, float steps) const
+            {
+                const float fw = static_cast<float>(sw), fh = static_cast<float>(sh), ow = static_cast<float>(w), oh = static_cast<float>(h);
+                Sgsr2Push push = {};
+                push.renderSize[0] = fw, push.renderSize[1] = fh;
+                push.outputSize[0] = ow, push.outputSize[1] = oh;
+                push.renderSizeRcp[0] = 1.0f / fw, push.renderSizeRcp[1] = 1.0f / fh;
+                push.outputSizeRcp[0] = 1.0f / ow, push.outputSizeRcp[1] = 1.0f / oh;
+                // The camera's jitter (GS pixels) in picture pixels.
+                push.jitterOffset[0] = m_jitter[0] * fw / 640.0f;
+                push.jitterOffset[1] = m_jitter[1] * fh / 224.0f;
+                push.scaleRatio[0] = ow / fw;
+                push.scaleRatio[1] = std::min(20.0f, std::pow(ow * oh / (fw * fh), 3.0f));
+                push.motionToNdc[0] = steps * 2.0f / 640.0f;
+                push.motionToNdc[1] = steps * 2.0f / 224.0f;
+                // The motion comes from the jittered cameras: without this frame's jitter step (as
+                // GSR expects, and as TAA takes it out too).
+                push.jitterDelta[0] = m_jitter[0] - m_jitter[2];
+                push.jitterDelta[1] = m_jitter[1] - m_jitter[3];
+                push.cameraFovAngleHor = 0.75f; // tan(FOV / 2): Road Trip's cameras are about 74 degrees across
+                push.minLerpContribution = 0.0f;
+                return push;
+            }
+
+            // A shadow frame (frame generation, half a frame after the real one) through GSR 2: its
+            // picture upscaled and blended with the real frame's GSR 2 output, moved on half a frame
+            // with the real frame's motion. Not kept as history. False when the real frame's output
+            // isn't this picture's (the caller scales with FSR 1).
+            bool upscaleSgsr2Shadow(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh, uint32_t w, uint32_t h)
+            {
+                const Vulkan::ImageHandle &real = m_sgsr2History[m_sgsr2Index ^ 1]; // the real frame's output
+                if (!m_sgsr2Convert || !m_sgsr2Upscale || !m_sgsr2Valid || m_sgsr2Serial != m_shared.pictureSerial || !real ||
+                    real->get_width() != w || real->get_height() != h || !m_shared.motion || !m_shared.depth ||
+                    m_shared.motion->get_width() != sw || m_shared.motion->get_height() != sh || m_shared.depth->get_width() != sw ||
+                    m_shared.depth->get_height() != sh)
+                    return false;
+                // t of the motion (a point at x in the shadow, t of a frame on, was at x - t m in the
+                // real frame), and the shadow's jitter: the real frame's plus t of its step (the
+                // shadow GS moves every vertex on by t of its motion, jitter step included).
+                const float t = m_shadowT;
+                Sgsr2Push push = sgsr2Push(sw, sh, w, h, t);
+                push.jitterOffset[0] = (m_jitter[0] + t * (m_jitter[0] - m_jitter[2])) * static_cast<float>(sw) / 640.0f;
+                push.jitterOffset[1] = (m_jitter[1] + t * (m_jitter[1] - m_jitter[3])) * static_cast<float>(sh) / 224.0f;
+                push.reset = 0.0f;
+                const PassInput convertIn[2] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp},
+                                                {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(cmd, m_sgsr2Mda, sw, sh, m_sgsr2Convert, convertIn, 2, &push, sizeof(push), false,
+                              VK_FORMAT_R16G16B16A16_SFLOAT);
+                const PassInput upscaleIn[3] = {{real.get(), Vulkan::StockSampler::LinearClamp},
+                                                {m_sgsr2Mda.get(), Vulkan::StockSampler::LinearClamp},
+                                                {m_final, Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(cmd, m_sgsr2Shadow, w, h, m_sgsr2Upscale, upscaleIn, 3, &push, sizeof(push), false);
+                m_final = m_sgsr2Shadow.get();
+                m_finalRcas = true;
+                return true;
+            }
+
             bool upscaleSgsr2(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh, uint32_t w, uint32_t h)
             {
                 if (!m_sgsr2Convert || !m_sgsr2Upscale || !m_shared.motion || !m_shared.depth || m_shared.motion->get_width() != sw ||
@@ -850,25 +968,7 @@ namespace ps2x::gs
                 const float steps = pictureSteps(m_sgsr2Serial);
                 const bool valid = sized && steps > 0.0f;
                 m_sgsr2Serial = m_shared.pictureSerial;
-                const float fw = static_cast<float>(sw), fh = static_cast<float>(sh), ow = static_cast<float>(w), oh = static_cast<float>(h);
-                Sgsr2Push push = {};
-                push.renderSize[0] = fw, push.renderSize[1] = fh;
-                push.outputSize[0] = ow, push.outputSize[1] = oh;
-                push.renderSizeRcp[0] = 1.0f / fw, push.renderSizeRcp[1] = 1.0f / fh;
-                push.outputSizeRcp[0] = 1.0f / ow, push.outputSizeRcp[1] = 1.0f / oh;
-                // The camera's jitter (GS pixels) in picture pixels.
-                push.jitterOffset[0] = m_jitter[0] * fw / 640.0f;
-                push.jitterOffset[1] = m_jitter[1] * fh / 224.0f;
-                push.scaleRatio[0] = ow / fw;
-                push.scaleRatio[1] = std::min(20.0f, std::pow(ow * oh / (fw * fh), 3.0f));
-                push.motionToNdc[0] = std::max(steps, 1.0f) * 2.0f / 640.0f;
-                push.motionToNdc[1] = std::max(steps, 1.0f) * 2.0f / 224.0f;
-                // The motion comes from the jittered cameras: without this frame's jitter step (as
-                // GSR expects, and as TAA takes it out too).
-                push.jitterDelta[0] = m_jitter[0] - m_jitter[2];
-                push.jitterDelta[1] = m_jitter[1] - m_jitter[3];
-                push.cameraFovAngleHor = 0.75f; // tan(FOV / 2): Road Trip's cameras are about 74 degrees across
-                push.minLerpContribution = 0.0f;
+                Sgsr2Push push = sgsr2Push(sw, sh, w, h, std::max(steps, 1.0f));
                 push.reset = valid ? 0.0f : 1.0f;
                 const PassInput convertIn[2] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp},
                                                 {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp}};
@@ -1142,17 +1242,29 @@ namespace ps2x::gs
                 bool &valid = m_noTemporal ? m_temporalValidShadow : m_temporalValid;
                 if (!scaler)
                     return;
-                if (!m_noTemporal && valid && m_shared.pictureSerial == m_mfxSerial && upImage && upImage->get_width() == w &&
-                    upImage->get_height() == h)
+                // The shadow scaler's frames are (picture, t) apart: one guest frame each at 2x, but
+                // t changes between them at 3x and 4x, and a shadow that wasn't ready leaves a gap.
+                const float shadowAt = static_cast<float>(m_shared.pictureSerial % 1000000u) + m_shadowT;
+                const bool same = m_noTemporal ? m_mfxShadowAt == shadowAt : m_shared.pictureSerial == m_mfxSerial;
+                if (valid && same && upImage && upImage->get_width() == w && upImage->get_height() == h)
                 {
                     m_final = upImage.get(); // the same 3D again: the last output
                     return;
                 }
-                const float steps = m_noTemporal ? 1.0f : pictureSteps(m_mfxSerial);
+                float steps = 0.0f;
+                if (!m_noTemporal)
+                {
+                    steps = pictureSteps(m_mfxSerial);
+                    m_mfxSerial = m_shared.pictureSerial;
+                }
+                else
+                {
+                    const float dt = shadowAt - m_mfxShadowAt;
+                    steps = m_mfxShadowAt >= 0.0f && dt > 0.0f && dt <= 4.0f ? dt : 0.0f;
+                    m_mfxShadowAt = shadowAt;
+                }
                 if (steps == 0.0f)
                     valid = false;
-                if (!m_noTemporal)
-                    m_mfxSerial = m_shared.pictureSerial;
                 const PassInput depthIn[1] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp}};
                 offscreenPass(*cmd, m_depthNorm, sw, sh, m_depthNormalize, depthIn, 1, nullptr, 0, false, VK_FORMAT_R32_SFLOAT);
                 if (!upImage || upImage->get_width() != w || upImage->get_height() != h ||
@@ -1181,8 +1293,10 @@ namespace ps2x::gs
                 f.inH = sh;
                 f.outW = w;
                 f.outH = h;
-                f.jitterX = m_jitter[0] * px;
-                f.jitterY = m_jitter[1] * py;
+                // A shadow's jitter: the real frame's plus t of its step (its GS moved every vertex on).
+                const float jt = m_noTemporal ? m_shadowT : 0.0f;
+                f.jitterX = (m_jitter[0] + jt * (m_jitter[0] - m_jitter[2])) * px;
+                f.jitterY = (m_jitter[1] + jt * (m_jitter[1] - m_jitter[3])) * py;
                 f.motionScaleX = -px * std::max(steps, 1.0f); // ours: current minus previous, GS pixels, one frame
                 f.motionScaleY = -py * std::max(steps, 1.0f);
                 f.reset = !valid;
@@ -1294,6 +1408,7 @@ namespace ps2x::gs
                         shadow->get_height() == raw->get_height())
                     {
                         m_sourceOverride = shadow; // until the next render: spareUi composites from it too
+                        m_shadowT = static_cast<float>(step) / static_cast<float>(m_fg.factor);
                         m_noTemporal = true;
                         preparePicture(cmd, fw, fh);
                         m_noTemporal = false;
@@ -1880,7 +1995,23 @@ namespace ps2x::gs
 
             void render()
             {
+                const auto lockAsked = std::chrono::steady_clock::now();
                 std::unique_lock<std::mutex> lock(m_shared.mutex);
+                // (RT_PRESENT_DEBUG's pacing line: how long the lock was waited for and held.)
+                auto lockedAt = std::chrono::steady_clock::now();
+                m_lockWaitMs = std::chrono::duration<double, std::milli>(lockedAt - lockAsked).count();
+                m_lockHeldMs = 0.0;
+                struct Held
+                {
+                    std::unique_lock<std::mutex> &lock;
+                    std::chrono::steady_clock::time_point &since;
+                    double &total;
+                    ~Held()
+                    {
+                        if (lock.owns_lock())
+                            total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since).count();
+                    }
+                } held{lock, lockedAt, m_lockHeldMs};
                 pgsRegisterThread();
                 Vulkan::Device &dev = *m_shared.device;
 #if defined(PS2X_PGS_PRESENTER_UI)
@@ -1920,9 +2051,11 @@ namespace ps2x::gs
                     {
                         if (m_shared.submitsUnderLock)
                         {
+                            m_lockHeldMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lockedAt).count();
                             lock.unlock();
                             begun = m_wsi.begin_frame();
                             lock.lock();
+                            lockedAt = std::chrono::steady_clock::now();
                         }
                         else
                             begun = m_wsi.begin_frame();
@@ -1939,6 +2072,22 @@ namespace ps2x::gs
                 const bool fresh = m_lastTick != m_renderedTick;
                 m_renderedTick = m_lastTick;
                 m_subframe = fresh ? 0u : m_subframe + 1u;
+                // RT_PRESENT_DUMP=<dir> (with RT_PRESENT_DUMP_FROM / _TO, guest vblanks): every guest
+                // frame's presents in that range as <dir>/v<vblank>_<present>.png, the real frame
+                // (0) and its generated ones (1..), as shown. With the lockstep test socket the
+                // presenter shows each parked frame long enough for all of them.
+                static const char *presentDump = std::getenv("RT_PRESENT_DUMP");
+                if (presentDump && *presentDump && m_capturePath.empty() && m_subframe < std::max(m_fg.factor, 1u))
+                {
+                    static const uint64_t from = std::strtoull(std::getenv("RT_PRESENT_DUMP_FROM") ? std::getenv("RT_PRESENT_DUMP_FROM") : "0", nullptr, 10);
+                    static const uint64_t to = std::strtoull(std::getenv("RT_PRESENT_DUMP_TO") ? std::getenv("RT_PRESENT_DUMP_TO") : "0", nullptr, 10);
+                    if (m_lastTick >= from && m_lastTick <= to)
+                    {
+                        char name[64];
+                        std::snprintf(name, sizeof(name), "/v%06llu_%u.png", static_cast<unsigned long long>(m_lastTick), m_subframe);
+                        m_capturePath = std::string(presentDump) + name;
+                    }
+                }
                 // RT_GPU_TIMES=1: GPU time of the presenter's passes and the GS's recordings, logged
                 // every 2 s (per occurrence).
                 static const bool gpuTimes = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && *e == '1'; }();
@@ -2009,6 +2158,7 @@ namespace ps2x::gs
                     m_getQueue(m_wsi.get_context().get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS], &queue);
                     const uint64_t desired = g_desiredPresentNs, target = g_targetRefreshNs;
                     g_desiredPresentNs = 0;
+                    m_lockHeldMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lockedAt).count();
                     lock.unlock();
                     // Waits for a drawable here, holding nothing the GS thread needs.
                     m_metal->present(queue, texture, back.get_width(), back.get_height(), desired ? static_cast<double>(desired) / 1e9 : 0.0,
@@ -2224,7 +2374,7 @@ namespace ps2x::gs
             Vulkan::Program *m_program = nullptr;
             Vulkan::Program *m_fxaa = nullptr, *m_easu = nullptr, *m_rcas = nullptr, *m_sgsr1 = nullptr;
             Vulkan::Program *m_sgsr2Convert = nullptr, *m_sgsr2Upscale = nullptr;
-            Vulkan::ImageHandle m_sgsr2Mda, m_sgsr2History[2];
+            Vulkan::ImageHandle m_sgsr2Mda, m_sgsr2History[2], m_sgsr2Shadow;
             uint32_t m_sgsr2Index = 0;
             bool m_sgsr2Valid = false;
             uint64_t m_sgsr2Serial = ~0ull, m_taaSerial = ~0ull, m_mfxSerial = ~0ull; // PgsShared::pictureSerial each last ran on
@@ -2290,6 +2440,17 @@ namespace ps2x::gs
             bool m_lastRcas = false;
             const Vulkan::Image *m_sourceOverride = nullptr; // a shadow frame shown instead of the scanout
             bool m_noTemporal = false;                       // processing a shadow frame: no TAA/MetalFX history
+            float m_shadowT = 0.5f;                          // that shadow's time after the real frame (frames)
+            double m_lockWaitMs = 0.0, m_lockHeldMs = 0.0;   // this present's device lock (RT_PRESENT_DEBUG)
+            double m_latchMs = 0.0;
+            struct
+            {
+                uint32_t n = 0, phases = 0;
+                double latchSum = 0, latchMax = 0, renderSum = 0, renderMax = 0, waitSum = 0, waitMax = 0, heldSum = 0, heldMax = 0;
+                double phaseSum = 0, phaseMin = 1e9, phaseMax = -1;
+                std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+            } m_pacing;
+            float m_mfxShadowAt = -1.0f;                     // MetalFX's shadow history: (picture + t) it last ran on
             bool m_frame2D = false;
             uint64_t m_realSerial = 0; // PgsShared::presentSerial of the real frame on show
             bool m_progressiveFields = true; // GS::progressiveFields, read each frame

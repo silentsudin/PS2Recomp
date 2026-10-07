@@ -1907,8 +1907,39 @@ void EeScheduler::processDueDeadlines()
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
+            if (scheduled.event.type == EeEventType::VBlankStart)
+                resyncHostDeadlines();
         }
     }
+}
+
+// The host timeline the guest's vblanks follow keeps its schedule (each vblank one period after the
+// last was due), so a short late vblank is made up for. But a long hold (a host menu parks the game
+// inside onVblank, the app in the background, a stall of the GS or the device) left every vblank
+// it missed due at once, and the game ran fast for seconds to catch up. A real PS2 never makes up
+// lost vblanks: when the next one is already more than two periods overdue, the whole timeline
+// moves on to now (RT_VBLANK_JITTER=1 logs it).
+void EeScheduler::resyncHostDeadlines()
+{
+    if (m_virtualTime)
+        return; // guest time: no host schedule to fall behind
+    constexpr auto kMaxLag = 2 * kVBlankPeriod;
+    std::chrono::steady_clock::duration lag{};
+    {
+        std::lock_guard lock(m_eventMutex);
+        const auto now = std::chrono::steady_clock::now();
+        const auto next = std::find_if(m_deadlines.begin(), m_deadlines.end(), [](const ScheduledEvent &item)
+                                       { return item.event.type == EeEventType::VBlankStart; });
+        if (next == m_deadlines.end() || now - next->hostDeadline <= kMaxLag)
+            return;
+        lag = now - next->hostDeadline;
+        for (ScheduledEvent &item : m_deadlines)
+            item.hostDeadline += lag;
+    }
+    static const bool jitter = [] { const char *e = std::getenv("RT_VBLANK_JITTER"); return e && *e == '1'; }();
+    if (jitter)
+        std::fprintf(stderr, "[vblank] %.1f ms behind the host clock: the vblanks restart from now (not caught up)\n",
+                     std::chrono::duration<double, std::milli>(lag).count());
 }
 
 void EeScheduler::processEvent(const EeEvent &event)

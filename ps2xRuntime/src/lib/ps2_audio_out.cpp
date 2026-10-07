@@ -24,6 +24,11 @@ namespace
     // the Thor) otherwise grows the queue until the cap drops frames, which crackles.
     constexpr double kTargetFrames = kSampleRate * 0.05;
     double g_frac = 0.0; // the read position's fraction between g_read and the next frame
+    // After the queue ran dry (the game paused under a host menu or in the background, a stall),
+    // play silence until it holds half the target again: resuming on a near-empty queue
+    // underran every few callbacks (crackles) while the rate matching took ~10 s to build it up.
+    constexpr size_t kPrimeFrames = static_cast<size_t>(kTargetFrames * 0.5);
+    bool g_priming = true;
 
     std::mutex g_mutex;
     std::vector<int16_t> g_ring(kCapacityFrames * 2);
@@ -44,7 +49,11 @@ namespace
         // well over (a backlog at start drains in seconds); too small a change to hear.
         const double error = (static_cast<double>(g_count) - kTargetFrames) / kTargetFrames;
         const double ratio = 1.0 + std::clamp(error * 0.004, -0.005, 0.01);
+        if (g_priming && g_count >= kPrimeFrames)
+            g_priming = false;
         size_t n = 0;
+        if (g_priming)
+            n = frames; // (silence below, not counted as an underrun)
         for (; n < frames && g_count >= 2; ++n)
         {
             const size_t next = (g_read + 1) % kCapacityFrames;
@@ -61,11 +70,14 @@ namespace
                 g_frac -= 1.0;
             }
         }
-        if (n < frames)
+        if (g_priming)
+            std::memset(out, 0, frames * 2 * sizeof(int16_t));
+        else if (n < frames)
         {
             std::memset(out + n * 2, 0, (frames - n) * 2 * sizeof(int16_t)); // underrun: silence
             g_underruns.fetch_add(1, std::memory_order_relaxed);
             g_underrunFrames.fetch_add(frames - n, std::memory_order_relaxed);
+            g_priming = g_count < 2; // ran dry: build the queue up again before playing on
         }
         static const bool stats = [] { const char *e = std::getenv("RT_AUDIO_STATS"); return e && *e == '1'; }();
         static auto windowStart = std::chrono::steady_clock::now();
@@ -121,6 +133,7 @@ void ps2AudioOutFlush()
     std::lock_guard<std::mutex> lock(g_mutex);
     g_read = g_write = g_count = 0;
     g_frac = 0.0;
+    g_priming = true;
 }
 
 void ps2AudioOutSubmit(const int16_t *interleavedStereo, size_t frames)
