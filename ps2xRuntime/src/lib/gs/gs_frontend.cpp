@@ -6,6 +6,8 @@
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -565,6 +567,9 @@ void GS::latchHostPresentationFrame(bool keepOnGpu, bool readback)
         m_framesAtLatch = m_frames3D;
         if (m_latchesWithoutHud >= 8)
             request.frame3D = (1ull << 62) + ++m_fallbackFrame3D;
+        const auto skipped = m_fbpSkipped.find(fbp);
+        request.frameSkipped = skipped != m_fbpSkipped.end() && skipped->second;
+        request.pauseShadows = m_paceLevel >= 1u;
         const auto it = m_jitterByFbp.find(fbp);
         const float *j = it != m_jitterByFbp.end() ? it->second.data() : m_snapJitter;
         std::copy(j, j + 4, m_presentJitter);
@@ -740,7 +745,16 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
             m_snapJitter[1] = m_frameJitter[1];
             m_jitterByFbp[m_lastFbp3D] = {m_snapJitter[0], m_snapJitter[1], m_snapJitter[2], m_snapJitter[3]};
             m_frame3DByFbp[m_lastFbp3D] = ++m_frames3D;
-            if (m_backend->WantsDepthSnapshot())
+            // RT_GS_TEST_LOAD_US=<n>: n µs of extra GS-thread work per drawn 3D frame (frame-skip tests).
+            static const long testLoadUs = [] { const char *e = std::getenv("RT_GS_TEST_LOAD_US"); return e ? std::atol(e) : 0L; }();
+            if (testLoadUs > 0 && !m_skipDraw)
+            {
+                const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(testLoadUs);
+                while (std::chrono::steady_clock::now() < until)
+                {
+                }
+            }
+            if (m_backend->WantsDepthSnapshot() && !m_skipDraw)
             {
                 const uint32_t fbw = m_ctx[1].frame.fbw ? m_ctx[1].frame.fbw : m_ctx[0].frame.fbw;
                 m_backend->SnapshotDepth(m_lastZbuf3D.zbp, fbw, m_lastFbp3D);
@@ -753,7 +767,7 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
     // and put on each vertex for primitive backends (GSVertex::motion).
     m_packetMotion.clear();
     ps2x::gs::MotionContext packetMotionContext;
-    const bool haveMotion = sideband && pathIndex == 0 && m_motionId &&
+    const bool haveMotion = sideband && pathIndex == 0 && m_motionId && !m_skipDraw &&
                             ps2x::gs::MotionTracker::instance().context(m_motionId, packetMotionContext);
     if (haveMotion)
     {
@@ -2009,6 +2023,17 @@ void GS::vertexKick(bool drawing)
 
     if (drawing && m_backend && m_backendWantsPrimitives)
     {
+        // Frame skip: note which buffers this frame's drawing was skipped in (latch shows the last
+        // picture for them); a skipped frame draws nothing.
+        const uint32_t fbp = m_ctx[m_prim.ctxt ? 1 : 0].frame.fbp;
+        if (fbp != m_kickFbp)
+        {
+            m_kickFbp = fbp;
+            m_fbpSkipped[fbp] = m_skipDraw;
+        }
+    }
+    if (drawing && m_backend && m_backendWantsPrimitives && !m_skipDraw)
+    {
         // The batch is a member: its draw state is rebuilt only after a state register changed.
         GSPrimitiveBatch &batch = m_drawBatch;
         if (m_drawBatchSerial != m_drawStateSerial || batch.stateSerial == 0)
@@ -2268,6 +2293,101 @@ void GS::snapshotJitter(float &curX, float &curY, float &prevX, float &prevY) co
     prevY = m_presentJitter[3];
 }
 
+// Frame skip (setFrameSkip). The game runs one frame per vblank where it keeps up; a frame that
+// starts two or more vblanks after the last one was late (the EE waited for VU1/GS or the GPU),
+// and the game's logic, which counts frames, ran slow. Level 1 pauses frame generation (its shadow
+// frames cost the presenter, the GPU and the device lock the GS thread also needs) once 2 of the
+// last 30 frames were late. Level 2, for a lasting shortfall (6 of the last 30 late, a quarter of a
+// second into level 1), skips the drawing and the VU1 runs of one 3D frame in 2, 3 or 4. Skipping only pays where VU1/GS are the
+// bottleneck: after a second of it the game's frame rate is compared with level 1's, and where it
+// didn't rise to (nearly) full speed, level 2 is barred for 10 s (then 20, 40, 60). Each level
+// holds for a while after the last late frame (1.5 s, 1 s). Steady 2-vblank frames (a scene the
+// game itself runs at 30) aren't counted, nor long stalls (loading).
+void GS::updateFramePacingUnlocked()
+{
+    const uint64_t tick = m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_acquire) : 0u;
+    const uint64_t delta = tick - m_paceTick;
+    m_paceTick = tick;
+    ++m_paceFrames;
+    const bool was3D = m_frames3D != m_paceFrames3D; // the frame that just ended had 3D (a HUD start)
+    m_paceFrames3D = m_frames3D;
+    m_paceHistory = (m_paceHistory << 1) | (delta >= 2u ? 1u : 0u);
+    const bool steady30 = (m_paceHistory & 0xFFu) == 0xFFu;
+    const bool canSkip = m_backendWantsPrimitives && !m_packetMirror; // a mirror needs every packet
+    const bool on = m_frameSkipOn.load(std::memory_order_relaxed);
+    const bool late = on && was3D && delta >= 2u && delta < 30u && !steady30;
+    auto enter = [&](uint32_t level) {
+        m_paceLevel = level;
+        m_paceSince = tick;
+        m_paceFramesSince = m_paceFrames;
+        m_paceJudged = false;
+    };
+    // Game frames per vblank since this level began.
+    auto rate = [&] { return tick > m_paceSince ? double(m_paceFrames - m_paceFramesSince) / double(tick - m_paceSince) : 1.0; };
+    if (!on)
+        enter(0u);
+    else if (late)
+    {
+        // Level 1 for repeated misses (2 of the last 30 frames), not a single slow frame.
+        if (m_paceLevel == 0u && __builtin_popcount(m_paceHistory & 0x3FFFFFFFu) >= 2)
+            enter(1u);
+        // Level 2 only for a lasting shortfall: 6 of the last 30 frames late (not a single hitch).
+        else if (m_paceLevel == 1u && canSkip && tick - m_paceSince >= 15u && tick >= m_noSkipUntil &&
+                 __builtin_popcount(m_paceHistory & 0x3FFFFFFFu) >= 6)
+        {
+            m_paceRate1 = rate();
+            enter(2u);
+            m_paceCalmSince = tick;
+        }
+        m_paceLastLate = tick;
+    }
+    else if ((m_paceLevel == 2u && tick - m_paceLastLate > 90u) || (m_paceLevel == 1u && tick - m_paceLastLate > 60u))
+    {
+        if (m_paceLevel == 1u)
+            m_noSkipBackoff = 0u; // caught up: skipping may be tried at once next time
+        enter(m_paceLevel - 1u);
+        m_paceLastLate = tick; // the level below holds its time too
+    }
+    if (m_paceLevel == 2u && !m_paceJudged && tick - m_paceSince >= 60u)
+    {
+        m_paceJudged = true;
+        const double rate2 = rate();
+        if (rate2 < 0.95 && rate2 < m_paceRate1 + 0.08)
+        {
+            m_noSkipBackoff = std::min<uint32_t>(m_noSkipBackoff ? m_noSkipBackoff * 2u : 600u, 3600u);
+            m_noSkipUntil = tick + m_noSkipBackoff;
+            enter(1u);
+            m_paceLastLate = tick;
+        }
+        else
+            m_noSkipBackoff = 0u;
+    }
+    // At level 2 one 3D frame in m_skipPeriod is skipped: every other one at first; a second without
+    // a late frame for 2 s skips fewer (one in 3, then 4), a late one more again.
+    // A period that failed within a second of trying isn't tried again for 10 s.
+    if (m_paceLevel != 2u)
+        m_skipPeriod = 2u, m_skipCounter = 0u, m_periodTriedAt = 0u, m_periodBarUntil = 0u;
+    else if (late)
+    {
+        if (m_skipPeriod > 2u)
+        {
+            --m_skipPeriod;
+            if (tick - m_periodTriedAt < 60u)
+                m_periodBarUntil = tick + 600u;
+        }
+        m_paceCalmSince = tick;
+    }
+    else if (tick - m_paceCalmSince >= 120u && m_skipPeriod < 4u && tick >= m_periodBarUntil)
+        ++m_skipPeriod, m_paceCalmSince = m_periodTriedAt = tick;
+    m_skipDraw = m_paceLevel == 2u && was3D && !m_skippedLast && ++m_skipCounter % m_skipPeriod == 0u;
+    m_skippedLast = m_skipDraw;
+    m_skipFrame.store(m_skipDraw, std::memory_order_release);
+    m_kickFbp = ~0u;
+    if (m_skipDraw)
+        m_framesSkipped.fetch_add(1, std::memory_order_relaxed);
+    m_paceLevelOut.store(m_paceLevel, std::memory_order_relaxed);
+}
+
 void GS::markFrameStart()
 {
     m_frameIndex.fetch_add(1, std::memory_order_relaxed);
@@ -2289,5 +2409,6 @@ void GS::markFrameStart()
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_wide.frameStart();
     publishWideUnlocked();
+    updateFramePacingUnlocked();
 
 }

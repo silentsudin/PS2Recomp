@@ -877,7 +877,10 @@ namespace ps2x::gs
                     m_motionOn = m_shared && m_shared->wantMotion.load(std::memory_order_relaxed);
                     // Shadow frames start from empty buffers: published once the game has drawn
                     // every buffer again.
-                    const uint32_t shadows = m_shared ? std::min(m_shared->wantShadows.load(std::memory_order_relaxed), kMaxShadows) : 0u;
+                    // Frame skip: while the game is behind, no shadows (they start over afterwards).
+                    const uint32_t shadows = m_shared && !request.pauseShadows
+                                                 ? std::min(m_shared->wantShadows.load(std::memory_order_relaxed), kMaxShadows)
+                                                 : 0u;
                     if (shadows != m_shadows)
                     {
                         m_shadows = shadows;
@@ -893,7 +896,8 @@ namespace ps2x::gs
                                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
                     record(*cmd, batches, vertices);
-                    const Vulkan::Image *scan = scanout(*cmd, request);
+                    // A frame whose drawing was skipped: the last picture stays (no new scanout).
+                    const Vulkan::Image *scan = request.frameSkipped ? nullptr : scanout(*cmd, request);
                     noteMapPresent();
                     if (scan && m_shared && m_shared->wantUi.load(std::memory_order_relaxed))
                         drawUiMask(*cmd);

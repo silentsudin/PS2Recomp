@@ -587,8 +587,9 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      // Test runs can skip rendering (VU1 microprograms and the
-                                     // drawing they send to the GS) while no picture is needed.
-                                     if (!ps2_test::renderingEnabled())
+                                     // drawing they send to the GS) while no picture is needed,
+                                     // and frame skip (GS::setFrameSkip) a frame it doesn't draw.
+                                     if (!ps2_test::renderingEnabled() || m_gs.skippingFrame())
                                          return;
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
@@ -676,7 +677,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     if (!ps2_test::renderingEnabled())
+                                     if (!ps2_test::renderingEnabled() || m_gs.skippingFrame())
                                          return;
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)

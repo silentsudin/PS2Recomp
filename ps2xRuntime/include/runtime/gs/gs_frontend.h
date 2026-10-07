@@ -124,6 +124,16 @@ public:
     void setWideLayout(float aspect, ps2x::gs::HudPlacement placement);
     // The game started drawing a frame (its clear, sceGsClear-style, from the GS stubs).
     void markFrameStart();
+    // Frame skip (Options > Frame skip, primitive backends): when the game falls behind real time
+    // (its frames start two or more vblanks apart), frame generation pauses first; if it is still
+    // behind, the drawing of every other frame is skipped (the game, VU1 and the GIF stream still
+    // run every frame; the picture on display stays the last one drawn). Off: the game slows.
+    void setFrameSkip(bool on) { m_frameSkipOn.store(on, std::memory_order_relaxed); }
+    // 0 keeping up, 1 frame generation paused, 2 skipping frames; frames skipped so far.
+    uint32_t frameSkipLevel() const { return m_paceLevelOut.load(std::memory_order_relaxed); }
+    uint64_t framesSkipped() const { return m_framesSkipped.load(std::memory_order_relaxed); }
+    // This frame's drawing is skipped: its VU1 microprograms needn't run either (VIF1 worker).
+    bool skippingFrame() const { return m_skipFrame.load(std::memory_order_acquire); }
 
     // Progressive fields: the game draws 224-line fields, nudged half a line down on every other
     // one (sceGsSetHalfOffset) for an interlaced TV. With this on, the game hook drops the nudge
@@ -269,6 +279,23 @@ private:
     std::map<uint32_t, std::array<float, 4>> m_jitterByFbp;
     float m_presentJitter[4] = {};
     uint32_t m_lastFbp3D = 0;
+    // Frame skip (setFrameSkip; decided at each frame start on the EE thread, under m_stateMutex).
+    std::atomic<bool> m_frameSkipOn{false};
+    bool m_skipDraw = false;            // this frame's drawing is skipped
+    bool m_skippedLast = false;
+    uint64_t m_paceTick = 0, m_paceFrames3D = 0, m_paceSince = 0, m_paceLastLate = 0;
+    uint64_t m_paceFrames = 0, m_paceFramesSince = 0, m_noSkipUntil = 0, m_paceCalmSince = 0;
+    uint32_t m_skipPeriod = 2, m_skipCounter = 0; // level 2 skips one 3D frame in m_skipPeriod
+    uint64_t m_periodTriedAt = 0, m_periodBarUntil = 0;
+    uint32_t m_paceLevel = 0, m_paceHistory = 0, m_noSkipBackoff = 0;
+    double m_paceRate1 = 0.0; // game frames per vblank at level 1 (before skipping)
+    bool m_paceJudged = false;
+    uint32_t m_kickFbp = ~0u;            // the frame buffer the last draw went to
+    std::map<uint32_t, bool> m_fbpSkipped; // per frame buffer: its last frame was skipped
+    std::atomic<uint32_t> m_paceLevelOut{0};
+    std::atomic<bool> m_skipFrame{false};
+    std::atomic<uint64_t> m_framesSkipped{0};
+    void updateFramePacingUnlocked();
     std::atomic<float> m_wideK{1.0f};
     void publishWideUnlocked();
     std::vector<uint8_t> m_wideScratch;    // the packet being transformed

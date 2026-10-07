@@ -24,17 +24,16 @@ namespace
     // the Thor) otherwise grows the queue until the cap drops frames, which crackles.
     constexpr double kTargetFrames = kSampleRate * 0.05;
     double g_frac = 0.0; // the read position's fraction between g_read and the next frame
-    // When the game can't keep up (heavy settings, frame generation at 120 Hz, the course
-    // carousel), guest time falls behind: slow frames, and each vblank resync drops ~34 ms of it
-    // (EeScheduler::resyncHostDeadlines). The SPU2 then makes less than real time (several resyncs a
-    // second on the Thor at 120 Hz), and the queue underran every second or two (crackles, then
-    // priming silence). Playback slows to match instead, up to 12% (a little lower pitch while the
-    // game is slow): a proportional term, a stronger one below 3/4 of the target, and an integral
-    // trim (slowing only) that learns a lasting shortfall so the queue stays near the target and
-    // still has room for a hitch. The control reads the queue smoothed over ~0.1 s: the SPU2
-    // delivers in bursts (the idle part of a frame arrives at its vblank), and the raw level would
-    // wobble the rate 60 times a second.
-    constexpr double kSlowKnee = 0.25, kSlowGain = 0.3, kMaxSlow = 0.12, kTrimGain = 0.05;
+    // When guest time falls behind the host (a stall of the EE over two vblanks makes
+    // EeScheduler::resyncHostDeadlines drop that time), the SPU2 makes less than real time and the
+    // queue runs low. Frame skip (GS::setFrameSkip) keeps the game on real time where the device
+    // can't keep up, and with the MotionTracker lock gone the Thor no longer stalls at 120 Hz, so
+    // this is only drift correction: playback slows by at most 2% (inaudible) when the queue stays
+    // short, through a proportional term below 3/4 of the target and an integral trim (slowing
+    // only). The control reads the queue smoothed over ~0.1 s: the SPU2 delivers in bursts (the
+    // idle part of a frame arrives at its vblank), and the raw level would wobble the rate 60 times
+    // a second. (Before frame skip it slowed up to 12%: a lower pitch while the game was slow.)
+    constexpr double kSlowKnee = 0.25, kSlowGain = 0.3, kMaxSlow = 0.02, kTrimGain = 0.05;
     double g_level = kTargetFrames; // the queue, smoothed (frames)
     double g_trim = 0.0;            // the integral term (<= 0)
     // After the queue ran dry (the game paused under a host menu or in the background, a stall),

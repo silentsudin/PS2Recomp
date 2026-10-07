@@ -213,10 +213,9 @@ namespace ps2x::gs
         }
         if (!invert(ctx.cur, ctx.curInv))
             return 0;
-        const uint32_t id = m_nextId++;
-        if (m_nextId == 0)
-            m_nextId = 1;
+        const uint32_t id = m_nextId.load(std::memory_order_relaxed);
         m_ring[id % kRing] = ctx;
+        m_nextId.store(id + 1 == 0 ? 1 : id + 1, std::memory_order_release);
         return id;
     }
 
@@ -232,6 +231,15 @@ namespace ps2x::gs
         if (!enabled())
             return;
         std::lock_guard<std::mutex> lock(m_mutex);
+        // A frame without objects (its VU1 runs skipped: frame skip) keeps the last frame's, so
+        // the next frame still finds its objects' previous positions.
+        if (m_cur[0].empty() && m_cur[1].empty() && m_cur[2].empty())
+        {
+            m_haveActive = false;
+            m_lastStats = m_stats;
+            m_stats = {};
+            return;
+        }
         for (int k = 0; k < 3; ++k)
         {
             m_prev[k].swap(m_cur[k]);
@@ -244,11 +252,13 @@ namespace ps2x::gs
 
     bool MotionTracker::context(uint32_t id, MotionContext &out) const
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (id == 0 || m_nextId - id >= kRing)
+        // Lock-free (see m_nextId): an id is asked for after onMscal published it, and an entry
+        // the producer may have reached while it was copied (a ring later) is refused.
+        if (id == 0 || m_nextId.load(std::memory_order_acquire) - id >= kRing)
             return false;
         out = m_ring[id % kRing];
-        return true;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return m_nextId.load(std::memory_order_relaxed) - id < kRing - 1024;
     }
 
     MotionTracker::Stats MotionTracker::lastFrameStats() const

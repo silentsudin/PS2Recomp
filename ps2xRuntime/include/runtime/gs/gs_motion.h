@@ -107,7 +107,10 @@ namespace ps2x::gs
         // Contexts by id (a ring; ids start at 1).
         static constexpr uint32_t kRing = 1u << 14;
         std::vector<MotionContext> m_ring = std::vector<MotionContext>(kRing);
-        uint32_t m_nextId = 1;
+        // Written by the VU1 thread under m_mutex; context() reads the ring without the lock (the
+        // GS thread asks once per PATH1 packet, and waiting behind onMscal's matching cost it
+        // ~40% of its time on the Thor): the entry is published by the release store of m_nextId.
+        std::atomic<uint32_t> m_nextId{1};
         float m_cameraJitter[2] = {};
         Stats m_stats{}, m_lastStats{};
     };

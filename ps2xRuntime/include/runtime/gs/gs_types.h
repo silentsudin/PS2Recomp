@@ -311,6 +311,10 @@ struct GSPresentationRequest
     // begins; 0 = none yet): the same number = the same picture, a step of more than 1 = the
     // presenter missed pictures (the motion covers one frame).
     uint64_t frame3D = 0;
+    // Frame skip (GS::setFrameSkip): the buffer on display holds a frame whose drawing was skipped
+    // (show the last picture again), and generated frames pause while the game is behind.
+    bool frameSkipped = false;
+    bool pauseShadows = false;
 };
 
 struct PresentationFrame
