@@ -34,6 +34,11 @@ public:
     bool SerializeState(ps2x::StateArchive &ar) override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    // The CLUT as SerializeState writes it: a backend that keeps its own (the hardware GS) puts
+    // it here before saving and takes it back after loading.
+    void SetClutState(const std::array<uint16_t, 512> &clut, const std::array<uint32_t, 2> &cbp);
+    void GetClutState(std::array<uint16_t, 512> &clut, std::array<uint32_t, 2> &cbp) const;
+
 private:
     void ResetUnlocked();
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);

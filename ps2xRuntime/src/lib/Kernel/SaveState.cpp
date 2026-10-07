@@ -366,6 +366,7 @@ bool GS::serializeState(StateArchive &ar)
     if (ar.saving() && kind != 0u)
     {
         StateArchive x = StateArchive::writer(extras);
+        x.setDigest(ar.digest());
         x.begin(kind);
         m_backend->SerializeStateExtras(x);
         x.end();
@@ -521,6 +522,7 @@ namespace ps2_save_state
         void serializeAll(PS2Runtime &rt, StateArchive &ar, bool hashOnly, const std::set<uint32_t> &skip, std::string *skipped)
         {
             PS2Memory &mem = rt.memory();
+            ar.setDigest(hashOnly);
             const auto chunk = [&](uint32_t id, auto &&fn)
             {
                 if (!ar.ok())
@@ -628,6 +630,8 @@ namespace ps2_save_state
                 return "cpu";
             if (kind == fourcc("PGS1"))
                 return "pgs";
+            if (kind == fourcc("HWG1"))
+                return "hw";
             return "other";
         }
 
@@ -829,6 +833,17 @@ namespace ps2_save_state
         g_savePath.clear();
         g_pendingLoad = PendingLoad{};
         detail::g_request.store(0, std::memory_order_relaxed);
+    }
+
+    std::string pendingBlockers(uint64_t *loopTops)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (loopTops)
+            *loopTops = g_loopTops;
+        std::string out;
+        for (const auto &b : g_blockers)
+            out += (out.empty() ? "" : ",") + b;
+        return out;
     }
 
     Result lastResult()

@@ -728,6 +728,20 @@ bool GSCpuBackend::SerializeState(ps2x::StateArchive &ar)
     return true;
 }
 
+void GSCpuBackend::SetClutState(const std::array<uint16_t, 512> &clut, const std::array<uint32_t, 2> &cbp)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_clut = clut;
+    m_clutCbp = cbp;
+}
+
+void GSCpuBackend::GetClutState(std::array<uint16_t, 512> &clut, std::array<uint32_t, 2> &cbp) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    clut = m_clut;
+    cbp = m_clutCbp;
+}
+
 GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);

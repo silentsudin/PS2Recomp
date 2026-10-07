@@ -114,6 +114,9 @@ namespace ps2_save_state
         std::string path;     // file saves/loads
     };
     Result lastResult();
+    // Any thread: why the request still waiting was refused so far (lastResult() is the previous
+    // request's until it is served), and how many loop tops it has seen.
+    std::string pendingBlockers(uint64_t *loopTops = nullptr);
 
     struct WriteResult
     {

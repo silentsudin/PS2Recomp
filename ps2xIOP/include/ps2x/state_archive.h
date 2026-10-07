@@ -119,6 +119,10 @@ namespace ps2x
         [[nodiscard]] bool saving() const noexcept { return m_out != nullptr; }
         [[nodiscard]] bool loading() const noexcept { return m_in != nullptr; }
         [[nodiscard]] bool ok() const noexcept { return m_error.empty(); }
+        // A digest (hashes for comparing machines, never loaded): host-side copies that only make a
+        // load look right (a GPU GS's render targets) are left out of it.
+        void setDigest(bool on) noexcept { m_digest = on; }
+        [[nodiscard]] bool digest() const noexcept { return m_digest; }
         [[nodiscard]] const std::string &error() const noexcept { return m_error; }
         [[nodiscard]] const std::vector<Chunk> &chunks() const noexcept { return m_chunks; }
 
@@ -514,6 +518,7 @@ namespace ps2x
         std::vector<Chunk> m_chunks;
         std::vector<IndexEntry> m_index;
         bool m_chunkOpen = false;
+        bool m_digest = false;
         uint32_t m_chunkId = 0;
         size_t m_chunkStart = 0, m_chunkEnd = 0, m_sizeAt = 0;
         uint32_t m_orderMismatches = 0;

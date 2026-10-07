@@ -21,6 +21,7 @@
 #include "../post/post_spirv.h"
 #include "hw_spirv.h"
 #include "gs_hw_textures.h"
+#include "ps2x/state_archive.h"
 
 #include "context.hpp"
 #include "command_buffer.hpp"
@@ -848,6 +849,270 @@ namespace ps2x::gs
             }
             void SnapshotVram(std::vector<uint8_t> &out) const override { m_cpu.SnapshotVram(out); }
             GSTransferSnapshot GetTransferSnapshot() const override { return m_cpu.GetTransferSnapshot(); }
+
+            // Save states (EE thread at a savable loop top, the frontend's state lock held: the GS
+            // thread is between packets). The shared part is what the CPU GS saves: local memory as
+            // the game wrote it (uploads and local copies: the render targets live on the GPU and
+            // never reach it, so it is the same bytes on every GPU and in every run), this backend's
+            // CLUT and the transfer state. The extra part (this backend only) is the texture tools'
+            // upload extents and the render targets and Z buffers as drawn (raw, at the render
+            // scale): Road Trip blends some of its picture with what the buffer held, so a load that
+            // started from empty targets would stay a level off here and there for good. A digest
+            // (state hashes) leaves the targets out. A state from another GS loads with empty
+            // targets (the game's next frames redraw them); one taken at another render scale is
+            // scaled to this one (its Z buffers start empty).
+            bool SerializeState(ps2x::StateArchive &ar) override
+            {
+                if (ar.saving())
+                    m_cpu.SetClutState(m_clut, m_clutCbp);
+                if (!m_cpu.SerializeState(ar))
+                    return false;
+                if (ar.loading())
+                    m_cpu.GetClutState(m_clut, m_clutCbp);
+                return ar.ok();
+            }
+
+            uint32_t StateExtrasKind() const override { return ps2x::fourcc("HWG1"); }
+
+            struct SavedImage
+            {
+                uint32_t key = 0, fbw = 0, psm = 0, width = 0, height = 0; // FBP/ZBP, GS size
+                uint32_t sx = 1, sy = 1, w = 0, h = 0;                       // render scale, image size
+                std::vector<uint8_t> bytes;                                 // RGBA8 or D32F texels
+            };
+
+            void SerializeStateExtras(ps2x::StateArchive &ar) override
+            {
+                ar.keyOrderedMap(m_uploads, [](ps2x::StateArchive &a, uint32_t &k) { a & k; },
+                                 [](ps2x::StateArchive &a, UploadExtent &e) { a & e.psm & e.width & e.height; });
+                std::vector<SavedImage> targets, depths;
+                if (ar.saving() && !ar.digest())
+                    readTargets(targets, depths);
+                const auto image = [](ps2x::StateArchive &a, SavedImage &i)
+                {
+                    a & i.key & i.fbw & i.psm & i.width & i.height & i.sx & i.sy & i.w & i.h;
+                    a.podVector(i.bytes);
+                    if (a.loading() && i.bytes.size() != static_cast<size_t>(i.w) * i.h * 4u)
+                        a.fail("hardware GS: a render target's size doesn't match its pixels");
+                };
+                ar.sequence(targets, image);
+                ar.sequence(depths, image);
+                if (ar.loading())
+                {
+                    m_loadedTargets = std::move(targets);
+                    m_loadedDepths = std::move(depths);
+                }
+            }
+
+            // Saving: the real frame's render targets and Z buffers with everything drawn so far
+            // (what the GS thread has queued is recorded first).
+            void readTargets(std::vector<SavedImage> &targets, std::vector<SavedImage> &depths)
+            {
+                publish(true);
+                flushPending();
+                std::vector<std::pair<SavedImage *, Vulkan::BufferHandle>> jobs;
+                Vulkan::Fence fence;
+                {
+                    const auto device = lockDevice();
+                    std::vector<uint32_t> keys, zkeys;
+                    for (const auto &[fbp, t] : m_main.targets)
+                        if (t.color)
+                            keys.push_back(fbp);
+                    for (const auto &[zbp, d] : m_main.depths)
+                        if (d)
+                            zkeys.push_back(zbp);
+                    std::sort(keys.begin(), keys.end());
+                    std::sort(zkeys.begin(), zkeys.end());
+                    targets.resize(keys.size());
+                    depths.resize(zkeys.size());
+                    auto cmd = m_dev->request_command_buffer();
+                    const auto copy = [&](SavedImage &out, const Vulkan::Image &img, bool depth)
+                    {
+                        out.w = img.get_width();
+                        out.h = img.get_height();
+                        Vulkan::BufferCreateInfo info = {};
+                        info.size = static_cast<VkDeviceSize>(out.w) * out.h * 4u;
+                        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                        info.domain = Vulkan::BufferDomain::CachedHost;
+                        auto buffer = m_dev->create_buffer(info);
+                        const VkPipelineStageFlags2 stages =
+                            depth ? (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)
+                                  : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                        const VkAccessFlags2 access =
+                            depth ? (VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+                                  : (VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                        cmd->image_barrier(img, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stages, access,
+                                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+                        cmd->copy_image_to_buffer(*buffer, img, 0, {}, {out.w, out.h, 1}, 0, 0,
+                                                  {static_cast<VkImageAspectFlags>(depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1});
+                        cmd->image_barrier(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+                                           VK_PIPELINE_STAGE_2_COPY_BIT, 0, stages, access);
+                        jobs.emplace_back(&out, std::move(buffer));
+                    };
+                    for (size_t i = 0; i < keys.size(); ++i)
+                    {
+                        const Target &t = m_main.targets[keys[i]];
+                        SavedImage &out = targets[i];
+                        out.key = keys[i];
+                        out.fbw = t.fbw, out.psm = t.psm, out.width = t.width, out.height = t.height, out.sx = t.sx, out.sy = t.sy;
+                        copy(out, *t.color, false);
+                    }
+                    for (size_t i = 0; i < zkeys.size(); ++i)
+                    {
+                        const Vulkan::Image &d = *m_main.depths[zkeys[i]];
+                        SavedImage &out = depths[i];
+                        out.key = zkeys[i];
+                        // The scale it was drawn at: that of a target its size.
+                        for (const SavedImage &t : targets)
+                            if (t.w == d.get_width() && t.h == d.get_height())
+                                out.sx = t.sx, out.sy = t.sy, out.width = t.width, out.height = t.height;
+                        copy(out, d, true);
+                    }
+                    cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
+                                 VK_ACCESS_2_HOST_READ_BIT);
+                    m_dev->submit(cmd, &fence);
+                }
+                fence->wait();
+                const auto device = lockDevice();
+                for (auto &[out, buffer] : jobs)
+                {
+                    const auto *src = static_cast<const uint8_t *>(m_dev->map_host_buffer(*buffer, Vulkan::MEMORY_ACCESS_READ_BIT));
+                    out->bytes.assign(src, src + static_cast<size_t>(out->w) * out->h * 4u);
+                    m_dev->unmap_host_buffer(*buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
+                }
+            }
+
+            // Loading (device lock held, the targets just dropped): the saved targets back, at this
+            // render scale; Z buffers only when the scale is the same.
+            void restoreTargets()
+            {
+                if (m_loadedTargets.empty() && m_loadedDepths.empty())
+                    return;
+                const uint32_t sx = m_scale, sy = m_scale * m_yScale;
+                auto cmd = m_dev->request_command_buffer();
+                const auto staging = [&](const SavedImage &s)
+                {
+                    Vulkan::BufferCreateInfo info = {};
+                    info.size = s.bytes.size();
+                    info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                    info.domain = Vulkan::BufferDomain::Host;
+                    return m_dev->create_buffer(info, s.bytes.data());
+                };
+                for (const SavedImage &s : m_loadedTargets)
+                {
+                    if (!s.w || !s.h || !s.width || !s.height)
+                        continue;
+                    const uint32_t w = s.width * sx, h = s.height * sy;
+                    auto info = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
+                    info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    auto image = m_dev->create_image(info);
+                    auto buffer = staging(s);
+                    cmd->image_barrier(*image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, 0,
+                                       VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                    if (s.w == w && s.h == h)
+                        cmd->copy_buffer_to_image(*image, *buffer, 0, {}, {w, h, 1}, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
+                    else
+                    {
+                        // Saved at another render scale: scaled to this one.
+                        auto tmpInfo = Vulkan::ImageCreateInfo::render_target(s.w, s.h, VK_FORMAT_R8G8B8A8_UNORM);
+                        tmpInfo.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                        auto tmp = m_dev->create_image(tmpInfo);
+                        cmd->image_barrier(*tmp, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, 0,
+                                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                        cmd->copy_buffer_to_image(*tmp, *buffer, 0, {}, {s.w, s.h, 1}, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
+                        cmd->image_barrier(*tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT,
+                                           VK_ACCESS_2_TRANSFER_READ_BIT);
+                        cmd->blit_image(*image, *tmp, {0, 0, 0}, {static_cast<int32_t>(w), static_cast<int32_t>(h), 1}, {0, 0, 0},
+                                        {static_cast<int32_t>(s.w), static_cast<int32_t>(s.h), 1}, 0, 0, 0, 0, 1, VK_FILTER_LINEAR);
+                    }
+                    cmd->image_barrier(*image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+                                       VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                       VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                    Target &t = m_main.targets[s.key];
+                    t.color = image;
+                    t.fbp = s.key;
+                    t.fbw = s.fbw;
+                    t.psm = s.psm;
+                    t.width = s.width;
+                    t.height = s.height;
+                    t.sx = sx;
+                    t.sy = sy;
+                    ++t.drawSerial;
+                    std::lock_guard<std::mutex> lock(m_targetPagesMutex);
+                    uint32_t first, last;
+                    pageRange(s.key * 32u, s.fbw, GS_PSM_CT32, 0, 0, s.width, s.height, first, last);
+                    m_targetPages[s.key] = {first, last, s.fbw};
+                }
+                for (const SavedImage &s : m_loadedDepths)
+                {
+                    if (!s.w || !s.h || s.sx != sx || s.sy != sy)
+                        continue;
+                    auto info = Vulkan::ImageCreateInfo::render_target(s.w, s.h, VK_FORMAT_D32_SFLOAT);
+                    info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    auto image = m_dev->create_image(info);
+                    auto buffer = staging(s);
+                    cmd->image_barrier(*image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, 0,
+                                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                    cmd->copy_buffer_to_image(*image, *buffer, 0, {}, {s.w, s.h, 1}, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1});
+                    cmd->image_barrier(*image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+                                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+                    m_main.depths[s.key] = image;
+                }
+                m_dev->submit(cmd);
+                m_loadedTargets.clear();
+                m_loadedDepths.clear();
+            }
+
+            void StateLoaded(bool extras) override
+            {
+                if (!extras)
+                {
+                    m_uploads.clear();
+                    m_loadedTargets.clear();
+                    m_loadedDepths.clear();
+                }
+                m_upload = {};
+                m_lastClutSource = 0;
+                m_pageCache.Invalidate();
+                m_haveCurrent = false;
+                {
+                    const auto device = lockDevice();
+                    {
+                        // What the GS thread had queued belongs to the timeline left behind.
+                        std::lock_guard<std::mutex> lock(m_frameMutex);
+                        m_batches.clear();
+                        m_vertices.clear();
+                        m_stage.clear();
+                        m_uiStage.clear();
+                        m_uiVerts.clear();
+                        m_open = false;
+                        for (auto &v : m_pageVersion) // every decoded texture is decoded again
+                            ++v;
+                    }
+                    m_recordBatches.clear();
+                    m_recordVertices.clear();
+                    m_shadowBatches.clear();
+                    m_shadowBatchVerts.clear();
+                    m_shadowWarm = 0;
+                    m_depthRequested = false;
+                    // The render targets and Z buffers: the state's (restoreTargets), else empty.
+                    m_main = TargetSet{};
+                    for (TargetSet &s : m_shadowSets)
+                        s = TargetSet{};
+                    {
+                        std::lock_guard<std::mutex> lock(m_targetPagesMutex);
+                        m_targetPages.clear();
+                    }
+                    restoreTargets();
+                }
+                ++m_epoch;
+            }
 
             PresentationFrame Present(const GSPresentationRequest &request) override
             {
@@ -2742,6 +3007,7 @@ namespace ps2x::gs
             }()};
 
             GSCpuBackend m_cpu; // transfers and readbacks over the shared local memory
+            std::vector<SavedImage> m_loadedTargets, m_loadedDepths; // a state's targets, until StateLoaded
             uint8_t *m_vram = nullptr;
             uint32_t m_vramSize = 0;
             GSMem::TexturePageCache m_pageCache;
