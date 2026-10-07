@@ -724,6 +724,7 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
         ps2x::gs::WideLayout::PrimState st;
         st.type = static_cast<uint32_t>(m_prim.type);
         st.tme = m_prim.tme;
+        st.abe = m_prim.abe;
         st.ctxt = m_prim.ctxt;
         for (int c = 0; c < 2; ++c)
         {
@@ -2021,6 +2022,14 @@ void GS::vertexKick(bool drawing)
     if (m_vtxCount < needed)
         return;
 
+    if (drawing)
+    {
+        // The frame buffer keeps the verdict of the frame drawing into it (lastFrameWas2D).
+        const uint8_t verdict = m_wide.lastFrameWas2D() ? 2u : 1u;
+        std::atomic<uint8_t> &slot = m_wide2DByFbp[m_ctx[m_prim.ctxt ? 1 : 0].frame.fbp & 0x1FFu];
+        if (slot.load(std::memory_order_relaxed) != verdict)
+            slot.store(verdict, std::memory_order_relaxed);
+    }
     if (drawing && m_backend && m_backendWantsPrimitives)
     {
         // Frame skip: note which buffers this frame's drawing was skipped in (latch shows the last
@@ -2224,7 +2233,19 @@ void GS::setWideLayout(float aspect, ps2x::gs::HudPlacement placement)
     publishWideUnlocked();
 }
 
-bool GS::lastFrameWas2D() const { return m_wide2D.load(std::memory_order_relaxed); }
+bool GS::lastFrameWas2D() const
+{
+    // The buffer on display (read circuit as the backends pick it), without the state lock.
+    if (m_privRegs)
+    {
+        const uint64_t pmode = m_privRegs->pmode;
+        const bool en1 = pmode & 1u, en2 = (pmode >> 1) & 1u;
+        const uint32_t fbp = static_cast<uint32_t>((en1 || !en2 ? m_privRegs->dispfb1 : m_privRegs->dispfb2) & 0x1FFu);
+        if (const uint8_t verdict = m_wide2DByFbp[fbp].load(std::memory_order_relaxed))
+            return verdict == 2u;
+    }
+    return m_wide2D.load(std::memory_order_relaxed);
+}
 
 bool GS::wideDriving() const { return m_wideDriving.load(std::memory_order_relaxed); }
 

@@ -18,8 +18,10 @@
 //  - 2D-backed frames (title, menus, shops): nothing is changed; the presenter shows them 4:3
 //    (pillarboxed) instead (lastFrameWas2D). A frame whose first draw is a full-screen 2D picture
 //    (a texture outside the frame buffers) is 2D-backed from that draw on, so a new screen is
-//    never shown stretched; a frame whose first draw is 3D is a driving one at once. Other
-//    2D-first frames vote, with hysteresis.
+//    never shown stretched; a frame whose first draw is 3D is a driving one at once. A frame
+//    whose first draw is a blended full-screen fill (the fade to "Now loading" over the last
+//    picture) keeps the verdict it has. Other 2D-first frames vote, with hysteresis.
+//    RT_WIDE_DEBUG=1 logs verdict changes, =2 also each frame's first draw.
 //
 // See the HUD spike in the recomp's plan for the evidence behind these rules. Not thread-safe: it
 // runs inside the GS frontend's packet processing (under its state lock).
@@ -47,6 +49,7 @@ namespace ps2x::gs
         {
             uint32_t type = 0; // GS PRIM.PRIM (0 point .. 6 sprite)
             bool tme = false;
+            bool abe = false; // alpha blending (a fill that fades what is there)
             bool ctxt = false;
             uint32_t ofx[2] = {0, 0}; // XYOFFSET_1/2 OFX and OFY (12.4 fixed point)
             uint32_t ofy[2] = {0, 0};

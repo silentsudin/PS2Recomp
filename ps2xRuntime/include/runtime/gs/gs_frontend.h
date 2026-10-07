@@ -149,7 +149,10 @@ public:
     bool cameraJitter(float &x, float &y) const;
     // The jitter of the frame whose depth/motion were last kept, and of the one before.
     void snapshotJitter(float &curX, float &curY, float &prevX, float &prevY) const;
-    // The last frame was a 2D-backed screen (title, menus): show it 4:3 even when widescreen is on.
+    // The frame on display (DISPFB) is a 2D-backed screen (title, menus): show it 4:3 even when
+    // widescreen is on. Each frame buffer keeps the verdict of the frame drawn into it: the next
+    // frame's first draw (which decides its verdict) often comes before the presenter latches
+    // the one on display, which at a change of screen showed that one 4:3 or stretched.
     bool lastFrameWas2D() const;
     // Widescreen is on and the game is driving (the 3D camera should be widened).
     bool wideDriving() const;
@@ -266,6 +269,8 @@ private:
     // m_wide's answers for other threads without the state lock (the game's camera hook asks on
     // every camera build): published after each change, under the lock.
     std::atomic<bool> m_wideDriving{false}, m_wide2D{false};
+    // Per frame buffer (FBP): the verdict of the frame last drawn into it (0 none, 1 wide, 2 4:3).
+    std::array<std::atomic<uint8_t>, 512> m_wide2DByFbp{};
     std::atomic<bool> m_jitterOn{false};
     std::atomic<bool> m_progressiveFields{false};
     std::vector<uint8_t> m_shadowScratch[3]; // re-projected PATH1 packets for shadow frames

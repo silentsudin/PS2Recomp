@@ -48,13 +48,14 @@ namespace ps2x::gs
         {
             st.type = static_cast<uint32_t>(prim & 7u);
             st.tme = ((prim >> 4) & 1u) != 0;
+            st.abe = ((prim >> 6) & 1u) != 0;
             st.ctxt = ((prim >> 9) & 1u) != 0;
         }
     }
 
     void WideLayout::setVerdict(bool is2D)
     {
-        static const bool debug = [] { const char *e = std::getenv("RT_WIDE_DEBUG"); return e && *e == '1'; }();
+        static const bool debug = [] { const char *e = std::getenv("RT_WIDE_DEBUG"); return e && *e >= '1'; }();
         if (debug && is2D != m_lastFrame2D)
             std::fprintf(stderr, "[wide] %s\n", is2D ? "2D-backed: shown 4:3" : "driving: shown wide");
         m_lastFrame2D = is2D;
@@ -80,7 +81,7 @@ namespace ps2x::gs
 
     void WideLayout::frameStart()
     {
-        static const bool debug = [] { const char *e = std::getenv("RT_WIDE_DEBUG"); return e && *e == '1'; }();
+        static const bool debug = [] { const char *e = std::getenv("RT_WIDE_DEBUG"); return e && *e >= '1'; }();
         if (debug && m_mode != Mode::Unknown && (m_mode == Mode::Screen2D) != m_lastFrame2D)
             std::fprintf(stderr, "[wide] a %s frame shown %s\n", m_mode == Mode::Screen2D ? "2D-first" : "3D-first",
                          m_lastFrame2D ? "4:3" : "wide");
@@ -163,12 +164,26 @@ namespace ps2x::gs
             // which proves nothing. Other 2D-first frames only vote (votes are counted at the
             // next clear, so m_2DVotes >= 1 means the frame before was 2D-first too).
             const uint32_t tbp = st.tbp[st.ctxt ? 1 : 0];
+            static const bool firstDrawDebug = [] { const char *e = std::getenv("RT_WIDE_DEBUG"); return e && *e == '2'; }();
+            if (firstDrawDebug)
+                std::fprintf(stderr, "[wide] first draw: path %u prim %u tme %d abe %d ctxt %d tbp %#x box %.0f..%.0f x %.0f..%.0f\n",
+                             pathIndex, st.type, st.tme ? 1 : 0, st.abe ? 1 : 0, st.ctxt ? 1 : 0, tbp, minX, maxX, minY, maxY);
+            const bool fullScreen = width >= kFullScreen && maxY - minY >= kFullHeight;
             if (m_mode == Mode::Driving)
             {
                 m_2DVotes = 0;
                 setVerdict(false);
             }
-            else if (width >= kFullScreen && maxY - minY >= kFullHeight &&
+            else if (fullScreen && st.abe && !st.tme)
+            {
+                // A blended full-screen fill first (the fade to "Now loading" over the last
+                // picture): it shows the picture before it, so the frame keeps that picture's
+                // verdict (it was squeezed to 4:3 for the fade). Kept wide, it is drawn as a
+                // driving frame, so the text on it is HUD and keeps its shape. (A copy of the
+                // frame buffer first is no such case: a late post-pass, before the 3D.)
+                m_mode = m_lastFrame2D ? Mode::Screen2D : Mode::Driving;
+            }
+            else if (fullScreen &&
                      ((st.tme && tbp >= kTextureArea) || (!st.tme && m_2DVotes >= 1)))
             {
                 // A full-screen fill (the black behind "Now loading") proves it from the second
