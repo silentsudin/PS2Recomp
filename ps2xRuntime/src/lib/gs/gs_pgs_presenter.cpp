@@ -293,7 +293,7 @@ namespace ps2x::gs
                               : post(post_spirv::fsr_easu_frag, sizeof(post_spirv::fsr_easu_frag), 80, 0);
                 m_rcas = post(post_spirv::fsr_rcas_frag, sizeof(post_spirv::fsr_rcas_frag), 32, 0);
                 m_sgsr1 = post(post_spirv::sgsr1_frag, sizeof(post_spirv::sgsr1_frag), 16, 0x1);
-                m_sgsr2Convert = post(post_spirv::sgsr2_convert_frag, sizeof(post_spirv::sgsr2_convert_frag), sizeof(Sgsr2Push), 0x1, 0x3);
+                m_sgsr2Convert = post(post_spirv::sgsr2_convert_frag, sizeof(post_spirv::sgsr2_convert_frag), sizeof(Sgsr2Push), 0x1, 0x7);
                 m_sgsr2Upscale = post(post_spirv::sgsr2_upscale_frag, sizeof(post_spirv::sgsr2_upscale_frag), sizeof(Sgsr2Push), 0x1, 0x7);
                 m_smaaEdges = post(post_spirv::smaa_edges_frag, sizeof(post_spirv::smaa_edges_frag), 16, 0x1, 0x1);
                 m_smaaWeights = post(post_spirv::smaa_weights_frag, sizeof(post_spirv::smaa_weights_frag), 16, 0x1, 0x7);
@@ -873,8 +873,10 @@ namespace ps2x::gs
             {
                 float renderSize[2], outputSize[2], renderSizeRcp[2], outputSizeRcp[2];
                 float jitterOffset[2], scaleRatio[2], motionToNdc[2];
-                float cameraFovAngleHor, minLerpContribution, reset, pad;
+                float cameraFovAngleHor, minLerpContribution, reset;
+                float prevValid; // the convert pass's previous buffer is the last picture's (its disocclusion test)
                 float jitterDelta[2]; // GS pixels, this frame's jitter minus last frame's
+                float moveConfidence, moveGamma, minWeight, pad2; // moving pixels (sgsr2_upscale.frag)
             };
 
             // Game frames between the picture a temporal pass last ran on (serial) and this one; 0 to
@@ -911,6 +913,14 @@ namespace ps2x::gs
                 push.jitterDelta[1] = m_jitter[1] - m_jitter[3];
                 push.cameraFovAngleHor = 0.75f; // tan(FOV / 2): Road Trip's cameras are about 74 degrees across
                 push.minLerpContribution = 0.0f;
+                // History on moving pixels (sgsr2_upscale.frag; 0 = Qualcomm's blend). A/B:
+                // RT_SGSR2_MOVE (current-frame weight per output half-pixel of motion),
+                // RT_SGSR2_GAMMA (history box in standard deviations), RT_SGSR2_MINW (least weight, 0.2 by default:
+                // against the 3x-rendered picture it took the attract demo from 0.82 to 0.68 blurred
+                // error, FSR 1 0.65, and removed the doubled decals and dotted rows on moving cars).
+                static const float move = envFloat("RT_SGSR2_MOVE", 0.0f), gamma = envFloat("RT_SGSR2_GAMMA", 0.0f),
+                                   minWeight = envFloat("RT_SGSR2_MINW", 0.2f);
+                push.moveConfidence = move, push.moveGamma = gamma, push.minWeight = minWeight;
                 return push;
             }
 
@@ -934,17 +944,35 @@ namespace ps2x::gs
                 push.jitterOffset[0] = (m_jitter[0] + t * (m_jitter[0] - m_jitter[2])) * static_cast<float>(sw) / 640.0f;
                 push.jitterOffset[1] = (m_jitter[1] + t * (m_jitter[1] - m_jitter[3])) * static_cast<float>(sh) / 224.0f;
                 push.reset = 0.0f;
-                const PassInput convertIn[2] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp},
-                                                {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp}};
-                offscreenPass(cmd, m_sgsr2Mda, sw, sh, m_sgsr2Convert, convertIn, 2, &push, sizeof(push), false,
+                // Disocclusion against the real frame's buffer (its depth: the history here is its output).
+                const Vulkan::ImageHandle &realMda = m_sgsr2Mda[m_sgsr2MdaIndex ^ 1];
+                const bool prevOk = sgsr2Disocclusion() && realMda && realMda->get_width() == sw && realMda->get_height() == sh;
+                push.prevValid = prevOk ? 1.0f : 0.0f;
+                const PassInput convertIn[3] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp},
+                                                {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp},
+                                                {prevOk ? realMda.get() : m_shared.depth.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(cmd, m_sgsr2MdaShadow, sw, sh, m_sgsr2Convert, convertIn, 3, &push, sizeof(push), false,
                               VK_FORMAT_R16G16B16A16_SFLOAT);
                 const PassInput upscaleIn[3] = {{real.get(), Vulkan::StockSampler::LinearClamp},
-                                                {m_sgsr2Mda.get(), Vulkan::StockSampler::LinearClamp},
+                                                {m_sgsr2MdaShadow.get(), Vulkan::StockSampler::LinearClamp},
                                                 {m_final, Vulkan::StockSampler::NearestClamp}};
                 offscreenPass(cmd, m_sgsr2Shadow, w, h, m_sgsr2Upscale, upscaleIn, 3, &push, sizeof(push), false);
                 m_final = m_sgsr2Shadow.get();
                 m_finalRcas = true;
                 return true;
+            }
+
+            static float envFloat(const char *name, float fallback)
+            {
+                const char *e = std::getenv(name);
+                return e && *e ? static_cast<float>(std::atof(e)) : fallback;
+            }
+
+            // GSR 2's disocclusion test (on unless RT_SGSR2_DISOCC=0, for A/B).
+            static bool sgsr2Disocclusion()
+            {
+                static const bool on = [] { const char *e = std::getenv("RT_SGSR2_DISOCC"); return !(e && *e == '0'); }();
+                return on;
             }
 
             bool upscaleSgsr2(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh, uint32_t w, uint32_t h)
@@ -970,12 +998,20 @@ namespace ps2x::gs
                 m_sgsr2Serial = m_shared.pictureSerial;
                 Sgsr2Push push = sgsr2Push(sw, sh, w, h, std::max(steps, 1.0f));
                 push.reset = valid ? 0.0f : 1.0f;
-                const PassInput convertIn[2] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp},
-                                                {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp}};
-                offscreenPass(cmd, m_sgsr2Mda, sw, sh, m_sgsr2Convert, convertIn, 2, &push, sizeof(push), false,
+                // The convert pass keeps each picture's depth in its buffer (w) and tests the history
+                // against the last one's: disocclusion (sgsr2_convert.frag).
+                Vulkan::ImageHandle &mda = m_sgsr2Mda[m_sgsr2MdaIndex];
+                const Vulkan::ImageHandle &prevMda = m_sgsr2Mda[m_sgsr2MdaIndex ^ 1];
+                const bool prevOk = sgsr2Disocclusion() && valid && prevMda && prevMda->get_width() == sw && prevMda->get_height() == sh;
+                push.prevValid = prevOk ? 1.0f : 0.0f;
+                const PassInput convertIn[3] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp},
+                                                {m_shared.motion.get(), Vulkan::StockSampler::NearestClamp},
+                                                {prevOk ? prevMda.get() : m_shared.depth.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(cmd, mda, sw, sh, m_sgsr2Convert, convertIn, 3, &push, sizeof(push), false,
                               VK_FORMAT_R16G16B16A16_SFLOAT);
+                m_sgsr2MdaIndex ^= 1;
                 const PassInput upscaleIn[3] = {{valid ? history.get() : m_final, Vulkan::StockSampler::LinearClamp},
-                                                {m_sgsr2Mda.get(), Vulkan::StockSampler::LinearClamp},
+                                                {mda.get(), Vulkan::StockSampler::LinearClamp},
                                                 {m_final, Vulkan::StockSampler::NearestClamp}};
                 offscreenPass(cmd, out, w, h, m_sgsr2Upscale, upscaleIn, 3, &push, sizeof(push), false);
                 m_final = out.get();
@@ -2374,7 +2410,8 @@ namespace ps2x::gs
             Vulkan::Program *m_program = nullptr;
             Vulkan::Program *m_fxaa = nullptr, *m_easu = nullptr, *m_rcas = nullptr, *m_sgsr1 = nullptr;
             Vulkan::Program *m_sgsr2Convert = nullptr, *m_sgsr2Upscale = nullptr;
-            Vulkan::ImageHandle m_sgsr2Mda, m_sgsr2History[2], m_sgsr2Shadow;
+            Vulkan::ImageHandle m_sgsr2Mda[2], m_sgsr2MdaShadow, m_sgsr2History[2], m_sgsr2Shadow;
+            uint32_t m_sgsr2MdaIndex = 0; // the buffer the next real frame's convert pass writes
             uint32_t m_sgsr2Index = 0;
             bool m_sgsr2Valid = false;
             uint64_t m_sgsr2Serial = ~0ull, m_taaSerial = ~0ull, m_mfxSerial = ~0ull; // PgsShared::pictureSerial each last ran on

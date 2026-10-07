@@ -25,8 +25,13 @@ layout(push_constant) uniform Push
     float cameraFovAngleHor; // tan(horizontal FOV / 2)
     float minLerpContribution;
     float reset;
-    float pad;
+    float prevValid;     // (the convert pass's)
     vec2 jitterDelta;    // GS pixels: this frame's camera jitter minus last frame's (in the motion)
+    // Added for moving pixels (0 = Qualcomm's behaviour), all faded in with the motion:
+    float moveConfidence; // the current frame's least weight per output pixel of motion (x2), up to 0.9
+    float moveGamma;      // the history box's half-width in standard deviations (tighter than 1)
+    float minWeight;      // the least current-frame weight (output pixels the kernel barely reaches)
+    float pad2;
 } params;
 layout(location = 0) in highp vec2 vUV;
 layout(location = 0) out mediump vec4 Output;
@@ -251,6 +256,24 @@ void main()
     Upsampledcw.xyz =  clamp(Upsampledcw.xyz / Upsampledcw.w, rectboxmin-vec3(0.075), rectboxmax+vec3(0.075));
     Upsampledcw.w = Upsampledcw.w * (1.0f / 3.0f) ;
 
+    // How much this pixel moves (0 still .. 1 from 20 half-pixels of the output on).
+    float moving = clamp(motion_viewport_len * 0.05, 0.0, 1.0);
+    // At 1.5x and more the kernel leaves output pixels with next to no weight (none of the
+    // jittered samples near them): Qualcomm's blend then keeps the history there almost alone,
+    // which on a moving car is last frame's car (doubled decals, dotted rows). Moving, such a pixel
+    // takes at least minWeight of the current frame, its colour leaning on the neighbourhood's
+    // centre where the kernel's own is unreliable.
+    if (params.minWeight > 0.0 && moving > 0.0)
+    {
+        float wmin = params.minWeight * moving;
+        if (Upsampledcw.w < wmin)
+        {
+            float t = clamp(Upsampledcw.w / wmin, 0.0, 1.0);
+            Upsampledcw.xyz = mix(rectboxcenter, Upsampledcw.xyz, t);
+            Upsampledcw.w = wmin;
+        }
+    }
+
     float baseupdate = 1.0f - depthfactor;
     baseupdate = min(baseupdate, mix(baseupdate, Upsampledcw.w *10.0f, clamp(10.0f* motion_viewport_len, 0.0, 1.0)));
     baseupdate = min(baseupdate, mix(baseupdate, Upsampledcw.w, clamp(motion_viewport_len *0.05f, 0.0, 1.0)));
@@ -259,6 +282,8 @@ void main()
     const float EPSILON = 1.192e-07f;
     float boxscale = max(depthfactor, clamp(motion_viewport_len * 0.05f, 0.0, 1.0));
     float boxsize = mix(scalefactor, 1.0f, boxscale);
+    if (params.moveGamma > 0.0)
+        boxsize = mix(boxsize, min(boxsize, params.moveGamma), moving);
     vec3 sboxvar = rectboxvar * boxsize;
     vec3 boxmin = rectboxcenter - sboxvar;
     vec3 boxmax = rectboxcenter + sboxvar;
@@ -277,6 +302,10 @@ void main()
     ////blend color
     float alphasum = max(EPSILON, basealpha + Upsampledcw.w);
     float alpha = clamp(Upsampledcw.w / alphasum + params.reset, 0.0, 1.0);
+    // History confidence falls with motion (FSR 2 / ASR do the same): the faster the pixel, the
+    // more of the current frame.
+    if (params.moveConfidence > 0.0)
+        alpha = max(alpha, min(0.9, motion_viewport_len * params.moveConfidence));
 
     Upsampledcw.xyz = mix(HistoryColor, Upsampledcw.xyz, alpha);
 

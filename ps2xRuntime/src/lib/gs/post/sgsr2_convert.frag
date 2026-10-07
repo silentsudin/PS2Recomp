@@ -3,7 +3,10 @@
 // (sgsr2_convert.fs, snapdragon-gsr sgsr/v2/include/glsl_2_pass_fs, BSD-3-Clause, sgsr/LICENSE). The algorithm
 // is Qualcomm's; adapted to the presenter: a push constant for the parameters, the full-screen
 // triangle's UV, the GS's motion (GS pixels, current minus previous) in place of encoded velocity,
-// and its depth (raw GS Z, larger = nearer: the README's reverse-Z changes).
+// and its depth (raw GS Z, larger = nearer: the README's reverse-Z changes). Added: a disocclusion
+// test against the previous frame's depth (kept in the buffer's w), which Qualcomm's version leaves
+// to the colour box: where a moving car uncovers the road, the history there is the car, and next
+// to the car's dark wheels and shadow the box let it through (trails behind cars).
 //
 //                  Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
 //                              SPDX-License-Identifier: BSD-3-Clause
@@ -12,6 +15,7 @@ precision highp int;
 
 layout(set = 0, binding = 0) uniform highp sampler2D InputDepth;    // R32F raw GS Z
 layout(set = 0, binding = 1) uniform highp sampler2D InputVelocity; // RG16F, GS pixels
+layout(set = 0, binding = 2) uniform highp sampler2D PrevMotionDepth; // last frame's output (w: its depth)
 layout(push_constant) uniform Push
 {
     vec2 renderSize;
@@ -24,8 +28,9 @@ layout(push_constant) uniform Push
     float cameraFovAngleHor; // tan(horizontal FOV / 2)
     float minLerpContribution;
     float reset;
-    float pad;
+    float prevValid;     // 1: PrevMotionDepth is the last picture's (else no disocclusion test)
     vec2 jitterDelta;    // GS pixels: this frame's camera jitter minus last frame's (in the motion)
+    vec4 upscaleOnly;    // (the upscale pass's moving-pixel parameters)
 } params;
 layout(location = 0) in highp vec2 vUV;
 layout(location = 0) out vec4 MotionDepthClipAlphaBuffer;
@@ -83,6 +88,21 @@ void main()
 
     // The GS's per-pixel motion (every 3D vertex carries it, the camera's included).
     vec2 motion = (texelFetch(InputVelocity, ivec2(InputPos), 0).xy - params.jitterDelta) * params.motionToNdc;
-    MotionDepthClipAlphaBuffer = vec4(motion, depthclip, 0.0);
+
+    // Disocclusion: where this pixel was last frame (the upscale pass's PrevUV) something nearer
+    // stood (the nearest of the 2x2 there): its history is that occluder. 5% farther starts to
+    // drop the history, 15% drops it (depthclip 1: the current frame only).
+    float depth = texelFetch(InputDepth, ivec2(InputPos), 0).x * (1.0 / 16777216.0);
+    if (params.prevValid > 0.5 && depth > 1.0e-05f)
+    {
+        vec2 prevUV = vUV - 0.5 * motion;
+        if (all(greaterThanEqual(prevUV, vec2(0.0))) && all(lessThanEqual(prevUV, vec2(1.0))))
+        {
+            vec4 prevZ4 = textureGather(PrevMotionDepth, prevUV, 3);
+            float prevZ = max(max(prevZ4.x, prevZ4.y), max(prevZ4.z, prevZ4.w));
+            depthclip = max(depthclip, clamp(((prevZ - depth) / prevZ - 0.05) * 10.0, 0.0, 1.0));
+        }
+    }
+    MotionDepthClipAlphaBuffer = vec4(motion, depthclip, depth);
 
 }
