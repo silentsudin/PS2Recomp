@@ -724,6 +724,7 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
         {
             st.ofx[c] = m_ctx[c].xyoffset.ofx;
             st.ofy[c] = m_ctx[c].xyoffset.ofy;
+            st.tbp[c] = m_ctx[c].tex0.tbp0;
         }
         m_wide.setRecordClasses(sideband);
         m_wide.transformPacket(pathIndex, m_wideScratch.data(), sizeBytes, st);

@@ -9,11 +9,17 @@
 //    first textured PATH2/3 draw in context 1; from there to the end of the frame every primitive
 //    is HUD. Each HUD primitive is narrowed either around the screen centre ("4:3 centred") or
 //    towards its own edge ("screen edges": left third -> left edge, right third -> right edge,
-//    middle third -> centred). A wide 3D-drawn HUD element (the town minimap, PATH1, scissored to
-//    its frame) takes the anchor of the HUD element drawn just before it. Full-screen primitives (fades, the final post-pass) are left
-//    to stretch, as are full-screen scissors.
+//    middle third -> centred). With edges, the primitives of one packet that touch or overlap
+//    form one element and move together, by the element's position (a message window is a
+//    frame of tiles with its text on top: it stays whole, centred). A wide 3D-drawn HUD element
+//    (the town minimap, PATH1, scissored to its frame) takes the anchor of the HUD element drawn
+//    just before it. Full-screen primitives (fades, the final post-pass) are left to stretch, as
+//    are full-screen scissors.
 //  - 2D-backed frames (title, menus, shops): nothing is changed; the presenter shows them 4:3
-//    (pillarboxed) instead (frameIs2D).
+//    (pillarboxed) instead (lastFrameWas2D). A frame whose first draw is a full-screen 2D picture
+//    (a texture outside the frame buffers) is 2D-backed from that draw on, so a new screen is
+//    never shown stretched; a frame whose first draw is 3D is a driving one at once. Other
+//    2D-first frames vote, with hysteresis.
 //
 // See the HUD spike in the recomp's plan for the evidence behind these rules. Not thread-safe: it
 // runs inside the GS frontend's packet processing (under its state lock).
@@ -44,6 +50,7 @@ namespace ps2x::gs
             bool ctxt = false;
             uint32_t ofx[2] = {0, 0}; // XYOFFSET_1/2 OFX and OFY (12.4 fixed point)
             uint32_t ofy[2] = {0, 0};
+            uint32_t tbp[2] = {0, 0}; // TEX0_1/2 TBP0 (blocks)
         };
 
         // Rewrites the X of 2D vertices (and HUD scissors) in a GIF packet in place. pathIndex as
@@ -86,13 +93,34 @@ namespace ps2x::gs
         {
             uint8_t *x;    // where X (16 bits, 12.4 fixed point) is stored
             bool ctx2;     // which XYOFFSET applies
+            float y;       // screen Y
+        };
+        // HUD primitives of the packet being transformed, placed at its end (resolvePacket).
+        struct PendingVertex
+        {
+            uint8_t *x;
+            uint32_t ofx;
+        };
+        struct PendingUnit
+        {
+            uint32_t first, count; // in m_pendVerts
+            float minX, maxX, minY, maxY;
+            bool follow;           // a wide 3D-drawn element: takes the anchor drawn before it
+            uint32_t group;        // the element it belongs to
+        };
+        struct PendingScissor
+        {
+            uint8_t *value;
+            uint32_t unitsBefore;  // pending units before it (it takes the last one's anchor)
         };
 
         void flushUnit(uint32_t pathIndex, const PrimState &st);
+        void resolvePacket();
+        void parsePacket(uint32_t pathIndex, uint8_t *data, uint32_t sizeBytes, PrimState &st);
+        void setVerdict(bool is2D);
         float toScreen(uint16_t gsX, bool ctx2, const PrimState &st) const;
-        uint16_t fromScreen(float x, bool ctx2, const PrimState &st) const;
         float place(float x, Anchor a) const;
-        void transformScissor(uint8_t *value);
+        void transformScissor(uint8_t *value, Anchor anchor) const;
         void vote(bool looks2D);
 
         float m_k = 1.0f;
@@ -106,9 +134,12 @@ namespace ps2x::gs
         bool m_hudStarted = false;
         bool m_recordClasses = false;
         std::vector<VertexClass> m_classes;
-        float m_dbgMinY = 0;   // clears since the last presented frame
         Vertex m_unit[2048];
         uint32_t m_unitCount = 0;
         uint32_t m_unitOverflow = 0; // vertices beyond m_unit's room (still counted for the classes)
+        std::vector<PendingVertex> m_pendVerts;
+        std::vector<PendingUnit> m_pendUnits;
+        std::vector<PendingScissor> m_pendScissors;
+        std::vector<Anchor> m_groupAnchor;
     };
 }
