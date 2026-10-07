@@ -31,11 +31,39 @@ layout(push_constant) uniform Push
     float moveConfidence; // the current frame's least weight per output pixel of motion (x2), up to 0.9
     float moveGamma;      // the history box's half-width in standard deviations (tighter than 1)
     float minWeight;      // the least current-frame weight (output pixels the kernel barely reaches)
-    float pad2;
+    float historyCubic;   // > 0: the history through a Catmull-Rom filter (shadow frames: their history is
+                          // the real frame's output moved on part of a frame, and bilinear softened it)
+    float speedScale;     // the motion's length per game frame / its length here (1; 1 / t for a shadow
+                          // frame t of a frame on, so its blend weights follow how fast the pixel moves)
 } params;
 layout(location = 0) in highp vec2 vUV;
 layout(location = 0) out mediump vec4 Output;
 
+
+// Catmull-Rom from 9 bilinear taps folded into 5 (the corners dropped): sharp where bilinear
+// blurs a picture moved by a fraction of a pixel.
+vec3 HistoryCatmullRom(highp vec2 uv)
+{
+    highp vec2 size = params.outputSize;
+    highp vec2 pos = uv * size;
+    highp vec2 c = floor(pos - 0.5) + 0.5;
+    highp vec2 f = pos - c;
+    highp vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    highp vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    highp vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    highp vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    highp vec2 w12 = w1 + w2;
+    highp vec2 tc0 = (c - 1.0) * params.outputSizeRcp;
+    highp vec2 tc12 = (c + w2 / w12) * params.outputSizeRcp;
+    highp vec2 tc3 = (c + 2.0) * params.outputSizeRcp;
+    vec3 r = textureLod(PrevOutput, vec2(tc12.x, tc0.y), 0.0).xyz * (w12.x * w0.y) +
+             textureLod(PrevOutput, vec2(tc0.x, tc12.y), 0.0).xyz * (w0.x * w12.y) +
+             textureLod(PrevOutput, tc12, 0.0).xyz * (w12.x * w12.y) +
+             textureLod(PrevOutput, vec2(tc3.x, tc12.y), 0.0).xyz * (w3.x * w12.y) +
+             textureLod(PrevOutput, vec2(tc12.x, tc3.y), 0.0).xyz * (w12.x * w3.y);
+    float wsum = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max(r / wsum, vec3(0.0));
+}
 
 float FastLanczos(float base)
 {
@@ -71,7 +99,7 @@ void main()
 
     float depthfactor = mda.z;
 
-    vec3 HistoryColor = textureLod(PrevOutput, PrevUV, 0.0).xyz;
+    vec3 HistoryColor = params.historyCubic > 0.0 ? HistoryCatmullRom(PrevUV) : textureLod(PrevOutput, PrevUV, 0.0).xyz;
 
     /////upsample and compute box
     vec4 Upsampledcw = vec4(0.0);
@@ -79,7 +107,7 @@ void main()
     float biasmin = max(1.0f, 0.3 + 0.3 * biasmax);
     float biasfactor = 0.25f * depthfactor;
     float kernelbias = mix(biasmax, biasmin, biasfactor);
-    float motion_viewport_len = length(Motion * params.outputSize);
+    float motion_viewport_len = length(Motion * params.outputSize) * params.speedScale;
     float curvebias = mix(-2.0, -3.0, clamp(motion_viewport_len * 0.02, 0.0, 1.0));
 
     vec3 rectboxcenter = vec3(0.0);

@@ -1291,7 +1291,8 @@ namespace ps2x::gs
                 float cameraFovAngleHor, minLerpContribution, reset;
                 float prevValid; // the convert pass's previous buffer is the last picture's (its disocclusion test)
                 float jitterDelta[2]; // GS pixels, this frame's jitter minus last frame's
-                float moveConfidence, moveGamma, minWeight, pad2; // moving pixels (sgsr2_upscale.frag)
+                float moveConfidence, moveGamma, minWeight, historyCubic; // moving pixels; history filter (sgsr2_upscale.frag)
+                float speedScale; // the blend weights' motion per game frame / the motion sampled
             };
 
             // Game frames between the picture a temporal pass last ran on (serial) and this one; 0 to
@@ -1336,6 +1337,7 @@ namespace ps2x::gs
                 static const float move = envFloat("RT_SGSR2_MOVE", 0.0f), gamma = envFloat("RT_SGSR2_GAMMA", 0.0f),
                                    minWeight = envFloat("RT_SGSR2_MINW", 0.2f);
                 push.moveConfidence = move, push.moveGamma = gamma, push.minWeight = minWeight;
+                push.speedScale = 1.0f;
                 return push;
             }
 
@@ -1359,6 +1361,18 @@ namespace ps2x::gs
                 push.jitterOffset[0] = (m_jitter[0] + t * (m_jitter[0] - m_jitter[2])) * static_cast<float>(sw) / 640.0f;
                 push.jitterOffset[1] = (m_jitter[1] + t * (m_jitter[1] - m_jitter[3])) * static_cast<float>(sh) / 224.0f;
                 push.reset = 0.0f;
+                // The history here is the real frame's output moved on t of a frame: bilinear
+                // sampling softened it (shadows ~11% less road detail than the real frames, a 60 Hz
+                // shimmer on textured ground at 120 Hz); Catmull-Rom keeps it as sharp.
+                // RT_SGSR2_SHADOW_CUBIC=0 samples it bilinearly again (A/B).
+                static const bool cubic = [] { const char *e = std::getenv("RT_SGSR2_SHADOW_CUBIC"); return !(e && *e == '0'); }();
+                push.historyCubic = cubic ? 1.0f : 0.0f;
+                // Its motion is t of the real frame's, but the blend weights (how much of this
+                // picture against the history) go by how fast a pixel moves per game frame: at t's
+                // motion a shadow kept up to twice the history the real frame does, and with it the
+                // history's softness. RT_SGSR2_SHADOW_SPEED=0 weighs by t's motion again (A/B).
+                static const bool perFrame = [] { const char *e = std::getenv("RT_SGSR2_SHADOW_SPEED"); return !(e && *e == '0'); }();
+                push.speedScale = perFrame && t > 0.0f ? 1.0f / t : 1.0f;
                 // Disocclusion against the real frame's buffer (its depth: the history here is its output).
                 const Vulkan::ImageHandle &realMda = m_sgsr2Mda[m_sgsr2MdaIndex ^ 1];
                 const bool prevOk = sgsr2Disocclusion() && realMda && realMda->get_width() == sw && realMda->get_height() == sh;
