@@ -24,10 +24,24 @@ namespace
     // the Thor) otherwise grows the queue until the cap drops frames, which crackles.
     constexpr double kTargetFrames = kSampleRate * 0.05;
     double g_frac = 0.0; // the read position's fraction between g_read and the next frame
+    // When the game can't keep up (heavy settings, frame generation at 120 Hz, the course
+    // carousel), guest time falls behind: slow frames, and each vblank resync drops ~34 ms of it
+    // (EeScheduler::resyncHostDeadlines). The SPU2 then makes less than real time (several resyncs a
+    // second on the Thor at 120 Hz), and the queue underran every second or two (crackles, then
+    // priming silence). Playback slows to match instead, up to 12% (a little lower pitch while the
+    // game is slow): a proportional term, a stronger one below 3/4 of the target, and an integral
+    // trim (slowing only) that learns a lasting shortfall so the queue stays near the target and
+    // still has room for a hitch. The control reads the queue smoothed over ~0.1 s: the SPU2
+    // delivers in bursts (the idle part of a frame arrives at its vblank), and the raw level would
+    // wobble the rate 60 times a second.
+    constexpr double kSlowKnee = 0.25, kSlowGain = 0.3, kMaxSlow = 0.12, kTrimGain = 0.05;
+    double g_level = kTargetFrames; // the queue, smoothed (frames)
+    double g_trim = 0.0;            // the integral term (<= 0)
     // After the queue ran dry (the game paused under a host menu or in the background, a stall),
-    // play silence until it holds half the target again: resuming on a near-empty queue
-    // underran every few callbacks (crackles) while the rate matching took ~10 s to build it up.
-    constexpr size_t kPrimeFrames = static_cast<size_t>(kTargetFrames * 0.5);
+    // play silence until it holds 3/4 of the target again (where the slowing starts): resuming on a
+    // near-empty queue underran every few callbacks (crackles) while the rate matching took ~10 s
+    // to build it up.
+    constexpr size_t kPrimeFrames = static_cast<size_t>(kTargetFrames * (1.0 - kSlowKnee));
     bool g_priming = true;
 
     std::mutex g_mutex;
@@ -45,10 +59,23 @@ namespace
         std::lock_guard<std::mutex> lock(g_mutex);
         g_calls.fetch_add(1, std::memory_order_relaxed);
         g_fillSum.fetch_add(g_count, std::memory_order_relaxed);
-        // Frames consumed per frame played: up to 0.5% slower when short, up to 1% faster when
-        // well over (a backlog at start drains in seconds); too small a change to hear.
-        const double error = (static_cast<double>(g_count) - kTargetFrames) / kTargetFrames;
-        const double ratio = 1.0 + std::clamp(error * 0.004, -0.005, 0.01);
+        // Frames consumed per frame played: near the target, within half a percent (clock drift,
+        // too small a change to hear); up to 1% faster when well over (a backlog drains in seconds);
+        // slower when the game falls behind (above).
+        if (g_priming)
+            g_level = static_cast<double>(g_count); // nothing plays yet: no lag to smooth over
+        else
+            g_level += (static_cast<double>(g_count) - g_level) * std::min(1.0, frames / (kSampleRate * 0.1));
+        const double error = (g_level - kTargetFrames) / kTargetFrames;
+        if (!g_priming && (error < -kSlowKnee || g_trim < 0.0))
+            g_trim = std::clamp(g_trim + error * kTrimGain * frames / kSampleRate, -kMaxSlow, 0.0);
+        double ratio = 1.0 + std::clamp(error * 0.02, -0.02, 0.01) + g_trim;
+        if (error < -kSlowKnee)
+            ratio -= (-error - kSlowKnee) * kSlowGain;
+        ratio = std::clamp(ratio, 1.0 - kMaxSlow, 1.01);
+        static double minRatio = 1.0; // for RT_AUDIO_STATS (under g_mutex)
+        if (!g_priming)
+            minRatio = std::min(minRatio, ratio);
         if (g_priming && g_count >= kPrimeFrames)
             g_priming = false;
         size_t n = 0;
@@ -78,6 +105,8 @@ namespace
             g_underruns.fetch_add(1, std::memory_order_relaxed);
             g_underrunFrames.fetch_add(frames - n, std::memory_order_relaxed);
             g_priming = g_count < 2; // ran dry: build the queue up again before playing on
+            if (g_priming)
+                g_trim = 0.0;
         }
         static const bool stats = [] { const char *e = std::getenv("RT_AUDIO_STATS"); return e && *e == '1'; }();
         static auto windowStart = std::chrono::steady_clock::now();
@@ -86,10 +115,11 @@ namespace
             windowStart = std::chrono::steady_clock::now();
             const uint64_t calls = g_calls.exchange(0);
             std::fprintf(stderr, "[audio] 5 s: %llu callbacks of %u frames, %llu underruns (%llu frames), %llu frames dropped, "
-                                 "average queue %llu frames\n",
+                                 "average queue %llu frames, slowest playback %.1f%%\n",
                          (unsigned long long)calls, frames, (unsigned long long)g_underruns.exchange(0),
                          (unsigned long long)g_underrunFrames.exchange(0), (unsigned long long)g_droppedFrames.exchange(0),
-                         (unsigned long long)(calls ? g_fillSum.exchange(0) / calls : 0));
+                         (unsigned long long)(calls ? g_fillSum.exchange(0) / calls : 0), minRatio * 100.0);
+            minRatio = 1.0;
         }
     }
 }
@@ -133,6 +163,8 @@ void ps2AudioOutFlush()
     std::lock_guard<std::mutex> lock(g_mutex);
     g_read = g_write = g_count = 0;
     g_frac = 0.0;
+    g_level = kTargetFrames;
+    g_trim = 0.0;
     g_priming = true;
 }
 

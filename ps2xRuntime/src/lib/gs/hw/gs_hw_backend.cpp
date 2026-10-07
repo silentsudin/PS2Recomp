@@ -455,6 +455,7 @@ namespace ps2x::gs
                     m_decodeHook = std::move(hook);
                 }
                 m_dropDecoded = true; // decode (and so repaint) everything again
+                m_resubmit = true;    // and see again which textures it repaints (no pack image for those)
                 ++m_epoch;
             }
 
@@ -1138,6 +1139,7 @@ namespace ps2x::gs
                 const GSContext &ctx = b.state.context;
                 const GSTex0Reg &tex = ctx.tex0;
                 TexRect rect = effectiveRect(ctx, ctx.clamp);
+                const TexRect own = rect; // the part this draw samples
                 const uint32_t wms = ctx.clamp & 3u, wmt = (ctx.clamp >> 2) & 3u;
                 if (wms == 2u && wmt == 2u)
                 {
@@ -1181,7 +1183,10 @@ namespace ps2x::gs
                 }
 
                 if (m_resubmit.exchange(false))
+                {
                     m_submitted.clear();
+                    m_repainted.clear();
+                }
                 if (m_submitted.insert(key).second)
                 {
                     std::vector<uint8_t> rgba(static_cast<size_t>(rect.w) * rect.h * 4u);
@@ -1189,7 +1194,45 @@ namespace ps2x::gs
                     for (uint32_t y = 0; y < rect.h; ++y)
                         for (uint32_t x = 0; x < rect.w; ++x)
                             out[static_cast<size_t>(y) * rect.w + x] = texel(b.state, tex.psm, tex.tbp0, tex.tbw, rect.x + x, rect.y + y);
+                    {
+                        // A texture the app repaints (the button glyphs in the font atlas, for the pad
+                        // in use): draws that sample the repainted part keep the repainted decode (the
+                        // pack's image shows the original glyphs); the rest still use the pack. The
+                        // tools get the original (dumps stay the game's).
+                        std::lock_guard<std::mutex> lock(m_hookMutex);
+                        if (m_decodeHook)
+                        {
+                            std::vector<uint8_t> copy(rgba);
+                            DecodedTexture d;
+                            d.psm = tex.psm;
+                            d.width = rect.w;
+                            d.height = rect.h;
+                            d.rgba = reinterpret_cast<uint32_t *>(copy.data());
+                            const uint32_t psm = tex.psm, tbp = tex.tbp0, tbw = tex.tbw, rx = rect.x, ry = rect.y;
+                            d.index = [this, psm, tbp, tbw, rx, ry](uint32_t x, uint32_t y)
+                            { return GSMem::ReadTexture(m_pageCache, m_vram, psm, tbp, tbw, rx + x, ry + y) & 0xFFu; };
+                            m_decodeHook(d);
+                            const uint32_t *a = reinterpret_cast<const uint32_t *>(rgba.data());
+                            const uint32_t *c = reinterpret_cast<const uint32_t *>(copy.data());
+                            uint32_t x0 = rect.w, y0 = rect.h, x1 = 0, y1 = 0;
+                            for (uint32_t y = 0; y < rect.h; ++y)
+                                for (uint32_t x = 0; x < rect.w; ++x)
+                                    if (a[static_cast<size_t>(y) * rect.w + x] != c[static_cast<size_t>(y) * rect.w + x])
+                                    {
+                                        x0 = std::min(x0, x), y0 = std::min(y0, y);
+                                        x1 = std::max(x1, x + 1), y1 = std::max(y1, y + 1);
+                                    }
+                            if (x1 > x0)
+                                m_repainted[key] = {rect.x + x0, rect.y + y0, x1 - x0, y1 - y0};
+                        }
+                    }
                     m_packs.submit(key, stable, rect.w, rect.h, tex.psm, std::move(rgba));
+                }
+                if (auto r = m_repainted.find(key); r != m_repainted.end())
+                {
+                    const TexRect &p = r->second;
+                    if (own.x < p.x + p.w && p.x < own.x + own.w && own.y < p.y + p.h && p.y < own.y + own.h)
+                        return;
                 }
 
                 HwTexturePacks::Bound bound = m_packs.lookup(key, stable);
@@ -2740,6 +2783,7 @@ namespace ps2x::gs
             std::unordered_map<uint32_t, UploadExtent> m_uploads; // GS thread: uploads by base address
             std::unordered_set<uint64_t> m_submitted;             // GS thread: textures handed to the tools
             std::atomic<bool> m_resubmit{false};
+            std::unordered_map<uint64_t, TexRect> m_repainted; // GS thread: what the decode hook changes in submitted textures
             // The app's repaint of decoded textures (setDecodeHook); m_dropDecoded: decode all again.
             std::mutex m_hookMutex;
             DecodeHook m_decodeHook;
