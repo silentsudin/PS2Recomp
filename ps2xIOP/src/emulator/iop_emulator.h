@@ -40,6 +40,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
         [[nodiscard]] bool freeMemory(uint32_t address);
         [[nodiscard]] bool readMemory(uint32_t address, void *destination, size_t size) const;
+        [[nodiscard]] bool peekMemory(uint32_t address, void *destination, size_t size) const; // RAM, no flush
         [[nodiscard]] bool writeMemory(uint32_t address, const void *source, size_t size);
         [[nodiscard]] bool zeroMemory(uint32_t address, size_t size);
         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;

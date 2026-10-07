@@ -336,6 +336,8 @@ public:
     uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
     bool freeIopMemory(uint32_t address);
     bool readIopMemory(uint32_t address, void *destination, size_t size) const;
+    // IOP RAM from any thread (readIopMemory runs the IOP's pending cycles: the EE thread's only).
+    bool peekIopMemory(uint32_t address, void *destination, size_t size) const;
     bool writeIopMemory(uint32_t address, const void *source, size_t size);
     bool zeroIopMemory(uint32_t address, size_t size);
     bool isIopMemoryRange(uint32_t address, size_t size) const;

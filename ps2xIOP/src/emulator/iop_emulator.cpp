@@ -22,6 +22,8 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <chrono>
+#include <vector>
 #include <cctype>
 #include <map>
 #include <optional>
@@ -415,11 +417,51 @@ namespace ps2x::iop::detail
                 return !cpu.stopped;
             }
 
+            if (profilePcs()) [[unlikely]]
+                profileStep(cpu.pc);
             const bool running = cpuCore.executeInstruction(cpu);
             schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
             return running;
+        }
+
+        // RT_IOP_PROFILE=1: where the IOP spends its instructions (64-byte buckets by module, every
+        // 5 s of host time), and how many it runs a second.
+        static bool profilePcs()
+        {
+            static const bool on = [] { const char *e = std::getenv("RT_IOP_PROFILE"); return e && *e == '1'; }();
+            return on;
+        }
+        std::map<uint32_t, uint64_t> profileBuckets;
+        uint64_t profileCount = 0, profileStart = 0;
+        std::chrono::steady_clock::time_point profileWindow = std::chrono::steady_clock::now();
+        void profileStep(uint32_t pc)
+        {
+            ++profileBuckets[physicalAddress(pc) & ~0x3Fu];
+            if (++profileCount % 65536u)
+                return;
+            const auto now = std::chrono::steady_clock::now();
+            const double secs = std::chrono::duration<double>(now - profileWindow).count();
+            if (secs < 5.0)
+                return;
+            std::vector<std::pair<uint64_t, uint32_t>> top;
+            for (const auto &[bucket, n] : profileBuckets)
+                top.push_back({n, bucket});
+            std::sort(top.rbegin(), top.rend());
+            std::fprintf(stderr, "[iop-prof] %.1f M instructions/s\n", (profileCount - profileStart) / secs / 1e6);
+            for (size_t i = 0; i < top.size() && i < 10; ++i)
+            {
+                const char *name = "?";
+                uint32_t offset = top[i].second;
+                for (const auto &[id, m] : modules)
+                    if (top[i].second >= m.base && top[i].second < m.base + m.size)
+                        name = m.name.c_str(), offset = top[i].second - m.base;
+                std::fprintf(stderr, "[iop-prof]   %4.1f%% %s+0x%x\n", 100.0 * top[i].first / (profileCount - profileStart), name, offset);
+            }
+            profileBuckets.clear();
+            profileStart = profileCount;
+            profileWindow = now;
         }
 
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
@@ -894,6 +936,11 @@ namespace ps2x::iop::detail
     {
         m_impl->flushPending();
         return m_impl->memory.freeAllocation(address);
+    }
+
+    bool IopEmulator::peekMemory(uint32_t address, void *destination, size_t size) const
+    {
+        return isMemoryRange(address, size) && m_impl->memory.readRam(address, destination, size);
     }
 
     bool IopEmulator::readMemory(uint32_t address, void *destination, size_t size) const

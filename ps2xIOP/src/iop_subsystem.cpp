@@ -250,6 +250,11 @@ namespace ps2x::iop
         return m_impl->emulator.readMemory(address, destination, size);
     }
 
+    bool IopSubsystem::peekMemory(uint32_t address, void *destination, size_t size) const
+    {
+        return m_impl->emulator.peekMemory(address, destination, size);
+    }
+
     bool IopSubsystem::writeMemory(uint32_t address, const void *source, size_t size)
     {
         return m_impl->emulator.writeMemory(address, source, size);

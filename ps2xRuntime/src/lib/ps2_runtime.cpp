@@ -544,6 +544,11 @@ bool PS2Runtime::readIopMemory(uint32_t address, void *destination, size_t size)
     return m_iopSubsystem && m_iopSubsystem->readMemory(address, destination, size);
 }
 
+bool PS2Runtime::peekIopMemory(uint32_t address, void *destination, size_t size) const
+{
+    return m_iopSubsystem && m_iopSubsystem->peekMemory(address, destination, size);
+}
+
 bool PS2Runtime::writeIopMemory(uint32_t address, const void *source, size_t size)
 {
     return m_iopSubsystem && m_iopSubsystem->writeMemory(address, source, size);

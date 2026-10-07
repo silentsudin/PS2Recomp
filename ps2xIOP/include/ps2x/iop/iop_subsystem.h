@@ -45,6 +45,9 @@ namespace ps2x::iop
         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
         [[nodiscard]] bool freeMemory(uint32_t address);
         [[nodiscard]] bool readMemory(uint32_t address, void *destination, size_t size) const;
+        // IOP RAM as it is, from any thread (readMemory first runs the IOP's pending cycles, which only
+        // the EE thread may do): for displays and diagnostics that tolerate a value mid-update.
+        [[nodiscard]] bool peekMemory(uint32_t address, void *destination, size_t size) const;
         [[nodiscard]] bool writeMemory(uint32_t address, const void *source, size_t size);
         [[nodiscard]] bool zeroMemory(uint32_t address, size_t size);
         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
