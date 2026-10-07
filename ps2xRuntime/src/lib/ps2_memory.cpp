@@ -28,6 +28,19 @@ namespace
                (addr >= 0x10005000u && addr < 0x10007000u);
     }
 
+    // A read of a GIF or VIF1 register needs the GIF/VIF1 worker done, not the GS thread: the
+    // registers are the worker's (GIF_STAT's PATH3 mask comes from VIF1's MSKPATH3), and nothing
+    // the GS thread does shows in them. Road Trip reads VIF1_STAT and GIF_STAT every frame after
+    // kicking its VU1 lists; waiting there for the GS thread too serialised the EE with the whole
+    // GS stage (~5 ms a frame in town on the Thor). The FIFOs (GS-to-host transfers) and anything
+    // touching the GS itself still wait for it (RT_VIF1_READ_WAITS_GS=1: these too, for A/B).
+    thread_local bool t_syncWorkerOnly = false;
+    inline bool isWorkerRegister(uint32_t addr)
+    {
+        static const bool waitGs = [] { const char *e = std::getenv("RT_VIF1_READ_WAITS_GS"); return e && *e == '1'; }();
+        return !waitGs && ((addr >= 0x10003000u && addr < 0x10003100u) || (addr >= 0x10003C00u && addr < 0x10003E00u));
+    }
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -843,7 +856,11 @@ uint64_t PS2Memory::read64(uint32_t address)
     if (isIoRegister(address))
     {
         if (isGifVif1Register(address))
+        {
+            t_syncWorkerOnly = isWorkerRegister(address);
             syncGifVif1();
+            t_syncWorkerOnly = false;
+        }
         uint32_t lo = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
         uint32_t hi = m_ioRegisters.count(address + 4) ? m_ioRegisters[address + 4] : 0u;
         return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
@@ -2078,7 +2095,11 @@ void PS2Memory::syncGifVif1()
     if (t_onGifVif1Worker || !m_gifVif1Worker.joinable())
         return;
     const uint64_t target = m_gifVif1Submitted.load(std::memory_order_acquire);
-    if (m_gifVif1Completed.load(std::memory_order_acquire) >= target)
+    // Done when the worker is, and (but for VIF1-register reads) the GS thread has drawn what the
+    // worker handed it: privileged-register writes must not overtake queued drawing (a display
+    // switch showed half-drawn frames when this looked at the worker only).
+    if (m_gifVif1Completed.load(std::memory_order_acquire) >= target &&
+        (t_syncWorkerOnly || m_gsCompleted.load(std::memory_order_acquire) >= m_gsSubmitted.load(std::memory_order_acquire)))
         return;
     m_gifVif1Stalls.fetch_add(1, std::memory_order_relaxed);
     const auto waitStart = std::chrono::steady_clock::now();
@@ -2101,9 +2122,10 @@ void PS2Memory::syncGifVif1()
                              { return m_gifVif1Completed.load(std::memory_order_acquire) >= target; });
         m_vifWaitTargets.erase(it);
     }
-    // The worker handed its GIF output to the GS thread before completing; wait for that too.
+    // The worker handed its GIF output to the GS thread before completing; wait for that too
+    // (unless only VIF1's own registers are read).
     const uint64_t gsTarget = m_gsSubmitted.load(std::memory_order_acquire);
-    if (m_gsCompleted.load(std::memory_order_acquire) < gsTarget)
+    if (!t_syncWorkerOnly && m_gsCompleted.load(std::memory_order_acquire) < gsTarget)
     {
         const auto it = m_gsWaitTargets.insert(gsTarget);
         m_gsIdleCv.wait(lock, [&]
@@ -2553,7 +2575,11 @@ int PS2Memory::pollDmaRegisters()
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
     if (isGifVif1Register(address))
+    {
+        t_syncWorkerOnly = isWorkerRegister(address);
         syncGifVif1();
+        t_syncWorkerOnly = false;
+    }
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
