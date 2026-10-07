@@ -24,6 +24,9 @@ layout(location = 3) noperspective in vec2 vMotion;
 layout(constant_id = 0) const uint FLAGS = 0u;
 layout(constant_id = 1) const uint ATST = 1u;
 layout(constant_id = 2) const uint AMODE = 2u; // 0 = alpha test, 1 = keep only failing pixels, 2 = none
+// DATE through the stencil buffer (gs_hw_backend.cpp): 1 = only the pixels whose written alpha MSB
+// differs from DATM (they flip the stencil), 2 = only those whose MSB equals it, 0 = all.
+layout(constant_id = 3) const uint DATE_SPLIT = 0u;
 
 layout(push_constant) uniform Push
 {
@@ -33,7 +36,9 @@ layout(push_constant) uniform Push
     vec4 lod;      // MXL, L, K, LCM
     vec4 texa;     // TA0, AEM, TA1, 1 = alpha from TEXA (a CT24 render target)
     uvec4 mode;    // z: AREF
-    vec4 texOffset; // xy: where texel (0, 0) is in the image (a texture inside a render target)
+    vec4 texOffset; // xy: where texel (0, 0) is in the image (a texture inside a render target);
+                    // z: 1 = 2D above 1x, attributes at the GS pixel's sample point; w: the snap
+                    // scale per axis (x | y << 4, 1 = none)
 } push;
 
 layout(location = 0) out vec4 outColor;
@@ -73,6 +78,25 @@ bool alphaPasses(float a)
 
 void main()
 {
+    // Above 1x: attributes where paraLLEl-GS samples them when it supersamples (gs_hw_backend.cpp,
+    // Push::texOffset). Varyings are affine in screen space, so the derivatives move them exactly.
+    // Before any discard (derivatives need the whole quad).
+    vec4 color = vColor;
+    vec3 stq = vStq;
+    float fogIn = vFog;
+    if (push.texOffset.z != 0.0)
+    {
+        // The snap scale per axis (1 = none): the GS pixel's sample point is the centre of its
+        // first device pixel.
+        const uint packed = uint(push.texOffset.w);
+        const vec2 scale = vec2(float(packed & 15u), float((packed >> 4u) & 15u));
+        const vec2 dev = floor(gl_FragCoord.xy);
+        const vec2 off = floor(dev / scale) * scale - dev;
+        stq += dFdxFine(vStq) * off.x + dFdyFine(vStq) * off.y;
+        color += dFdxFine(vColor) * off.x + dFdyFine(vColor) * off.y;
+        fogIn += dFdxFine(vFog) * off.x + dFdyFine(vFog) * off.y;
+    }
+
     // DATE: only where the frame buffer's alpha MSB equals DATM (alpha is kept as A/128).
     if ((FLAGS & F_DATE) != 0u)
     {
@@ -81,14 +105,14 @@ void main()
             discard;
     }
 
-    vec4 f = floor(vColor * 255.0 + 0.5);
+    vec4 f = floor(clamp(color, 0.0, 1.0) * 255.0 + 0.5);
     vec3 rgb = f.rgb;
     float a = f.a;
     const uint flags = FLAGS;
 
     if ((flags & F_TME) != 0u)
     {
-        vec2 st = vStq.xy / vStq.z;
+        vec2 st = stq.xy / stq.z;
         vec2 texel = st * push.texNorm.xy;
         bool linear = (flags & F_LINEAR) != 0u;
         vec4 t;
@@ -131,7 +155,7 @@ void main()
             float lod = 0.0;
             if ((flags & F_MIP) != 0u)
             {
-                lod = push.lod.w != 0.0 ? push.lod.z : log2(1.0 / abs(vStq.z)) * exp2(push.lod.y) + push.lod.z;
+                lod = push.lod.w != 0.0 ? push.lod.z : log2(1.0 / abs(stq.z)) * exp2(push.lod.y) + push.lod.z;
                 lod = clamp(lod, 0.0, push.lod.x);
             }
             t = textureLod(uTex, (texel + push.texOffset.xy) * push.texNorm.zw, lod);
@@ -164,7 +188,7 @@ void main()
 
     if ((flags & F_FGE) != 0u)
     {
-        float fog = floor(vFog + 0.5);
+        float fog = floor(clamp(fogIn, 0.0, 255.0) + 0.5);
         rgb = floor((rgb * fog + push.fogColor.rgb * (255.0 - fog)) / 256.0);
     }
 
@@ -172,6 +196,13 @@ void main()
     {
         bool pass = alphaPasses(a);
         if (pass == (AMODE == 1u))
+            discard;
+    }
+
+    if (DATE_SPLIT != 0u)
+    {
+        const bool flips = (a >= 128.0) != ((flags & F_DATM) != 0u);
+        if (flips != (DATE_SPLIT == 1u))
             discard;
     }
 

@@ -15,6 +15,7 @@
 #if defined(PS2X_HAVE_PGS)
 
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_display_phase.h"
 #include "runtime/gs/gs_motion.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "../gs_pgs_shared.h"
@@ -238,6 +239,9 @@ namespace ps2x::gs
             bool recolor = false;
             float recolorMap[20] = {};
             bool map = false; // the game's map (PgsShared::wantMap)
+            // Every triangle flat (one Z, no perspective): 2D, drawn as paraLLEl-GS supersamples
+            // UI (attributes at the GS pixel's own sample, Snap::Attributes).
+            bool flat = true;
         };
 
         struct Target
@@ -375,7 +379,7 @@ namespace ps2x::gs
                 frag.sets[0].sampled_image_mask = 0x3;
                 frag.sets[0].fp_mask = 0x3;
                 frag.sets[0].uniform_buffer_mask = 0x4; // the recolour map (texture packs)
-                frag.spec_constant_mask = 0x7; // flags, ATST, alpha-test pass (draw.frag)
+                frag.spec_constant_mask = 0xF; // flags, ATST, alpha-test pass, DATE split (draw.frag)
                 m_drawProgram = m_dev->request_program(hw_spirv::draw_vert, sizeof(hw_spirv::draw_vert), hw_spirv::draw_frag,
                                                        sizeof(hw_spirv::draw_frag), &vert, &frag);
                 {
@@ -391,6 +395,21 @@ namespace ps2x::gs
                     m_depthCopyProgram = m_dev->request_program(post_spirv::fullscreen_vert, sizeof(post_spirv::fullscreen_vert),
                                                                 hw_spirv::depth_copy_frag, sizeof(hw_spirv::depth_copy_frag), &fsVert,
                                                                 &copyFrag);
+                    // DATE through the stencil buffer (date_stencil.frag): Z buffers get a stencil
+                    // aspect. RT_HWGS_STENCIL_DATE=0 keeps the snapshot test (no stencil).
+                    Vulkan::ResourceLayout stencilFrag = {};
+                    stencilFrag.input_mask = 0x1;
+                    stencilFrag.sets[0].sampled_image_mask = 0x1;
+                    stencilFrag.sets[0].fp_mask = 0x1;
+                    m_dateStencilProgram = m_dev->request_program(post_spirv::fullscreen_vert, sizeof(post_spirv::fullscreen_vert),
+                                                                  hw_spirv::date_stencil_frag, sizeof(hw_spirv::date_stencil_frag),
+                                                                  &fsVert, &stencilFrag);
+                    const char *e = std::getenv("RT_HWGS_STENCIL_DATE");
+                    m_stencilDate = m_dateStencilProgram && !(e && *e == '0') &&
+                                    m_dev->image_format_is_supported(VK_FORMAT_D32_SFLOAT_S8_UINT,
+                                                                     VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                                                         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT);
+                    m_depthFormat = m_stencilDate ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
                 }
                 if (!m_drawProgram)
                 {
@@ -533,6 +552,54 @@ namespace ps2x::gs
                 return true;
             }
 
+            // A sprite covers the GS pixels whose sample point (the pixel's corner) it contains, at
+            // any render scale, as paraLLEl-GS snaps sprite rasterisation: its edges move to whole
+            // GS pixels (ceil: the GS's top-left rule), its attributes along with them.
+            static void snapSprite(HwVertex &a, HwVertex &b, bool snapX, bool snapY)
+            {
+                auto snap = [](float &p0, float &p1, float *a0, float *a1, int n) {
+                    const float q0 = std::ceil(p0), q1 = std::ceil(p1);
+                    if (p1 != p0)
+                    {
+                        const float k0 = (q0 - p0) / (p1 - p0), k1 = (q1 - p0) / (p1 - p0);
+                        for (int i = 0; i < n; ++i)
+                        {
+                            const float d = a1[i] - a0[i], base = a0[i];
+                            a0[i] = base + d * k0;
+                            a1[i] = base + d * k1;
+                        }
+                    }
+                    p0 = q0, p1 = q1;
+                };
+                // S (or U) runs along x, T (or V) along y.
+                if (snapX)
+                    snap(a.x, b.x, &a.s, &b.s, 1);
+                if (snapY)
+                    snap(a.y, b.y, &a.t, &b.t, 1);
+            }
+
+            // How 2D (sprites, flat triangles) is drawn above 1x, as paraLLEl-GS supersamples it:
+            // coverage snapped to GS pixels and attributes (texture coordinates, colour, fog) taken
+            // at the GS pixel's sample point, across always, down except for interlaced fields shown
+            // as fields (field-aware there: the supersampled lines are the frame's, and alternate
+            // fields land between each other); the mode is the last Present's (before the first,
+            // m_yScale's guess). Measured against paraLLEl-GS on the regression
+            // suite's pictures (menus, cards, HUD text: crisp, no half-texel blur or shift).
+            // RT_HWGS_SNAP=<letters> overrides: X, Y snap coverage, x, y attributes on that axis.
+            struct Snap
+            {
+                bool coverX, coverY, attrX, attrY;
+            };
+            Snap snapRules() const
+            {
+                static const char *env = std::getenv("RT_HWGS_SNAP");
+                if (env)
+                    return {std::strchr(env, 'X') != nullptr, std::strchr(env, 'Y') != nullptr, std::strchr(env, 'x') != nullptr,
+                            std::strchr(env, 'y') != nullptr};
+                const bool down = !m_fieldAware.load(std::memory_order_relaxed);
+                return {true, down, true, down};
+            }
+
             void Submit(const GSPrimitiveBatch &batch) override
             {
                 const GSDrawState &state = batch.state;
@@ -606,6 +673,10 @@ namespace ps2x::gs
                     HwVertex v0 = convert(a, b), v1 = convert(b, b);
                     v0.z = v1.z; // a sprite takes Z (and colour, fog) from its second vertex
                     v0.fog = v1.fog;
+                    {
+                        const Snap rules = snapRules();
+                        snapSprite(v0, v1, rules.coverX, rules.coverY);
+                    }
                     HwVertex v2 = v0, v3 = v0;
                     v2.x = v1.x, v2.s = v1.s; // top-right
                     v3.y = v1.y, v3.t = v1.t; // bottom-left
@@ -618,6 +689,11 @@ namespace ps2x::gs
                     const GSVertex &flat = batch.vertices[2];
                     for (int i = 0; i < 3; ++i)
                         m_stage.push_back(convert(batch.vertices[i], state.prim.iip ? batch.vertices[i] : flat));
+                    // 2D as paraLLEl-GS tells it: one Z and, with STQ, one Q.
+                    const auto &v = batch.vertices;
+                    if (m_current.flat && (v[0].z != v[1].z || v[1].z != v[2].z ||
+                                           (state.prim.tme && !state.prim.fst && (v[0].q != v[1].q || v[1].q != v[2].q))))
+                        m_current.flat = false;
                 }
                 // The UI mask: the HUD's triangles, drawn into a mask at Present.
                 if (batch.vertexClass == 1u)
@@ -1050,7 +1126,7 @@ namespace ps2x::gs
                 {
                     if (!s.w || !s.h || s.sx != sx || s.sy != sy)
                         continue;
-                    auto info = Vulkan::ImageCreateInfo::render_target(s.w, s.h, VK_FORMAT_D32_SFLOAT);
+                    auto info = Vulkan::ImageCreateInfo::render_target(s.w, s.h, m_depthFormat);
                     info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
                     info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                     auto image = m_dev->create_image(info);
@@ -1164,6 +1240,8 @@ namespace ps2x::gs
                     // A frame whose drawing was skipped: the last picture stays (no new scanout).
                     const Vulkan::Image *scan = request.frameSkipped ? nullptr : scanout(*cmd, request);
                     noteMapPresent();
+                    // Drawing from here on (the next frame) snaps as this scanout shows (snapRules).
+                    m_fieldAware = (request.smode2 & 3u) == 3u && !request.progressiveFields;
                     if (scan && m_shared && m_shared->wantUi.load(std::memory_order_relaxed))
                         drawUiMask(*cmd);
                     m_uiDraw.clear();
@@ -1759,14 +1837,14 @@ namespace ps2x::gs
                 if (!d || d->get_width() != w || d->get_height() != h)
                 {
                     endPass(cmd, passOpen);
-                    auto info = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_D32_SFLOAT);
+                    auto info = Vulkan::ImageCreateInfo::render_target(w, h, m_depthFormat);
                     info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT; // the depth snapshot (temporal upscalers)
                     info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                     d = m_dev->create_image(info);
                     cmd.image_barrier(*d, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
                                       0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
                     VkClearValue zero = {};
-                    cmd.clear_image(*d, zero, VK_IMAGE_ASPECT_DEPTH_BIT);
+                    cmd.clear_image(*d, zero, m_stencilDate ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT);
                     cmd.image_barrier(*d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
                                       VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                       VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
@@ -2154,6 +2232,8 @@ namespace ps2x::gs
                     const GSDrawState &s = b.state;
                     if (!m_inShadow && ((s.context.test >> 14) & 1u))
                         ++m_stats.dateBatches;
+                    if (!m_inShadow && debugSkip(b, vertices))
+                        continue;
                     const GSContext &ctx = s.context;
                     const uint32_t fpsm = ctx.frame.psm;
                     if (fpsm != GS_PSM_CT32 && fpsm != GS_PSM_CT24)
@@ -2189,8 +2269,12 @@ namespace ps2x::gs
                     const uint32_t ztst = (ctx.test >> 17) & 3u;
                     const bool zwrite = !ctx.zbuf.zmask && !toMap;
                     const bool useDepth = !toMap && ((zte && ztst != 1u) || zwrite);
+                    // DATE through the stencil aspect of the Z buffer's image (Z itself only tested
+                    // and written as the draw says). Not in the map layer (no Z buffer of its size:
+                    // the shader tests the snapshot there).
+                    const bool dateStencil = ((ctx.test >> 14) & 1u) && m_stencilDate && !toMap;
                     const Vulkan::Image *depthImage = nullptr;
-                    if (useDepth)
+                    if (useDepth || dateStencil)
                         depthImage = depth(ctx.zbuf.zbp, t, cmd, passOpen).get();
 
                     // The texture: decoded, or a snapshot of a render target.
@@ -2278,6 +2362,8 @@ namespace ps2x::gs
 
                     const float devW = static_cast<float>(t.color->get_width()), devH = static_cast<float>(t.color->get_height());
                     const float sx = static_cast<float>(t.sx), sy = static_cast<float>(t.sy);
+                    if (dateStencil)
+                        dateStencilPrepass(cmd, b, vertices, ctx, *destView, sx, sy, devW, devH);
 
                     // The pipeline's state (applyPipe; noted for the next start's warm-up).
                     PipeKey key;
@@ -2285,7 +2371,7 @@ namespace ps2x::gs
                     key.motion = motionImage != nullptr;
 
                     // Depth.
-                    if (depthImage)
+                    if (depthImage && useDepth)
                     {
                         static const VkCompareOp ops[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS,
                                                            VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
@@ -2406,6 +2492,20 @@ namespace ps2x::gs
                     p.texa[1] = s.texa.aem ? 1.0f : 0.0f;
                     p.texa[2] = s.texa.ta1;
                     p.texa[3] = ct24Target ? 1.0f : 0.0f;
+                    // Above 1x, 2D's attributes as paraLLEl-GS interpolates them when it supersamples
+                    // (snapRules). Not for render-target textures (post-passes copy device pixels
+                    // 1:1) or texture-pack images (filtered at full resolution).
+                    if ((sx > 1.0f || sy > 1.0f) && !b.replacement && !b.fromTarget)
+                    {
+                        const Snap rules = snapRules();
+                        if (s.prim.type == GS_PRIM_SPRITE || b.flat)
+                        {
+                            // The snap scale per axis (1 = none), 4 bits each.
+                            p.texOffset[2] = 1.0f;
+                            p.texOffset[3] = static_cast<float>((rules.attrX ? static_cast<uint32_t>(sx) : 1u) |
+                                                                ((rules.attrY ? static_cast<uint32_t>(sy) : 1u) << 4));
+                        }
+                    }
                     p.mode[0] = flags;
                     p.mode[1] = (test >> 1) & 7u;
                     p.mode[2] = (test >> 4) & 0xFFu;
@@ -2413,7 +2513,7 @@ namespace ps2x::gs
                     const uint32_t afail = (test >> 12) & 3u;
                     p.mode[3] = ate ? 0u : 2u;
                     if (date)
-                        p.mode[0] |= F_DATE | (((test >> 15) & 1u) ? F_DATM : 0u);
+                        p.mode[0] |= (dateStencil ? 0u : F_DATE) | (((test >> 15) & 1u) ? F_DATM : 0u);
                     cmd.set_texture(0, 1, *destView, sampler(false, false, false, false, false));
                     if (!(flags & F_RECOLOR))
                         cmd.set_uniform_buffer(0, 2, *m_noRecolor);
@@ -2429,12 +2529,69 @@ namespace ps2x::gs
                     key.spec[0] = p.mode[0];
                     key.spec[1] = p.mode[1];
                     key.spec[2] = p.mode[3];
-                    applyPipe(cmd, key);
-                    cmd.push_constants(&p, 0, sizeof(p));
-                    cmd.draw(b.vertexCount, 1, b.firstVertex);
+                    // One draw; with DATE through the stencil, the pixels whose written alpha MSB
+                    // leaves DATM (they flip the stencil: later primitives fail there) and those that
+                    // keep it are two draws (exact while a batch's pixels do one or the other, as the
+                    // game's shadows do). Packed in spec[2] above the alpha-test pass (applyPipe).
+                    const uint32_t datm = ((test >> 15) & 1u) << 12;
+                    auto drawBatch = [&](PipeKey k) {
+                        if (!dateStencil)
+                        {
+                            applyPipe(cmd, k);
+                            cmd.push_constants(&p, 0, sizeof(p));
+                            cmd.draw(b.vertexCount, 1, b.firstVertex);
+                            return;
+                        }
+                        const uint32_t amode = k.spec[2] & 0xFFu;
+                        const bool writesAlpha = k.mask & 8u;
+                        k.spec[2] = amode | (writesAlpha ? (1u << 8) | (2u << 10) : (1u << 10)) | datm;
+                        applyPipe(cmd, k);
+                        cmd.push_constants(&p, 0, sizeof(p));
+                        cmd.draw(b.vertexCount, 1, b.firstVertex);
+                        if (!writesAlpha)
+                            return;
+                        k.spec[2] = amode | (2u << 8) | (1u << 10) | datm;
+                        applyPipe(cmd, k);
+                        cmd.draw(b.vertexCount, 1, b.firstVertex);
+                    };
+                    // Pixels failing the alpha test still update what AFAIL lets them. Where Z can't
+                    // change a colour (no Z test, or Z not written), in the GS's primitive order: the
+                    // part every pixel writes, then (in order again) what only passing pixels add.
+                    // Passing pixels then failing ones (below) put a batch's failing pixels over its
+                    // later primitives: the race map's track over the car markers.
+                    // FB_ONLY: every pixel's colour and alpha, then the passing ones' Z.
+                    // ZB_ONLY: every pixel's Z, then the passing ones' colour.
+                    // RGB_ONLY: every pixel's colour, then the passing ones' alpha and Z.
+                    const bool failWrites = ate && afail != 0u && p.mode[1] != 1u;
+                    const bool zw = key.zwrite != 0;
+                    if (failWrites && (!zw || !key.ztest || key.zop == VK_COMPARE_OP_ALWAYS))
+                    {
+                        const uint32_t motionBits = key.mask & 0x30u;
+                        const uint32_t common = afail == 1u ? mask : afail == 2u ? 0u : (mask & 0x7u);
+                        const uint32_t passing = afail == 1u ? 0u : afail == 2u ? mask : (mask & 0x8u);
+                        if (common || (zw && afail == 2u))
+                        {
+                            PipeKey all = key;
+                            all.mask = static_cast<uint8_t>(common | (afail == 1u ? motionBits : 0u));
+                            all.zwrite = zw && afail == 2u;
+                            all.spec[2] = 2u; // no alpha test
+                            p.mode[3] = 2u;
+                            drawBatch(all);
+                        }
+                        if (passing || (zw && afail != 2u) || (afail != 1u && motionBits))
+                        {
+                            PipeKey pass = key;
+                            pass.mask = static_cast<uint8_t>(passing | (afail != 1u ? motionBits : 0u));
+                            pass.zwrite = zw && afail != 2u;
+                            pass.spec[2] = 0u; // the alpha test
+                            p.mode[3] = 0u;
+                            drawBatch(pass);
+                        }
+                        continue;
+                    }
+                    drawBatch(key);
 
-                    // Pixels failing the alpha test still update what AFAIL lets them.
-                    if (ate && afail != 0u && p.mode[1] != 1u)
+                    if (failWrites)
                     {
                         p.mode[3] = 1u;
                         if (afail == 1u) // FB_ONLY
@@ -2448,9 +2605,7 @@ namespace ps2x::gs
                         }
                         key.mask = static_cast<uint8_t>(mask);
                         key.spec[2] = p.mode[3];
-                        applyPipe(cmd, key);
-                        cmd.push_constants(&p, 0, sizeof(p));
-                        cmd.draw(b.vertexCount, 1, b.firstVertex);
+                        drawBatch(key);
                     }
                 }
                 endPass(cmd, passOpen);
@@ -2538,10 +2693,16 @@ namespace ps2x::gs
                     return nullptr;
                 }
                 const uint32_t sx = t.sx, sy = t.sy;
-                const uint32_t outW = w * sx, outH = h * sy;
+                // Interlaced fields at 2x and up (not progressive fields): scanned out as
+                // paraLLEl-GS does (field-aware high-resolution scanout), half a field line higher in
+                // phase 0 than in phase 1, one half line shorter, so the game's half-line offset of
+                // alternate fields (sceGsSetHalfOffset) lines the two fields' pictures up.
+                const bool interlaced = (r.smode2 & 3u) == 3u && !r.progressiveFields && sy >= 2u;
+                const uint32_t yOff = interlaced && g_displayFieldPhase.load(std::memory_order_relaxed) == 0u ? sy / 2u : 0u;
+                const uint32_t outW = w * sx, outH = h * sy - (interlaced ? sy / 2u : 0u);
                 if (!m_inShadow)
                 {
-                    m_scanGeom = {dbx, dby, sx, sy, outW, outH};
+                    m_scanGeom = {dbx, dby, sx, sy, outW, outH, yOff};
                     m_scanoutIndex = (m_scanoutIndex + 1u) % 3u;
                 }
                 Vulkan::ImageHandle &out = m_inShadow ? m_shadowScan[m_shadowSlot][m_shadowIndex] : m_scanout[m_scanoutIndex];
@@ -2558,7 +2719,7 @@ namespace ps2x::gs
                 cmd.image_barrier(*out, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT,
                                   VK_ACCESS_2_TRANSFER_WRITE_BIT);
-                cmd.copy_image(*out, *t.color, {0, 0, 0}, {static_cast<int32_t>(dbx * sx), static_cast<int32_t>(dby * sy), 0},
+                cmd.copy_image(*out, *t.color, {0, 0, 0}, {static_cast<int32_t>(dbx * sx), static_cast<int32_t>(dby * sy + yOff), 0},
                                {outW, outH, 1}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
                 cmd.image_barrier(*out, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                   VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -2587,7 +2748,7 @@ namespace ps2x::gs
                                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
                     cmd.image_barrier(*mo, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                       0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-                    cmd.copy_image(*mo, *t.motion, {0, 0, 0}, {static_cast<int32_t>(dbx * sx), static_cast<int32_t>(dby * sy), 0},
+                    cmd.copy_image(*mo, *t.motion, {0, 0, 0}, {static_cast<int32_t>(dbx * sx), static_cast<int32_t>(dby * sy + yOff), 0},
                                    {outW, outH, 1}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
                     cmd.image_barrier(*mo, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
@@ -2633,7 +2794,7 @@ namespace ps2x::gs
                 cmd.set_cull_mode(VK_CULL_MODE_NONE);
                 cmd.set_texture(0, 0, depth.get_view(), Vulkan::StockSampler::NearestClamp);
                 const float dw = static_cast<float>(depth.get_width()), dh = static_cast<float>(depth.get_height());
-                const float rect[4] = {g.dbx * g.sx / dw, g.dby * g.sy / dh, g.outW / dw, g.outH / dh};
+                const float rect[4] = {g.dbx * g.sx / dw, (g.dby * g.sy + g.yOff) / dh, g.outW / dw, g.outH / dh};
                 cmd.push_constants(rect, 0, sizeof(rect));
                 cmd.draw(3);
                 cmd.end_render_pass();
@@ -2667,7 +2828,7 @@ namespace ps2x::gs
                 {
                     verts[i] = HwVertex{};
                     verts[i].x = m_uiDraw[i][0] - static_cast<float>(g.dbx);
-                    verts[i].y = m_uiDraw[i][1] - static_cast<float>(g.dby);
+                    verts[i].y = m_uiDraw[i][1] - static_cast<float>(g.dby) - static_cast<float>(g.yOff) / static_cast<float>(g.sy);
                     verts[i].rgba = 0xFFFFFFFFu;
                     verts[i].q = 1.0f;
                 }
@@ -2756,6 +2917,90 @@ namespace ps2x::gs
 
             // ---------------------------------------------------------------- pipelines
             // The draw pipeline's state, set on `cmd` the same way for a draw and for the warm-up.
+            // DATE through the stencil: before the batch, stencil bit 0 = the target's alpha MSB (from
+            // its snapshot) where the batch can draw (its bounding box inside the scissor; shadows
+            // cover little of the frame).
+            void dateStencilPrepass(Vulkan::CommandBuffer &cmd, const Batch &b, const std::vector<HwVertex> &vertices,
+                                    const GSContext &ctx, const Vulkan::ImageView &dest, float sx, float sy, float devW, float devH)
+            {
+                float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
+                for (uint32_t i = b.firstVertex; i < b.firstVertex + b.vertexCount && i < vertices.size(); ++i)
+                {
+                    bx0 = std::min(bx0, vertices[i].x), bx1 = std::max(bx1, vertices[i].x);
+                    by0 = std::min(by0, vertices[i].y), by1 = std::max(by1, vertices[i].y);
+                }
+                const float x0 = std::max(static_cast<float>(ctx.scissor.x0), std::floor(bx0)) * sx;
+                const float y0 = std::max(static_cast<float>(ctx.scissor.y0), std::floor(by0)) * sy;
+                const float x1 = std::min(static_cast<float>(ctx.scissor.x1) + 1.0f, std::ceil(bx1) + 1.0f) * sx;
+                const float y1 = std::min(static_cast<float>(ctx.scissor.y1) + 1.0f, std::ceil(by1) + 1.0f) * sy;
+                VkClearRect rect = {};
+                rect.rect.offset.x = static_cast<int32_t>(std::clamp(x0, 0.0f, devW));
+                rect.rect.offset.y = static_cast<int32_t>(std::clamp(y0, 0.0f, devH));
+                rect.rect.extent.width = static_cast<uint32_t>(std::max(0.0f, std::clamp(x1, 0.0f, devW) - rect.rect.offset.x));
+                rect.rect.extent.height = static_cast<uint32_t>(std::max(0.0f, std::clamp(y1, 0.0f, devH) - rect.rect.offset.y));
+                rect.layerCount = 1;
+                if (!rect.rect.extent.width || !rect.rect.extent.height)
+                    return;
+                VkClearValue zero = {};
+                cmd.clear_quad(0, rect, zero, VK_IMAGE_ASPECT_STENCIL_BIT);
+                cmd.set_program(m_dateStencilProgram);
+                cmd.set_opaque_state();
+                cmd.set_cull_mode(VK_CULL_MODE_NONE);
+                cmd.set_depth_test(false, false);
+                cmd.set_color_write_mask(0u);
+                cmd.set_scissor(rect.rect);
+                cmd.set_stencil_test(true);
+                cmd.set_stencil_ops(VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP);
+                cmd.set_stencil_reference(1u, 1u, 1u);
+                cmd.set_specialization_constant_mask(0);
+                cmd.set_texture(0, 0, dest, sampler(false, false, false, false, false));
+                cmd.draw(3);
+            }
+
+            // Finding which draw a difference against paraLLEl-GS comes from (scripts/hwgs_ab.py):
+            // RT_HWGS_BATCH_LOG=<file> logs every batch recorded (state, bounding box; "record N"
+            // before each recording), RT_HWGS_DROP=<TEST hex>,... leaves out the batches with those
+            // TEST values (t<hex>), ALPHA values (a<hex>) or TEX0.TBP0 (b<dec>).
+            bool debugSkip(const Batch &b, const std::vector<HwVertex> &vertices)
+            {
+                static FILE *log = [] {
+                    const char *p = std::getenv("RT_HWGS_BATCH_LOG");
+                    return p && *p ? std::fopen(p, "w") : nullptr;
+                }();
+                static const std::string drop = [] {
+                    const char *e = std::getenv("RT_HWGS_DROP");
+                    return e ? "," + std::string(e) + "," : std::string();
+                }();
+                if (!log && drop.empty())
+                    return false;
+                const GSContext &c = b.state.context;
+                const unsigned long long test = c.test & 0x7FFFFu, alpha = c.alpha & 0xFF000000FFull;
+                if (log)
+                {
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+                    for (uint32_t i = b.firstVertex; i < b.firstVertex + b.vertexCount && i < vertices.size(); ++i)
+                    {
+                        x0 = std::min(x0, vertices[i].x), x1 = std::max(x1, vertices[i].x);
+                        y0 = std::min(y0, vertices[i].y), y1 = std::max(y1, vertices[i].y);
+                        z0 = std::min(z0, vertices[i].z), z1 = std::max(z1, vertices[i].z);
+                    }
+                    std::fprintf(log,
+                                 "frame=%llu fbp=%u zbp=%u prim=%u tme=%u abe=%u fge=%u test=%05llx alpha=%llx zmsk=%u tbp=%u tw=%u th=%u "
+                                 "psm=%u tfx=%u tcc=%u tex1=%llx target=%d flat=%d verts=%u box=%.1f,%.1f,%.1f,%.1f z=%.7f..%.7f\n",
+                                 static_cast<unsigned long long>(m_frame.load()), c.frame.fbp, c.zbuf.zbp, b.state.prim.type, b.state.prim.tme,
+                                 b.state.prim.abe, b.state.prim.fge, test, alpha, c.zbuf.zmask, c.tex0.tbp0, 1u << c.tex0.tw,
+                                 1u << c.tex0.th, c.tex0.psm, c.tex0.tfx, c.tex0.tcc,
+                                 static_cast<unsigned long long>(c.tex1 & 0xFFFFFFFFFull), b.fromTarget ? 1 : 0, b.flat ? 1 : 0,
+                                 b.vertexCount, x0, y0, x1, y1, z0, z1);
+                }
+                char t[32], a[32], tb[32];
+                std::snprintf(t, sizeof(t), ",t%llx,", test);
+                std::snprintf(a, sizeof(a), ",a%llx,", alpha);
+                std::snprintf(tb, sizeof(tb), ",b%u,", c.tex0.tbp0);
+                return !drop.empty() && (drop.find(t) != std::string::npos || drop.find(a) != std::string::npos ||
+                                         (b.state.prim.tme && drop.find(tb) != std::string::npos));
+            }
+
             void applyPipe(Vulkan::CommandBuffer &cmd, const PipeKey &k, bool note = true)
             {
                 cmd.set_program(m_drawProgram);
@@ -2780,10 +3025,21 @@ namespace ps2x::gs
                 else
                     cmd.set_blend_enable(false);
                 cmd.set_color_write_mask(k.mask);
-                cmd.set_specialization_constant_mask(0x7);
+                // spec[2]: the alpha-test pass (bits 0-7), DATE through the stencil (record()): the
+                // shader's DATE split (8-9), the stencil op (10-11: 1 test, 2 test and invert on
+                // pass) and DATM, the stencil value that passes (12).
+                if (const uint32_t st = (k.spec[2] >> 10) & 3u)
+                {
+                    cmd.set_stencil_test(true);
+                    cmd.set_stencil_ops(VK_COMPARE_OP_EQUAL, st == 2u ? VK_STENCIL_OP_INVERT : VK_STENCIL_OP_KEEP,
+                                        VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP);
+                    cmd.set_stencil_reference(1u, 1u, static_cast<uint8_t>((k.spec[2] >> 12) & 1u));
+                }
+                cmd.set_specialization_constant_mask(0xF);
                 cmd.set_specialization_constant(0, k.spec[0]);
                 cmd.set_specialization_constant(1, k.spec[1]);
-                cmd.set_specialization_constant(2, k.spec[2]);
+                cmd.set_specialization_constant(2, k.spec[2] & 0xFFu);
+                cmd.set_specialization_constant(3, (k.spec[2] >> 8) & 3u);
                 if (note && !m_pipeStatesPath.empty())
                 {
                     const uint64_t h = k.hash();
@@ -2882,7 +3138,7 @@ namespace ps2x::gs
                         return m_dev->create_image(Vulkan::ImageCreateInfo::render_target(1, 1, format));
                     };
                     auto color = target(VK_FORMAT_R8G8B8A8_UNORM), motion = target(VK_FORMAT_R16G16_SFLOAT),
-                         depth = target(VK_FORMAT_D32_SFLOAT);
+                         depth = target(m_depthFormat);
                     Vulkan::BufferCreateInfo vb = {};
                     vb.size = 3 * sizeof(HwVertex);
                     vb.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
@@ -3000,11 +3256,15 @@ namespace ps2x::gs
             std::atomic<uint32_t> m_scale{2};
             std::atomic<bool> m_rescale{false};
             // Progressive fields (the default) until the first Present says otherwise; RT_PROGRESSIVE_FIELDS=0
-            // (the regression harness) says so before any target is made.
-            std::atomic<uint32_t> m_yScale{[] {
+            // (the regression harness) says so before any target is made (drawing doesn't depend on
+            // when the host first presents: save states replay the same pictures).
+            static bool interlacedFromEnv()
+            {
                 const char *pf = std::getenv("RT_PROGRESSIVE_FIELDS");
-                return pf && std::strcmp(pf, "0") == 0 ? 1u : 2u;
-            }()};
+                return pf && std::strcmp(pf, "0") == 0;
+            }
+            std::atomic<bool> m_fieldAware{interlacedFromEnv()}; // interlaced fields shown as fields (Snap)
+            std::atomic<uint32_t> m_yScale{interlacedFromEnv() ? 1u : 2u};
 
             GSCpuBackend m_cpu; // transfers and readbacks over the shared local memory
             std::vector<SavedImage> m_loadedTargets, m_loadedDepths; // a state's targets, until StateLoaded
@@ -3100,6 +3360,7 @@ namespace ps2x::gs
             struct ScanGeom
             {
                 uint32_t dbx = 0, dby = 0, sx = 1, sy = 1, outW = 0, outH = 0;
+                uint32_t yOff = 0; // device rows skipped at the top (interlaced phase 0)
             } m_scanGeom;
             // Motion vectors (PgsShared::wantMotion): per-target attachments, the scanned-out part.
             bool m_motionOn = false;
@@ -3108,6 +3369,9 @@ namespace ps2x::gs
             // Depth for temporal upscalers (WantsDepthSnapshot): requested by the GS thread where the
             // HUD starts, copied after the frame's 3D is recorded.
             Vulkan::Program *m_depthCopyProgram = nullptr;
+            Vulkan::Program *m_dateStencilProgram = nullptr; // DATE: the stencil from the alpha MSB
+            bool m_stencilDate = false;                      // DATE through the stencil (D32S8 Z buffers)
+            VkFormat m_depthFormat = VK_FORMAT_D32_SFLOAT;
             bool m_depthRequested = false;
             uint32_t m_depthRequestZbp = 0, m_depthRequestFbp = 0, m_depthIndex = 0;
             std::map<uint32_t, Vulkan::ImageHandle> m_depthByFbp; // the latest snapshot per 3D frame buffer
