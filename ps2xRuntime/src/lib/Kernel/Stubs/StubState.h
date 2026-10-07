@@ -19,6 +19,9 @@ namespace ps2_stubs
     void serializeGsStubState(ps2x::StateArchive &ar);
     void serializeFileIoStubState(ps2x::StateArchive &ar);
     void serializeLibcFileState(ps2x::StateArchive &ar);
+    // After a load from the app's menu: the next sceMcGetInfo per port reports a changed card,
+    // so the game reads the card again (it may hold other saves than when the state was taken).
+    void markMemoryCardsChanged();
 }
 
 namespace ps2_syscalls

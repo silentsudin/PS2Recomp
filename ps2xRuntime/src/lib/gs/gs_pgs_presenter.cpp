@@ -1618,6 +1618,15 @@ namespace ps2x::gs
                 return id;
             }
 
+            void destroyUiTexture(uint64_t id) override
+            {
+                std::lock_guard<std::mutex> lock(m_shared.mutex);
+                pgsRegisterThread();
+                // Granite defers the image's destruction until the frames using it are done.
+                m_textures.erase(id);
+                m_nearestTextures.erase(id);
+            }
+
         private:
             struct SecondScreen
             {

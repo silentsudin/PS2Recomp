@@ -81,6 +81,7 @@ namespace ps2_stubs
         {
             std::string currentDir = "/";
             bool formatted = true;
+            bool changed = false; // host-side, not in a state: markMemoryCardsChanged()
         };
 
         std::mutex g_mcStateMutex;
@@ -894,6 +895,10 @@ namespace ps2_stubs
                 freeBlocks = state.formatted ? kMcFreeClusters : 0;
                 format = state.formatted ? kMcFormatted : kMcUnformatted;
                 result = state.formatted ? kMcResultSucceed : kMcResultNoFormat;
+                // A changed card is reported once (as libmc does after a swap): "new formatted card".
+                if (state.changed && state.formatted)
+                    result = kMcResultChangedCard;
+                state.changed = false;
             }
 
             setMcCommandResultLocked(kMcCmdGetInfo, result);
@@ -1555,6 +1560,13 @@ namespace ps2_stubs
 
 namespace ps2_stubs
 {
+    void markMemoryCardsChanged()
+    {
+        std::lock_guard<std::mutex> lock(g_mcStateMutex);
+        for (McPortState &port : g_mcPorts)
+            port.changed = true;
+    }
+
     // Card files are normally closed when a state is taken (canSnapshot waits while one is
     // open: the game is in the middle of a card operation); any that are open are saved as
     // (fd, port, path, position) and reopened read/write on load.

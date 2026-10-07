@@ -9,3 +9,7 @@ void ps2AudioOutSuspend(bool suspend);
 // and mono (left and right averaged). Applied as the sound leaves for the device, after the test
 // harness's capture. Any thread.
 void ps2AudioOutSetMix(float gain, bool mono);
+
+// Drops the sound queued for the device (a save state was loaded: what was queued belongs to the
+// moment before). Any thread.
+void ps2AudioOutFlush();

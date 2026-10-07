@@ -113,6 +113,11 @@ namespace ps2_test
         bool g_captureRequested = false;
         bool g_captureDone = false;
         std::vector<uint8_t> g_capture;
+        // The app's own picture requests (requestAppFrameCapture), apart from the socket's.
+        bool g_appCaptureRequested = false;
+        bool g_appCaptureDone = false;
+        std::vector<uint8_t> g_appCapture;
+        uint32_t g_appCaptureWidth = 0, g_appCaptureHeight = 0;
         uint32_t g_captureWidth = 0, g_captureHeight = 0;
         uint64_t g_hashInterval = 60;
 
@@ -875,7 +880,20 @@ namespace ps2_test
                 bool first = true;
                 for (const auto &[k, v] : info.metadata)
                 {
-                    reply += std::string(first ? "" : ",") + "\"" + k + "\":\"" + v + "\"";
+                    // Bytes (a thumbnail PNG) as "hex:<digits>"; quotes and backslashes escaped.
+                    const bool binary = std::any_of(v.begin(), v.end(), [](char c)
+                                                    { return static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) >= 0x7F; });
+                    std::string text;
+                    if (binary)
+                        text = "hex:" + toHex(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+                    else
+                        for (char c : v)
+                        {
+                            if (c == '"' || c == '\\')
+                                text += '\\';
+                            text += c;
+                        }
+                    reply += std::string(first ? "" : ",") + "\"" + k + "\":\"" + text + "\"";
                     first = false;
                 }
                 reply += "},\"chunks\":[";
@@ -1108,12 +1126,40 @@ namespace ps2_test
     bool frameCaptureRequested()
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        return g_captureRequested;
+        return g_captureRequested || g_appCaptureRequested;
+    }
+
+    void requestAppFrameCapture()
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_appCaptureRequested = true;
+        g_appCaptureDone = false;
+    }
+
+    bool takeAppFrameCapture(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_appCaptureDone)
+            return false;
+        g_appCaptureDone = false;
+        rgba = std::move(g_appCapture);
+        g_appCapture.clear();
+        width = g_appCaptureWidth;
+        height = g_appCaptureHeight;
+        return true;
     }
 
     void deliverFrameCapture(const std::vector<uint8_t> &rgba, uint32_t width, uint32_t height)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_appCaptureRequested)
+        {
+            g_appCapture = rgba;
+            g_appCaptureWidth = width;
+            g_appCaptureHeight = height;
+            g_appCaptureRequested = false;
+            g_appCaptureDone = true;
+        }
         if (!g_captureRequested)
             return;
         g_capture = rgba;

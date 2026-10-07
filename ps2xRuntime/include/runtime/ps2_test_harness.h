@@ -121,4 +121,9 @@ namespace ps2_test
     // and hands the latched picture (tightly packed RGBA) to it.
     bool frameCaptureRequested();
     void deliverFrameCapture(const std::vector<uint8_t> &rgba, uint32_t width, uint32_t height);
+    // The app's own picture of the game (a save state's thumbnail), any thread: ask, then poll.
+    // The next latched picture is delivered (headless too, when the game renders), as the GS
+    // scanned it out, before post-processing; empty if there was none.
+    void requestAppFrameCapture();
+    bool takeAppFrameCapture(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
 }

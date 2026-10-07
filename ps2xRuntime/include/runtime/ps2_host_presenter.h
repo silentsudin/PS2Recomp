@@ -122,6 +122,10 @@ namespace ps2x
             return 0;
         }
 
+        // Frees a texture made by createUiTexture (UI thread; after the last frame that drew it was
+        // recorded, which is any time between frames).
+        virtual void destroyUiTexture(uint64_t id) { (void)id; }
+
         // The SDL_Window of this presenter, or nullptr (raylib keeps its own).
         virtual void *sdlWindow() { return nullptr; }
 

@@ -6,6 +6,8 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_guest_clock.h"
 #include "runtime/ps2_test_harness.h"
+#include "runtime/ps2_audio_suspend.h"
+#include "Stubs/MPEG.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_runtime.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -756,6 +758,10 @@ namespace ps2_save_state
 
     void failNextLoadForTest() { g_failNextLoad.store(true); }
 
+    void markMemoryCardsChanged() { ps2_stubs::markMemoryCardsChanged(); }
+
+    bool moviePlaying() { return ps2_stubs::mpegPlaybackActive(); }
+
     bool requestLoadFile(const std::string &path, std::string &error, const std::string &resavePath)
     {
         const auto start = std::chrono::steady_clock::now();
@@ -1006,6 +1012,7 @@ namespace ps2_save_state
         }
         r.vblank = scheduler.currentVSyncTick();
         ps2_test::onStateLoaded(r.vblank);
+        ps2AudioOutFlush(); // the sound queued for the device belongs to the moment before
         // The digest right after loading matches the one taken at the save, chunk by chunk
         // (except chunks left out).
         const auto now = digest(runtime);

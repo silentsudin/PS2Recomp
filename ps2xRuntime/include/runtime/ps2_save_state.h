@@ -82,6 +82,13 @@ namespace ps2_save_state
     // `resavePath`: right after a successful load, the machine is saved there again (tests: a
     // state loaded and saved again is the same bytes, except EETM's wall-clock deadlines).
     bool requestLoadFile(const std::string &path, std::string &error, const std::string &resavePath = {});
+    // The app's menu after a load it asked for: the memory cards read as changed (the game's next
+    // sceMcGetInfo per port says so, and the game reads them again). Test loads leave it out, so
+    // that a load replays exactly as the game ran after the save. (Every load also drops the sound
+    // queued for the device.)
+    void markMemoryCardsChanged();
+    // Any thread: a movie is playing (no state can be taken until it ends).
+    bool moviePlaying();
     // Tests: the next load fails its last check (after the machine was overwritten), so the
     // machine is put back as it was.
     void failNextLoadForTest();

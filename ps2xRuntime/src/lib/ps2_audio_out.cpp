@@ -116,6 +116,13 @@ void ps2AudioOutSetMix(float gain, bool mono)
     g_mono = mono;
 }
 
+void ps2AudioOutFlush()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_read = g_write = g_count = 0;
+    g_frac = 0.0;
+}
+
 void ps2AudioOutSubmit(const int16_t *interleavedStereo, size_t frames)
 {
     // RT_AUDIO_DUMP=<file>: also write everything as raw s16le 48 kHz stereo (diagnostics).
