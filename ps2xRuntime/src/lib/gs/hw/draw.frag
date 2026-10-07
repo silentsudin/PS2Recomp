@@ -95,17 +95,30 @@ void main()
         if ((flags & F_REPLACED) != 0u)
         {
             // A texture-pack image for the texture's rect (texOffset = -its origin, texNorm.zw =
-            // 1 / its size): filtered by the hardware with implicit derivatives (mips, anisotropy).
+            // 1 / its size): filtered by the hardware (mips, anisotropy).
+            // Clamped axes stay inside the texels the GS could reach ([0, TW) or [MINU, MAXU + 1)),
+            // inset so the filter footprint (half a pack texel when magnified, half the pixel's
+            // footprint when minified) never reaches past them: the image is often a whole atlas
+            // upload, and the GS point-sampled the region where we filter (a line of the
+            // neighbouring sprite showed beside HUD parts).
             uint ws = (flags >> 5) & 3u, wt = (flags >> 7) & 3u;
-            if (ws == 1u)
-                texel.x = clamp(texel.x, 0.0, push.texNorm.x);
-            else if (ws == 2u)
-                texel.x = clamp(texel.x, push.region.x, push.region.y + 1.0);
-            if (wt == 1u)
-                texel.y = clamp(texel.y, 0.0, push.texNorm.y);
-            else if (wt == 2u)
-                texel.y = clamp(texel.y, push.region.z, push.region.w + 1.0);
-            vec4 c = texture(uTex, (texel + push.texOffset.xy) * push.texNorm.zw) * 255.0;
+            // The gradients are the unclamped coordinates' (a clamped edge keeps its mip level).
+            vec2 dx = dFdx(texel), dy = dFdy(texel);
+            vec2 half_ = max(0.5 / (vec2(textureSize(uTex, 0)) * push.texNorm.zw), 0.5 * max(abs(dx), abs(dy)));
+            if (ws == 1u || ws == 2u)
+            {
+                float lo = ws == 1u ? 0.0 : push.region.x, hi = ws == 1u ? push.texNorm.x : push.region.y + 1.0;
+                float h = min(half_.x, 0.5 * (hi - lo));
+                texel.x = clamp(texel.x, lo + h, hi - h);
+            }
+            if (wt == 1u || wt == 2u)
+            {
+                float lo = wt == 1u ? 0.0 : push.region.z, hi = wt == 1u ? push.texNorm.y : push.region.w + 1.0;
+                float h = min(half_.y, 0.5 * (hi - lo));
+                texel.y = clamp(texel.y, lo + h, hi - h);
+            }
+            vec4 c = textureGrad(uTex, (texel + push.texOffset.xy) * push.texNorm.zw, dx * push.texNorm.zw,
+                                 dy * push.texNorm.zw) * 255.0;
             if ((flags & F_RECOLOR) != 0u)
                 c = clamp(vec4(dot(uRecolor.rows[0], c), dot(uRecolor.rows[1], c), dot(uRecolor.rows[2], c),
                                dot(uRecolor.rows[3], c)) + uRecolor.rows[4], vec4(0.0), vec4(255.0));
