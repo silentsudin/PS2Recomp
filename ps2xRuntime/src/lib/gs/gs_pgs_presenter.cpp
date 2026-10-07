@@ -2218,6 +2218,24 @@ namespace ps2x::gs
                 if (!m_capturePath.empty())
                     captureLocked(fw, fh);
                 schedulePresent();
+                if (m_shared.submitsUnderLock)
+                {
+                    // The present can block in the driver for many milliseconds (Adreno sleeps in
+                    // queueBuffer), and the hardware GS, which keeps no command buffer open outside
+                    // the lock, would wait for it all that time and miss the game's vblank: the
+                    // lock is let go for it, as for begin_frame. (RT_PRESENT_UNDER_LOCK=1: as before.)
+                    static const bool underLock = [] { const char *e = std::getenv("RT_PRESENT_UNDER_LOCK"); return e && *e == '1'; }();
+                    if (!underLock)
+                    {
+                        m_lockHeldMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lockedAt).count();
+                        lock.unlock();
+                        m_wsi.end_frame();
+                        lock.lock();
+                        lockedAt = std::chrono::steady_clock::now();
+                        renderSecondScreen();
+                        return;
+                    }
+                }
                 m_wsi.end_frame();
                 renderSecondScreen();
             }

@@ -21,10 +21,24 @@ namespace ps2x::gs
         HostPresenter *presenter = nullptr;
         // Vulkan library to load for a device of its own (e.g. a bundled libMoltenVK.dylib).
         std::string vulkanLibrary;
+        // Directory for the persistent Vulkan pipeline cache and the pipeline states drawn (compiled
+        // ahead at the next start). Empty = neither.
+        std::string pipelineCacheDir;
     };
 
     // nullptr (and `error`) if Vulkan is unavailable. `control` gets the runtime settings
     // interface: supersampling 1/4/16 select a render scale of 1x/2x/4x.
     std::unique_ptr<GSRasterBackend> createHwBackend(const HwOptions &options, std::string &error,
                                                      PgsControl **control = nullptr);
+
+    // The draw pipeline states the hardware GS knows (built in, and those drawn before on this
+    // device) are compiled on a worker from the moment it starts: from the persistent pipeline
+    // cache in milliseconds, or, on a first run or after a driver or app update, in seconds (the
+    // app shows "Preparing graphics" meanwhile). False if `backend` isn't the hardware GS.
+    struct HwPipelinePrep
+    {
+        uint32_t total = 0; // states to compile
+        uint32_t done = 0;  // of those, compiled (or already there)
+    };
+    bool hwPipelinePrep(GSRasterBackend *backend, HwPipelinePrep &out);
 }

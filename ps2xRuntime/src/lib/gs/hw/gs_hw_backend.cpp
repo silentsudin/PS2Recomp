@@ -23,13 +23,19 @@
 #include "gs_hw_textures.h"
 
 #include "context.hpp"
+#include "command_buffer.hpp"
 #include "device.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -38,6 +44,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 
 namespace ps2x::gs
 {
@@ -54,6 +63,61 @@ namespace ps2x::gs
             uint32_t motion; // screen motion (two halves, GS pixels; 0 for the HUD and 2D)
         };
         static_assert(sizeof(HwVertex) == 36);
+
+        // A draw pipeline's state: everything of it that varies between the game's draws (the
+        // render pass's attachments, depth, blending, write mask and the shader's specialisation
+        // constants). Every state drawn is noted in the cache directory, and the known states
+        // (those and the list built in, hw_pipeline_states.inc) are compiled on a worker at start,
+        // so the GS thread finds them ready instead of compiling for 8-25 ms in the middle of a
+        // frame (Adreno; ~100 of them in a town at first).
+        struct PipeKey
+        {
+            uint8_t depth = 0, motion = 0;  // attachments: D32F depth, RG16F motion
+            uint8_t ztest = 0, zwrite = 0;
+            uint8_t zop = VK_COMPARE_OP_GREATER_OR_EQUAL; // (set_opaque_state's, when untouched)
+            uint8_t blend = 0, src = 0, dst = 0, op = 0;
+            uint8_t mask = 0xF;
+            uint32_t spec[3] = {};
+
+            uint64_t hash() const
+            {
+                uint64_t h = 1469598103934665603ull;
+                const uint32_t words[] = {uint32_t(depth) | uint32_t(motion) << 8 | uint32_t(ztest) << 16 | uint32_t(zwrite) << 24,
+                                          uint32_t(zop) | uint32_t(blend) << 8 | uint32_t(src) << 16 | uint32_t(dst) << 24,
+                                          uint32_t(op) | uint32_t(mask) << 8, spec[0], spec[1], spec[2]};
+                for (uint32_t w : words)
+                    h = (h ^ w) * 1099511628211ull;
+                return h;
+            }
+            std::string text() const
+            {
+                char line[96];
+                std::snprintf(line, sizeof(line), "%u %u %u %u %u %u %u %u %u %u %u %u %u", depth, motion, ztest, zwrite, zop,
+                              blend, src, dst, op, mask, spec[0], spec[1], spec[2]);
+                return line;
+            }
+            static bool parse(const char *line, PipeKey &k)
+            {
+                unsigned v[13];
+                if (std::sscanf(line, "%u %u %u %u %u %u %u %u %u %u %u %u %u", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6],
+                                &v[7], &v[8], &v[9], &v[10], &v[11], &v[12]) != 13)
+                    return false;
+                k.depth = uint8_t(v[0] != 0), k.motion = uint8_t(v[1] != 0), k.ztest = uint8_t(v[2] != 0), k.zwrite = uint8_t(v[3] != 0);
+                k.zop = uint8_t(std::min(v[4], 7u)), k.blend = uint8_t(v[5] != 0);
+                k.src = uint8_t(std::min(v[6], unsigned(VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA)));
+                k.dst = uint8_t(std::min(v[7], unsigned(VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA)));
+                k.op = uint8_t(std::min(v[8], unsigned(VK_BLEND_OP_MAX)));
+                k.mask = uint8_t(v[9] & (v[1] ? 0x3Fu : 0xFu));
+                k.spec[0] = v[10], k.spec[1] = v[11], k.spec[2] = v[12];
+                return true;
+            }
+        };
+
+        // States the game draws with (RT_GS_BACKEND=hw), recorded on the AYN Thor across towns, the
+        // open world, races and menus: compiled at the first start, before any is in the cache.
+        const char *const kBuiltinPipeStates[] = {
+#include "hw_pipeline_states.inc"
+        };
 
         struct Push
         {
@@ -244,6 +308,7 @@ namespace ps2x::gs
         public:
             ~HwBackend() override
             {
+                stopPipelineWorker();
                 if (!m_shared || m_own)
                 {
                     if (m_own)
@@ -342,6 +407,8 @@ namespace ps2x::gs
                 ubo.domain = Vulkan::BufferDomain::Device;
                 const float zero[20] = {};
                 m_noRecolor = m_dev->create_buffer(ubo, zero);
+                loadPipelineCache(options.pipelineCacheDir);
+                warmUpPipelines();
 
                 m_shared->attached = true;
                 m_shared->scanoutRing = 3; // m_scanout
@@ -826,7 +893,7 @@ namespace ps2x::gs
                                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
                     record(*cmd, batches, vertices);
                     const Vulkan::Image *scan = scanout(*cmd, request);
-                    publishMap(*cmd);
+                    noteMapPresent();
                     if (scan && m_shared && m_shared->wantUi.load(std::memory_order_relaxed))
                         drawUiMask(*cmd);
                     m_uiDraw.clear();
@@ -1498,7 +1565,7 @@ namespace ps2x::gs
                 m_mapBox[2] = std::max(m_mapBox[2], x1), m_mapBox[3] = std::max(m_mapBox[3], y1);
             }
 
-            // At Present: hands this frame's map (if one was drawn) to the second screen.
+            // At the end of a map's run of batches: hands it to the second screen.
             void publishMap(Vulkan::CommandBuffer &cmd)
             {
                 if (!m_shared)
@@ -1544,8 +1611,19 @@ namespace ps2x::gs
                     const float pixelAspect = (4.0f / 3.0f) * 224.0f / 640.0f;
                     m_shared->mapAspect = (m_mapBox[2] - m_mapBox[0]) * pixelAspect / (m_mapBox[3] - m_mapBox[1]);
                     m_mapIndex ^= 1u;
-                    m_mapMissed = 0;
+                    m_mapPublished = true;
                 }
+                m_mapDrawn = false;
+                m_mapClipped[0] = m_mapClipped[1] = m_mapClipped[2] = m_mapClipped[3] = false;
+            }
+
+            // At Present: presents without a map (the map's run ends publish it, publishMap).
+            void noteMapPresent()
+            {
+                if (!m_shared)
+                    return;
+                if (m_mapPublished || m_mapDrawn)
+                    m_mapMissed = 0;
                 else
                 {
                     ++m_mapMissed;
@@ -1554,8 +1632,7 @@ namespace ps2x::gs
                     if (m_mapMissed > 120)
                         m_mapStable[0] = m_mapStable[2] = 0; // the next map (another course or town) gets its own box
                 }
-                m_mapDrawn = false;
-                m_mapClipped[0] = m_mapClipped[1] = m_mapClipped[2] = m_mapClipped[3] = false;
+                m_mapPublished = false;
             }
 
             void endPass(Vulkan::CommandBuffer &cmd, bool &passOpen)
@@ -1777,6 +1854,21 @@ namespace ps2x::gs
                     const bool toMap = b.map && m_shared && m_shared->wantMap.load(std::memory_order_relaxed);
                     if (toMap && m_inShadow)
                         continue; // (the real frame draws it into the map layer, not the frame)
+                    // A frame's map goes to the second screen when the game moves on to its other
+                    // frame buffer (the next frame), not at Present: the GS thread runs up to a frame
+                    // behind the EE, so a Present could come in the middle of a map (half a map
+                    // shown) or after two (drawn over each other): the map flashed. (Not at the end
+                    // of a run of map batches either: other drawing comes between the map's parts.)
+                    if (!m_inShadow)
+                    {
+                        if (m_mapDrawn && ctx.frame.fbp != m_mapFbp)
+                        {
+                            endPass(cmd, passOpen);
+                            publishMap(cmd);
+                        }
+                        if (toMap)
+                            m_mapFbp = ctx.frame.fbp;
+                    }
                     Target &t = toMap ? mapLayer(frameTarget, cmd, passOpen) : frameTarget;
                     if (toMap)
                         noteMapBox(b, vertices);
@@ -1875,27 +1967,20 @@ namespace ps2x::gs
                     const float devW = static_cast<float>(t.color->get_width()), devH = static_cast<float>(t.color->get_height());
                     const float sx = static_cast<float>(t.sx), sy = static_cast<float>(t.sy);
 
-                    cmd.set_program(m_drawProgram);
-                    cmd.set_opaque_state();
-                    cmd.set_cull_mode(VK_CULL_MODE_NONE);
-                    cmd.set_primitive_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
-                    cmd.set_vertex_attrib(0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(HwVertex, x));
-                    cmd.set_vertex_attrib(1, 0, VK_FORMAT_R32_SFLOAT, offsetof(HwVertex, z));
-                    cmd.set_vertex_attrib(2, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(HwVertex, rgba));
-                    cmd.set_vertex_attrib(3, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(HwVertex, s));
-                    cmd.set_vertex_attrib(4, 0, VK_FORMAT_R32_SFLOAT, offsetof(HwVertex, fog));
-                    cmd.set_vertex_attrib(5, 0, VK_FORMAT_R16G16_SFLOAT, offsetof(HwVertex, motion));
+                    // The pipeline's state (applyPipe; noted for the next start's warm-up).
+                    PipeKey key;
+                    key.depth = depthImage != nullptr;
+                    key.motion = motionImage != nullptr;
 
                     // Depth.
                     if (depthImage)
                     {
                         static const VkCompareOp ops[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS,
                                                            VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
-                        cmd.set_depth_test(true, zwrite);
-                        cmd.set_depth_compare(zte ? ops[ztst] : VK_COMPARE_OP_ALWAYS);
+                        key.ztest = 1;
+                        key.zwrite = zwrite;
+                        key.zop = static_cast<uint8_t>(zte ? ops[ztst] : VK_COMPARE_OP_ALWAYS);
                     }
-                    else
-                        cmd.set_depth_test(false, false);
 
                     // Blending.
                     if (s.prim.abe)
@@ -1907,17 +1992,16 @@ namespace ps2x::gs
                             unsupported("blend equation with a (1 + C) term");
                             src = VK_BLEND_FACTOR_ONE, dst = VK_BLEND_FACTOR_ZERO, op = VK_BLEND_OP_ADD;
                         }
-                        cmd.set_blend_enable(true);
-                        cmd.set_blend_factors(src, VK_BLEND_FACTOR_ONE, dst, VK_BLEND_FACTOR_ZERO);
-                        cmd.set_blend_op(op, VK_BLEND_OP_ADD);
+                        key.blend = 1;
+                        key.src = static_cast<uint8_t>(src);
+                        key.dst = static_cast<uint8_t>(dst);
+                        key.op = static_cast<uint8_t>(op);
                         const float fix = static_cast<float>((ctx.alpha >> 32) & 0xFFu) / 128.0f;
                         const float constants[4] = {0, 0, 0, std::min(fix, 1.0f)};
                         cmd.set_blend_constants(constants);
                         if (s.pabe)
                             unsupported("PABE");
                     }
-                    else
-                        cmd.set_blend_enable(false);
 
                     // Colour write mask: whole channels of FBMSK; a CT24 target keeps its alpha.
                     uint32_t mask = 0;
@@ -2029,11 +2113,11 @@ namespace ps2x::gs
                     // the motion output carries the colour's alpha); other blends (additive effects)
                     // leave it. The HUD writes its zero.
                     const bool motionWrite = motionImage && (!s.prim.abe || (ctx.alpha & 0xFFu) == 0x44u);
-                    cmd.set_color_write_mask(mask | (motionWrite ? 0x30u : 0u));
-                    cmd.set_specialization_constant_mask(0x7);
-                    cmd.set_specialization_constant(0, p.mode[0]);
-                    cmd.set_specialization_constant(1, p.mode[1]);
-                    cmd.set_specialization_constant(2, p.mode[3]);
+                    key.mask = static_cast<uint8_t>(mask | (motionWrite ? 0x30u : 0u));
+                    key.spec[0] = p.mode[0];
+                    key.spec[1] = p.mode[1];
+                    key.spec[2] = p.mode[3];
+                    applyPipe(cmd, key);
                     cmd.push_constants(&p, 0, sizeof(p));
                     cmd.draw(b.vertexCount, 1, b.firstVertex);
 
@@ -2042,16 +2126,17 @@ namespace ps2x::gs
                     {
                         p.mode[3] = 1u;
                         if (afail == 1u) // FB_ONLY
-                            cmd.set_depth_test(depthImage != nullptr, false);
+                            key.zwrite = 0;
                         else if (afail == 2u) // ZB_ONLY
                             mask = 0u;
                         else // RGB_ONLY
                         {
                             mask &= 0x7u;
-                            cmd.set_depth_test(depthImage != nullptr, false);
+                            key.zwrite = 0;
                         }
-                        cmd.set_color_write_mask(mask);
-                        cmd.set_specialization_constant(2, p.mode[3]);
+                        key.mask = static_cast<uint8_t>(mask);
+                        key.spec[2] = p.mode[3];
+                        applyPipe(cmd, key);
                         cmd.push_constants(&p, 0, sizeof(p));
                         cmd.draw(b.vertexCount, 1, b.firstVertex);
                     }
@@ -2357,6 +2442,213 @@ namespace ps2x::gs
                 return frame;
             }
 
+            // ---------------------------------------------------------------- pipelines
+            // The draw pipeline's state, set on `cmd` the same way for a draw and for the warm-up.
+            void applyPipe(Vulkan::CommandBuffer &cmd, const PipeKey &k, bool note = true)
+            {
+                cmd.set_program(m_drawProgram);
+                cmd.set_opaque_state();
+                cmd.set_cull_mode(VK_CULL_MODE_NONE);
+                cmd.set_primitive_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+                cmd.set_vertex_attrib(0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(HwVertex, x));
+                cmd.set_vertex_attrib(1, 0, VK_FORMAT_R32_SFLOAT, offsetof(HwVertex, z));
+                cmd.set_vertex_attrib(2, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(HwVertex, rgba));
+                cmd.set_vertex_attrib(3, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(HwVertex, s));
+                cmd.set_vertex_attrib(4, 0, VK_FORMAT_R32_SFLOAT, offsetof(HwVertex, fog));
+                cmd.set_vertex_attrib(5, 0, VK_FORMAT_R16G16_SFLOAT, offsetof(HwVertex, motion));
+                cmd.set_depth_test(k.ztest, k.zwrite);
+                cmd.set_depth_compare(static_cast<VkCompareOp>(k.zop));
+                if (k.blend)
+                {
+                    cmd.set_blend_enable(true);
+                    cmd.set_blend_factors(static_cast<VkBlendFactor>(k.src), VK_BLEND_FACTOR_ONE,
+                                          static_cast<VkBlendFactor>(k.dst), VK_BLEND_FACTOR_ZERO);
+                    cmd.set_blend_op(static_cast<VkBlendOp>(k.op), VK_BLEND_OP_ADD);
+                }
+                else
+                    cmd.set_blend_enable(false);
+                cmd.set_color_write_mask(k.mask);
+                cmd.set_specialization_constant_mask(0x7);
+                cmd.set_specialization_constant(0, k.spec[0]);
+                cmd.set_specialization_constant(1, k.spec[1]);
+                cmd.set_specialization_constant(2, k.spec[2]);
+                if (note && !m_pipeStatesPath.empty())
+                {
+                    const uint64_t h = k.hash();
+                    std::lock_guard<std::mutex> lock(m_pipeMutex);
+                    if (m_pipeSeen.insert(h).second)
+                        m_pipeNew.push_back(k);
+                }
+            }
+
+            // Compiled pipelines persist across runs in <cache>/hw_pipelines.bin (the presenter's
+            // too: it is the presenter's device), saved as the cache grows, since apps are often
+            // killed. Driver caches don't move between GPUs or drivers; the states do
+            // (<cache>/hw_pipeline_states.txt, PipeKey::text() per line).
+            void loadPipelineCache(const std::string &dir)
+            {
+                if (dir.empty())
+                    return;
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                m_pipeCachePath = (std::filesystem::path(dir) / "hw_pipelines.bin").string();
+                m_pipeStatesPath = (std::filesystem::path(dir) / "hw_pipeline_states.txt").string();
+                std::ifstream in(m_pipeCachePath, std::ios::binary);
+                std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                m_dev->init_pipeline_cache(data.empty() ? nullptr : data.data(), data.size());
+                m_pipeCacheSaved = data.size();
+                std::fprintf(stderr, "[hwgs] pipeline cache: %zu KB\n", data.size() >> 10);
+            }
+
+            void savePipelineCache()
+            {
+                if (m_pipeCachePath.empty())
+                    return;
+                const size_t size = m_dev->get_pipeline_cache_size();
+                if (size && size != m_pipeCacheSaved)
+                {
+                    std::vector<uint8_t> data(size);
+                    if (m_dev->get_pipeline_cache_data(data.data(), size))
+                    {
+                        const std::string tmp = m_pipeCachePath + ".tmp";
+                        bool ok;
+                        {
+                            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                            out.write(reinterpret_cast<const char *>(data.data()), std::streamsize(size));
+                            ok = static_cast<bool>(out);
+                        }
+                        std::error_code ec;
+                        if (ok)
+                            std::filesystem::rename(tmp, m_pipeCachePath, ec);
+                        if (ok && !ec)
+                            m_pipeCacheSaved = size;
+                    }
+                }
+                std::vector<PipeKey> fresh;
+                {
+                    std::lock_guard<std::mutex> lock(m_pipeMutex);
+                    fresh.swap(m_pipeNew);
+                }
+                if (!fresh.empty())
+                {
+                    std::ofstream out(m_pipeStatesPath, std::ios::app);
+                    for (const PipeKey &k : fresh)
+                        out << k.text() << '\n';
+                }
+            }
+
+            // Every known state compiled on a worker (RT_HWGS_WARMUP=0: none). The state is set on a
+            // command buffer in a render pass of 1x1 images with the real targets' formats, taken
+            // out (extract_pipeline_state: the same hash a draw looks up) and the command buffer
+            // dropped; the worker builds each pipeline unless a draw got there first.
+            void warmUpPipelines()
+            {
+                std::vector<PipeKey> keys;
+                std::unordered_set<uint64_t> seen;
+                auto add = [&](const char *line) {
+                    PipeKey k;
+                    if (PipeKey::parse(line, k) && seen.insert(k.hash()).second)
+                        keys.push_back(k);
+                };
+                for (const char *line : kBuiltinPipeStates)
+                    add(line);
+                if (!m_pipeStatesPath.empty())
+                {
+                    std::ifstream in(m_pipeStatesPath);
+                    for (std::string line; std::getline(in, line);)
+                        add(line.c_str());
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_pipeMutex);
+                    m_pipeSeen = seen; // only new states are written to the file
+                }
+                const char *e = std::getenv("RT_HWGS_WARMUP");
+                std::vector<Vulkan::DeferredPipelineCompile> compiles;
+                if (!keys.empty() && !(e && *e == '0'))
+                {
+                    auto target = [&](VkFormat format) {
+                        return m_dev->create_image(Vulkan::ImageCreateInfo::render_target(1, 1, format));
+                    };
+                    auto color = target(VK_FORMAT_R8G8B8A8_UNORM), motion = target(VK_FORMAT_R16G16_SFLOAT),
+                         depth = target(VK_FORMAT_D32_SFLOAT);
+                    Vulkan::BufferCreateInfo vb = {};
+                    vb.size = 3 * sizeof(HwVertex);
+                    vb.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+                    vb.domain = Vulkan::BufferDomain::Device;
+                    auto vbo = m_dev->create_buffer(vb);
+                    auto cmd = m_dev->request_command_buffer();
+                    for (uint32_t pass = 0; pass < 4; ++pass)
+                    {
+                        const bool withDepth = pass & 1u, withMotion = pass & 2u;
+                        Vulkan::RenderPassInfo rp = {};
+                        rp.num_color_attachments = withMotion ? 2 : 1;
+                        rp.color_attachments[0] = &color->get_view();
+                        if (withMotion)
+                            rp.color_attachments[1] = &motion->get_view();
+                        if (withDepth)
+                            rp.depth_stencil = &depth->get_view();
+                        bool open = false;
+                        for (const PipeKey &k : keys)
+                        {
+                            if (k.depth != withDepth || k.motion != withMotion)
+                                continue;
+                            if (!open)
+                                cmd->begin_render_pass(rp), open = true;
+                            applyPipe(*cmd, k, false);
+                            cmd->set_vertex_binding(0, *vbo, 0, sizeof(HwVertex));
+                            compiles.emplace_back();
+                            cmd->extract_pipeline_state(compiles.back());
+                        }
+                        if (open)
+                            cmd->end_render_pass();
+                    }
+                    m_dev->submit_discard(cmd);
+                }
+                m_pipeTotal = static_cast<uint32_t>(compiles.size());
+                m_pipeThread = std::thread([this, compiles = std::move(compiles)] {
+#if defined(__linux__)
+                    setpriority(PRIO_PROCESS, 0, 5); // (this thread) behind the game's
+#endif
+                    const auto start = std::chrono::steady_clock::now();
+                    uint32_t built = 0;
+                    for (const auto &c : compiles)
+                    {
+                        if (m_pipeStop)
+                            break;
+                        if (c.program->get_pipeline(c.hash).pipeline == VK_NULL_HANDLE &&
+                            Vulkan::CommandBuffer::build_graphics_pipeline(m_dev, c, Vulkan::CommandBuffer::CompileMode::AsyncThread).pipeline)
+                            ++built;
+                        m_pipeDone.fetch_add(1, std::memory_order_release);
+                    }
+                    m_pipeDone.store(m_pipeTotal, std::memory_order_release); // (stopped early: nothing to wait for)
+                    if (!compiles.empty())
+                        savePipelineCache(); // at once: the app may be killed before the next save
+                    if (!compiles.empty())
+                        std::fprintf(stderr, "[hwgs] pipelines: %zu known states, %u compiled ahead in %.0f ms\n", compiles.size(), built,
+                                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+                    while (!m_pipeStop)
+                    {
+                        std::unique_lock<std::mutex> lock(m_pipeMutex);
+                        m_pipeCv.wait_for(lock, std::chrono::seconds(10), [this] { return m_pipeStop.load(); });
+                        lock.unlock();
+                        savePipelineCache();
+                    }
+                });
+            }
+
+            void stopPipelineWorker()
+            {
+                if (!m_pipeThread.joinable())
+                    return;
+                {
+                    std::lock_guard<std::mutex> lock(m_pipeMutex);
+                    m_pipeStop = true;
+                }
+                m_pipeCv.notify_all();
+                m_pipeThread.join();
+                savePipelineCache();
+            }
+
             std::unique_lock<std::mutex> lockDevice()
             {
                 pgsRegisterThread();
@@ -2371,6 +2663,26 @@ namespace ps2x::gs
             Vulkan::Device *m_dev = nullptr;
             PgsDeviceInfo m_info;
             Vulkan::Program *m_drawProgram = nullptr;
+            // Pipelines: the persistent cache, the states drawn (noted for the next start), the
+            // worker that compiles the known ones ahead and saves both.
+            std::string m_pipeCachePath, m_pipeStatesPath;
+            size_t m_pipeCacheSaved = 0;
+            std::mutex m_pipeMutex;
+            std::condition_variable m_pipeCv;
+            std::unordered_set<uint64_t> m_pipeSeen;
+            std::vector<PipeKey> m_pipeNew;
+            std::atomic<bool> m_pipeStop{false};
+            uint32_t m_pipeTotal = 0;                // states the worker compiles at start ...
+            std::atomic<uint32_t> m_pipeDone{0};     // ... and how many it got through
+
+        public:
+            HwPipelinePrep pipelinePrep() const
+            {
+                return {m_pipeTotal, std::min(m_pipeTotal, m_pipeDone.load(std::memory_order_acquire))};
+            }
+
+        private:
+            std::thread m_pipeThread;
             Vulkan::ImageHandle m_white;
             std::unordered_map<uint32_t, Vulkan::SamplerHandle> m_samplers;
             std::atomic<uint32_t> m_scale{2};
@@ -2490,6 +2802,8 @@ namespace ps2x::gs
             Target m_mapLayers[2];
             uint32_t m_mapIndex = 0, m_mapMissed = 0;
             bool m_mapDrawn = false;
+            uint32_t m_mapFbp = 0;       // the frame buffer the map being drawn belongs to
+            bool m_mapPublished = false; // a map went to the second screen since the last Present
             float m_mapBox[4] = {};
             float m_mapStable[4] = {}; // the fixed box of the map on show
             bool m_mapClipped[4] = {};  // this frame's map edges the scissor cut
@@ -2504,6 +2818,15 @@ namespace ps2x::gs
             uint32_t m_vboSlot = 0;
             std::vector<uint32_t> m_vboPending; // slots written since the last submit
         };
+    }
+
+    bool hwPipelinePrep(GSRasterBackend *backend, HwPipelinePrep &out)
+    {
+        const auto *hw = dynamic_cast<const HwBackend *>(backend);
+        if (!hw)
+            return false;
+        out = hw->pipelinePrep();
+        return true;
     }
 
     std::unique_ptr<GSRasterBackend> createHwBackend(const HwOptions &options, std::string &error, PgsControl **control)
@@ -2525,6 +2848,11 @@ namespace ps2x::gs
     {
         error = "built without Vulkan (PS2X_ENABLE_PGS)";
         return nullptr;
+    }
+
+    bool hwPipelinePrep(GSRasterBackend *, HwPipelinePrep &)
+    {
+        return false;
     }
 }
 
