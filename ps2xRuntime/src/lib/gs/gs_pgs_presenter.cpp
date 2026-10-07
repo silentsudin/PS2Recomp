@@ -67,6 +67,9 @@
 #include <unordered_set>
 #include <cstdio>
 #include <thread>
+#include <condition_variable>
+#include <deque>
+#include <memory>
 #include <vector>
 
 namespace ps2x::gs
@@ -103,6 +106,369 @@ namespace ps2x::gs
             withTime.pNext = &times;
             return g_realQueuePresent(queue, &withTime);
         }
+
+        // Presenting off the render thread. vkQueuePresentKHR can block in the driver for many
+        // milliseconds (Adreno sleeps in queueBuffer), and Granite presents with its queue lock held
+        // (and the presenter with the device lock): the hardware GS, which needs both, then misses
+        // the game's vblank (Peach Town's main roads dropped to 20-45 fps). Presents are handed to a
+        // thread of their own, on a queue of their own when the device has a spare one in the
+        // graphics family (made with the device, PresentDeviceFactory); the swapchain calls that need
+        // its external synchronisation (acquire, past timing) take the same mutex as the presents,
+        // and whatever must not overlap a present (destroying or recreating a swapchain, waiting for
+        // the device) first lets the queued presents go out. A present's result reaches its caller
+        // with the next present to that swapchain. Android by default; RT_PRESENT_THREAD=0|1.
+        bool presentThreadWanted()
+        {
+            static const bool on = [] {
+                const char *e = std::getenv("RT_PRESENT_THREAD");
+#if defined(__ANDROID__)
+                return !(e && *e == '0');
+#else
+                return e && *e == '1';
+#endif
+            }();
+            return on;
+        }
+
+        class PresentQueue
+        {
+        public:
+            void start(VkDevice device, VkQueue dedicated, VkQueue shared, Vulkan::Device *granite, PFN_vkQueuePresentKHR present)
+            {
+                // Only on a queue of its own: on Granite's it would need Granite's queue lock, which
+                // Device::wait_idle holds while it waits for the device (and drains this thread).
+                if (!dedicated)
+                {
+                    std::fprintf(stderr, "[present] no spare queue: presents stay on the render thread\n");
+                    return;
+                }
+                m_device = device;
+                m_queue = dedicated ? dedicated : shared;
+                m_dedicated = dedicated != VK_NULL_HANDLE;
+                m_granite = granite;
+                m_present = present;
+                m_stop = false;
+                m_thread = std::thread([this] { run(); });
+                std::fprintf(stderr, "[present] presents on a thread of their own, %s\n",
+                             m_dedicated ? "on a queue of their own" : "on the graphics queue (no spare queue)");
+            }
+
+            void stop()
+            {
+                if (!m_thread.joinable())
+                    return;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_stop = true;
+                }
+                m_cv.notify_all();
+                m_thread.join();
+            }
+
+            bool running() const { return m_thread.joinable(); }
+
+            // Queues a present (a copy of it); false if it can't be copied (then present it directly).
+            bool push(const VkPresentInfoKHR *info, VkResult &result)
+            {
+                if (!info || info->swapchainCount != 1 || info->waitSemaphoreCount > 4)
+                    return false;
+                Job job;
+                job.swapchain = info->pSwapchains[0];
+                job.index = info->pImageIndices[0];
+                job.waitCount = info->waitSemaphoreCount;
+                for (uint32_t i = 0; i < job.waitCount; ++i)
+                    job.wait[i] = info->pWaitSemaphores[i];
+                for (const auto *n = static_cast<const VkBaseInStructure *>(info->pNext); n; n = n->pNext)
+                {
+                    switch (n->sType)
+                    {
+                    case VK_STRUCTURE_TYPE_PRESENT_ID_KHR:
+                    {
+                        const auto *id = reinterpret_cast<const VkPresentIdKHR *>(n);
+                        if (id->swapchainCount != 1 || !id->pPresentIds)
+                            return false;
+                        job.hasId = true, job.id = id->pPresentIds[0];
+                        break;
+                    }
+                    case VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR:
+                    {
+                        const auto *id = reinterpret_cast<const VkPresentId2KHR *>(n);
+                        if (id->swapchainCount != 1 || !id->pPresentIds)
+                            return false;
+                        job.hasId2 = true, job.id = id->pPresentIds[0];
+                        break;
+                    }
+                    case VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR:
+                    {
+                        const auto *f = reinterpret_cast<const VkSwapchainPresentFenceInfoKHR *>(n);
+                        if (f->swapchainCount != 1 || !f->pFences)
+                            return false;
+                        job.hasFence = true, job.fence = f->pFences[0];
+                        break;
+                    }
+                    case VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR:
+                    {
+                        const auto *m = reinterpret_cast<const VkSwapchainPresentModeInfoKHR *>(n);
+                        if (m->swapchainCount != 1 || !m->pPresentModes)
+                            return false;
+                        job.hasMode = true, job.mode = m->pPresentModes[0];
+                        break;
+                    }
+                    case VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE:
+                    {
+                        const auto *t = reinterpret_cast<const VkPresentTimesInfoGOOGLE *>(n);
+                        if (t->swapchainCount != 1 || !t->pTimes)
+                            return false;
+                        job.hasTime = true, job.time = t->pTimes[0];
+                        break;
+                    }
+                    default:
+                        return false; // (unknown: presented directly)
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    auto it = m_results.find(job.swapchain);
+                    result = it != m_results.end() ? it->second : VK_SUCCESS;
+                    if (it != m_results.end())
+                        m_results.erase(it);
+                    m_jobs.push_back(job);
+                    ++m_queued;
+                }
+                m_cv.notify_one();
+                return true;
+            }
+
+            // Until every queued present has gone to the driver.
+            void drain()
+            {
+                if (!running() || std::this_thread::get_id() == m_thread.get_id())
+                    return;
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_doneCv.wait(lock, [this] { return m_issued == m_queued || m_stop; });
+            }
+
+            // Until at most `pending` presents wait for the thread (the presenter keeps no backlog).
+            void waitBelow(uint64_t pending)
+            {
+                if (!running())
+                    return;
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_doneCv.wait(lock, [&] { return m_queued - m_issued <= pending || m_stop; });
+            }
+
+            // Held around calls on a swapchain that need external synchronisation with its presents
+            // (one per swapchain: the second screen's acquire doesn't wait for the main present).
+            std::mutex &swapchainMutex(VkSwapchainKHR swapchain)
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto &m = m_swapchainMutexes[swapchain];
+                if (!m)
+                    m = std::make_unique<std::mutex>();
+                return *m;
+            }
+            // Held while presenting: nothing else may use a queue then (vkDeviceWaitIdle).
+            std::mutex &presentMutex() { return m_presentMutex; }
+            bool dedicated() const { return m_dedicated; }
+
+        private:
+            struct Job
+            {
+                VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+                uint32_t index = 0, waitCount = 0;
+                VkSemaphore wait[4] = {};
+                bool hasId = false, hasId2 = false, hasFence = false, hasMode = false, hasTime = false;
+                uint64_t id = 0;
+                VkFence fence = VK_NULL_HANDLE;
+                VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+                VkPresentTimeGOOGLE time = {};
+            };
+
+            void run()
+            {
+                for (;;)
+                {
+                    Job job;
+                    {
+                        std::unique_lock<std::mutex> lock(m_mutex);
+                        m_cv.wait(lock, [this] { return m_stop || !m_jobs.empty(); });
+                        if (m_jobs.empty())
+                            break;
+                        job = m_jobs.front();
+                        m_jobs.pop_front();
+                    }
+                    VkPresentInfoKHR info = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+                    info.waitSemaphoreCount = job.waitCount;
+                    info.pWaitSemaphores = job.wait;
+                    info.swapchainCount = 1;
+                    info.pSwapchains = &job.swapchain;
+                    info.pImageIndices = &job.index;
+                    const void *chain = nullptr;
+                    VkPresentIdKHR id = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+                    VkPresentId2KHR id2 = {VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR};
+                    VkSwapchainPresentFenceInfoKHR fence = {VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR};
+                    VkSwapchainPresentModeInfoKHR mode = {VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR};
+                    VkPresentTimesInfoGOOGLE time = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
+                    if (job.hasId)
+                        id.pNext = chain, id.swapchainCount = 1, id.pPresentIds = &job.id, chain = &id;
+                    if (job.hasId2)
+                        id2.pNext = chain, id2.swapchainCount = 1, id2.pPresentIds = &job.id, chain = &id2;
+                    if (job.hasFence)
+                        fence.pNext = chain, fence.swapchainCount = 1, fence.pFences = &job.fence, chain = &fence;
+                    if (job.hasMode)
+                        mode.pNext = chain, mode.swapchainCount = 1, mode.pPresentModes = &job.mode, chain = &mode;
+                    if (job.hasTime)
+                        time.pNext = chain, time.swapchainCount = 1, time.pTimes = &job.time, chain = &time;
+                    info.pNext = chain;
+                    VkResult r;
+                    {
+                        std::lock_guard<std::mutex> presenting(m_presentMutex);
+                        std::lock_guard<std::mutex> swapchain(swapchainMutex(job.swapchain));
+                        if (m_dedicated)
+                            r = m_present(m_queue, &info);
+                        else
+                        {
+                            m_granite->external_queue_lock();
+                            r = m_present(m_queue, &info);
+                            m_granite->external_queue_unlock();
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        if (r != VK_SUCCESS)
+                            m_results[job.swapchain] = r;
+                        ++m_issued;
+                    }
+                    m_doneCv.notify_all();
+                }
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_issued = m_queued;
+                m_doneCv.notify_all();
+            }
+
+            VkDevice m_device = VK_NULL_HANDLE;
+            VkQueue m_queue = VK_NULL_HANDLE;
+            bool m_dedicated = false;
+            Vulkan::Device *m_granite = nullptr;
+            PFN_vkQueuePresentKHR m_present = nullptr;
+            std::thread m_thread;
+            std::mutex m_mutex, m_presentMutex;
+            std::unordered_map<VkSwapchainKHR, std::unique_ptr<std::mutex>> m_swapchainMutexes;
+            std::condition_variable m_cv, m_doneCv;
+            std::deque<Job> m_jobs;
+            std::unordered_map<VkSwapchainKHR, VkResult> m_results;
+            uint64_t m_queued = 0, m_issued = 0;
+            bool m_stop = false;
+        };
+        PresentQueue g_presentQueue;
+        // The device table's originals the wrappers below call.
+        PFN_vkQueuePresentKHR g_threadRealPresent = nullptr;
+        PFN_vkAcquireNextImageKHR g_realAcquire = nullptr;
+        PFN_vkDestroySwapchainKHR g_realDestroySwapchain = nullptr;
+        PFN_vkCreateSwapchainKHR g_realCreateSwapchain = nullptr;
+        PFN_vkDeviceWaitIdle g_realDeviceWaitIdle = nullptr;
+        PFN_vkWaitForPresentKHR g_realWaitForPresent = nullptr;
+
+        VKAPI_ATTR VkResult VKAPI_CALL threadedPresent(VkQueue queue, const VkPresentInfoKHR *info)
+        {
+            VkResult result = VK_SUCCESS;
+            if (g_presentQueue.running() && g_presentQueue.push(info, result))
+            {
+                if (info->pResults)
+                    info->pResults[0] = result;
+                return result;
+            }
+            // (Not copyable: in order, after the queued ones, on the caller's queue.)
+            g_presentQueue.drain();
+            std::lock_guard<std::mutex> presenting(g_presentQueue.presentMutex());
+            return g_threadRealPresent(queue, info);
+        }
+        VKAPI_ATTR VkResult VKAPI_CALL threadedAcquire(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+                                                       VkSemaphore semaphore, VkFence fence, uint32_t *index)
+        {
+            // A non-blocking acquire (the second screen's, under the device lock) doesn't wait for a
+            // present in the driver either: not ready this time.
+            std::unique_lock<std::mutex> lock(g_presentQueue.swapchainMutex(swapchain), std::defer_lock);
+            if (timeout == 0)
+            {
+                if (!lock.try_lock())
+                    return VK_NOT_READY;
+            }
+            else
+                lock.lock();
+            return g_realAcquire(device, swapchain, timeout, semaphore, fence, index);
+        }
+        VKAPI_ATTR void VKAPI_CALL threadedDestroySwapchain(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks *alloc)
+        {
+            g_presentQueue.drain();
+            std::lock_guard<std::mutex> presenting(g_presentQueue.presentMutex());
+            std::lock_guard<std::mutex> lock(g_presentQueue.swapchainMutex(swapchain));
+            g_realDestroySwapchain(device, swapchain, alloc);
+        }
+        VKAPI_ATTR VkResult VKAPI_CALL threadedCreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR *info,
+                                                               const VkAllocationCallbacks *alloc, VkSwapchainKHR *swapchain)
+        {
+            g_presentQueue.drain(); // (the old swapchain's presents first)
+            std::lock_guard<std::mutex> lock(g_presentQueue.presentMutex());
+            return g_realCreateSwapchain(device, info, alloc, swapchain);
+        }
+        VKAPI_ATTR VkResult VKAPI_CALL threadedDeviceWaitIdle(VkDevice device)
+        {
+            g_presentQueue.drain();
+            std::lock_guard<std::mutex> lock(g_presentQueue.presentMutex()); // (every queue: none presenting)
+            return g_realDeviceWaitIdle(device);
+        }
+        VKAPI_ATTR VkResult VKAPI_CALL threadedWaitForPresent(VkDevice device, VkSwapchainKHR swapchain, uint64_t id, uint64_t timeout)
+        {
+            g_presentQueue.drain(); // (the present it waits for has gone out)
+            return g_realWaitForPresent(device, swapchain, id, timeout);
+        }
+
+        // Makes the device with one more queue in the graphics family, when it has one to spare,
+        // for the presents (PresentQueue).
+        class PresentDeviceFactory final : public Vulkan::DeviceFactory
+        {
+        public:
+            VkDevice create_device(VkPhysicalDevice gpu, const VkDeviceCreateInfo *info) override
+            {
+                uint32_t familyCount = 0;
+                vkGetPhysicalDeviceQueueFamilyProperties(gpu, &familyCount, nullptr);
+                std::vector<VkQueueFamilyProperties> families(familyCount);
+                vkGetPhysicalDeviceQueueFamilyProperties(gpu, &familyCount, families.data());
+                std::vector<VkDeviceQueueCreateInfo> queues(info->pQueueCreateInfos, info->pQueueCreateInfos + info->queueCreateInfoCount);
+                std::vector<float> priorities;
+                for (auto &q : queues)
+                {
+                    if (q.queueFamilyIndex >= familyCount || !(families[q.queueFamilyIndex].queueFlags & VK_QUEUE_GRAPHICS_BIT) ||
+                        q.queueCount >= families[q.queueFamilyIndex].queueCount)
+                        continue;
+                    priorities.assign(q.pQueuePriorities, q.pQueuePriorities + q.queueCount);
+                    priorities.push_back(1.0f);
+                    m_family = q.queueFamilyIndex;
+                    m_index = q.queueCount;
+                    q.pQueuePriorities = priorities.data();
+                    ++q.queueCount;
+                    break;
+                }
+                std::fprintf(stderr, "[present] graphics family: %s\n", m_index != UINT32_MAX ? "a spare queue for presents" : "no spare queue");
+                VkDeviceCreateInfo copy = *info;
+                copy.pQueueCreateInfos = queues.data();
+                VkDevice device = VK_NULL_HANDLE;
+                if (vkCreateDevice(gpu, &copy, nullptr, &device) != VK_SUCCESS)
+                    return VK_NULL_HANDLE;
+                if (m_index != UINT32_MAX)
+                {
+                    auto getQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(device, "vkGetDeviceQueue"));
+                    getQueue(device, m_family, m_index, &m_queue);
+                }
+                return device;
+            }
+            VkQueue presentQueue() const { return m_queue; }
+
+        private:
+            uint32_t m_family = UINT32_MAX, m_index = UINT32_MAX;
+            VkQueue m_queue = VK_NULL_HANDLE;
+        };
 
         bool presentAtTimeWanted()
         {
@@ -190,7 +556,12 @@ namespace ps2x::gs
         {
         public:
             explicit PgsPresenter(PgsPresenterOptions options) : m_options(std::move(options)) {}
-            ~PgsPresenter() override { close(); }
+            ~PgsPresenter() override
+            {
+                close();
+                g_presentQueue.drain();
+                g_presentQueue.stop();
+            }
 
             const char *name() const override { return "vulkan"; }
 
@@ -236,12 +607,56 @@ namespace ps2x::gs
                 m_wsi.set_present_wait_latency(2);
                 Vulkan::Context::SystemHandles handles = {};
                 // As the GS's own device: push descriptors, no descriptor buffers/heaps.
-                if (!m_wsi.init_context_from_platform(1, handles, Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT,
-                                                      Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT |
-                                                          Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT))
+                const bool presentThread = presentThreadWanted() && !m_metalPresent;
+                if (presentThread)
+                {
+                    // As WSI::init_context_from_platform, with a device made by PresentDeviceFactory.
+                    const Vulkan::ContextCreationFlags flags =
+                        (Vulkan::CONTEXT_CREATION_ENABLE_ADVANCED_WSI_BIT | Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT);
+                    auto context = Util::make_handle<Vulkan::Context>();
+                    context->set_application_info(m_platform->get_application_info());
+                    context->set_num_thread_indices(1);
+                    context->set_system_handles(handles);
+                    context->set_device_factory(&m_deviceFactory);
+                    auto instanceExt = m_platform->get_instance_extensions();
+                    auto deviceExt = m_platform->get_device_extensions();
+                    if (!context->init_instance(instanceExt.data(), instanceExt.size(), flags))
+                        return fail("Vulkan", "instance creation failed");
+                    VkSurfaceKHR probe = m_platform->create_surface(context->get_instance(), VK_NULL_HANDLE);
+                    const bool made = context->init_device(VK_NULL_HANDLE, probe, deviceExt.data(), deviceExt.size(), flags);
+                    if (probe)
+                        m_platform->destroy_surface(context->get_instance(), probe);
+                    if (!made || !m_wsi.init_from_existing_context(std::move(context)))
+                        return fail("Vulkan", "device creation failed");
+                }
+                else if (!m_wsi.init_context_from_platform(1, handles, Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT,
+                                                           Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT |
+                                                               Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT))
                     return fail("Vulkan", "instance/device creation failed");
+                if (presentThread)
+                {
+                    // Before the swapchain: its creation goes through the wrappers too.
+                    auto &table = const_cast<VolkDeviceTable &>(m_wsi.get_context().get_device_table());
+                    g_threadRealPresent = table.vkQueuePresentKHR;
+                    g_realAcquire = table.vkAcquireNextImageKHR;
+                    g_realDestroySwapchain = table.vkDestroySwapchainKHR;
+                    g_realCreateSwapchain = table.vkCreateSwapchainKHR;
+                    g_realDeviceWaitIdle = table.vkDeviceWaitIdle;
+                    g_realWaitForPresent = table.vkWaitForPresentKHR;
+                    table.vkQueuePresentKHR = threadedPresent;
+                    table.vkAcquireNextImageKHR = threadedAcquire;
+                    table.vkDestroySwapchainKHR = threadedDestroySwapchain;
+                    table.vkCreateSwapchainKHR = threadedCreateSwapchain;
+                    table.vkDeviceWaitIdle = threadedDeviceWaitIdle;
+                    if (g_realWaitForPresent)
+                        table.vkWaitForPresentKHR = threadedWaitForPresent;
+                }
                 if (!m_wsi.init_device() || (!m_metalPresent && !m_wsi.init_surface_swapchain()))
                     return fail("Vulkan", "swapchain creation failed");
+                if (presentThread)
+                    g_presentQueue.start(m_wsi.get_context().get_device(), m_deviceFactory.presentQueue(),
+                                         m_wsi.get_context().get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS],
+                                         &m_wsi.get_device(), g_threadRealPresent);
                 if (presentAtTimeWanted() && m_metalPresent)
                     m_presentAtTime = true; // Metal's presentDrawable:atTime:
                 else if (presentAtTimeWanted())
@@ -2010,9 +2425,15 @@ namespace ps2x::gs
                 present.pResults = &result;
                 const VkQueue queue = m_wsi.get_context().get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS];
                 const PFN_vkQueuePresentKHR presentFn = g_realQueuePresent ? g_realQueuePresent : table.vkQueuePresentKHR;
-                dev.external_queue_lock();
-                const VkResult overall = presentFn(queue, &present);
-                dev.external_queue_unlock();
+                VkResult overall;
+                if (g_presentQueue.running())
+                    overall = threadedPresent(queue, &present); // (the present thread: no lock held over it)
+                else
+                {
+                    dev.external_queue_lock();
+                    overall = presentFn(queue, &present);
+                    dev.external_queue_unlock();
+                }
                 release->wait_external(); // consumed by the present, even when it fails
                 m_second.release[index] = std::move(release);
                 // (SUBOPTIMAL is expected: the compositor turns the unrotated picture.)
@@ -2031,6 +2452,9 @@ namespace ps2x::gs
 
             void render()
             {
+                // The last frame's presents have gone to the driver (no backlog: pacing as before,
+                // but waited for here, holding nothing).
+                g_presentQueue.waitBelow(0);
                 const auto lockAsked = std::chrono::steady_clock::now();
                 std::unique_lock<std::mutex> lock(m_shared.mutex);
                 // (RT_PRESENT_DEBUG's pacing line: how long the lock was waited for and held.)
@@ -2321,7 +2745,11 @@ namespace ps2x::gs
                         return;
                     VkPastPresentationTimingGOOGLE past[16];
                     uint32_t count = 16;
-                    const VkResult r = m_pastTiming(m_wsi.get_context().get_device(), g_timedSwapchain, &count, past);
+                    VkResult r;
+                    {
+                        std::lock_guard<std::mutex> swapchain(g_presentQueue.swapchainMutex(g_timedSwapchain)); // (externally synchronised)
+                        r = m_pastTiming(m_wsi.get_context().get_device(), g_timedSwapchain, &count, past);
+                    }
                     if (r != VK_SUCCESS && r != VK_INCOMPLETE)
                         return;
                     for (uint32_t i = 0; i < count; ++i)
@@ -2488,6 +2916,7 @@ namespace ps2x::gs
             int64_t m_presentLead = 0;        // how far ahead of now a present is aimed (adaptive)
             uint32_t m_presentsOnTime = 0, m_presentsSinceMiss = 1000;
             PFN_vkGetPastPresentationTimingGOOGLE m_pastTiming = nullptr;
+            PresentDeviceFactory m_deviceFactory; // (the device: a spare queue for the present thread)
             int64_t m_presentOffset = INT64_MAX, m_offsetWindowMin = INT64_MAX; // presented time - target refresh
             uint32_t m_offsetSamples = 0;
             uint32_t m_presentCount = 0;
