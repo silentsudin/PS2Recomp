@@ -253,6 +253,13 @@ namespace ps2x::gs
             Vulkan::ImageHandle motion; // RG16F per-pixel motion, while TAA wants it
             bool motionStale = false;   // scanned out: cleared before the next frame draws into it
             uint64_t drawSerial = 1, snapshotSerial = 0;
+            // Draws that may change the alpha (DATE reads only its MSB): a snapshot taken since the
+            // last of them still serves DATE, however much RGB was drawn after it.
+            uint64_t alphaSerial = 1, snapshotAlphaSerial = 0;
+            // DATE through the stencil: the Z buffer whose stencil mirrors this target's alpha MSB
+            // (whole target), valid while alphaSerial and the Z buffers' generation are unchanged.
+            const Vulkan::Image *stencilDepth = nullptr;
+            uint64_t stencilSerial = 0, stencilGeneration = 0, stencilPrepass = 0;
         };
 
         // The render targets and Z buffers frames draw into: the real ones, and one set per shadow
@@ -396,7 +403,11 @@ namespace ps2x::gs
                                                                 hw_spirv::depth_copy_frag, sizeof(hw_spirv::depth_copy_frag), &fsVert,
                                                                 &copyFrag);
                     // DATE through the stencil buffer (date_stencil.frag): Z buffers get a stencil
-                    // aspect. RT_HWGS_STENCIL_DATE=0 keeps the snapshot test (no stencil).
+                    // aspect, set from the target's alpha MSB once per run of DATE draws, which keep
+                    // it in step (record()). The snapshot test copied the target and split the pass
+                    // for each DATE draw: Q's Factory's 39 shadow draws a frame took the GPU to 82%
+                    // at 120 Hz (55% this way; passes 57 -> 6 a present). Setting the stencil per
+                    // draw, as this first did, maxed it in towns. RT_HWGS_STENCIL_DATE=0: snapshots.
                     Vulkan::ResourceLayout stencilFrag = {};
                     stencilFrag.input_mask = 0x1;
                     stencilFrag.sets[0].sampled_image_mask = 0x1;
@@ -1117,6 +1128,7 @@ namespace ps2x::gs
                     t.sx = sx;
                     t.sy = sy;
                     ++t.drawSerial;
+                    ++t.alphaSerial;
                     std::lock_guard<std::mutex> lock(m_targetPagesMutex);
                     uint32_t first, last;
                     pageRange(s.key * 32u, s.fbw, GS_PSM_CT32, 0, 0, s.width, s.height, first, last);
@@ -1139,6 +1151,7 @@ namespace ps2x::gs
                                        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
                     m_main.depths[s.key] = image;
+                    ++m_depthGeneration;
                 }
                 m_dev->submit(cmd);
                 m_loadedTargets.clear();
@@ -1219,16 +1232,23 @@ namespace ps2x::gs
                     // Shadow frames start from empty buffers: published once the game has drawn
                     // every buffer again.
                     // Frame skip: while the game is behind, no shadows (they start over afterwards).
-                    const uint32_t shadows = m_shared && !request.pauseShadows
-                                                 ? std::min(m_shared->wantShadows.load(std::memory_order_relaxed), kMaxShadows)
-                                                 : 0u;
+                    // A pause (frame skip, GPU headroom) keeps the shadows' targets: throwing them
+                    // away and making them again at every pause cost a spike, and targets the game
+                    // draws only now and then (the sky) were missing afterwards (flashes).
+                    const uint32_t wanted = m_shared ? std::min(m_shared->wantShadows.load(std::memory_order_relaxed), kMaxShadows) : 0u;
+                    if (wanted != m_shadowsWanted)
+                    {
+                        m_shadowsWanted = wanted;
+                        for (auto &set : m_shadowSets)
+                            set = {};
+                        m_shadowWarm = 0;
+                    }
+                    const uint32_t shadows = request.pauseShadows ? 0u : wanted;
                     if (shadows != m_shadows)
                     {
                         m_shadows = shadows;
                         m_shadowBatches.clear();
                         m_shadowBatchVerts.clear();
-                        for (auto &set : m_shadowSets)
-                            set = {};
                         m_shadowWarm = 0;
                     }
                     auto cmd = m_dev->request_command_buffer();
@@ -1271,8 +1291,23 @@ namespace ps2x::gs
                     }
                     // The shadows after the real frame (submitted first, so they don't delay it).
                     if (m_shadows)
-                    {
                         keepForShadows(batches, vertices);
+                    // A still frame (no vertex moves: menus, Q's Factory, pauses) needs no shadow:
+                    // re-rendering it cost as much GPU as the real frame (Thor, Q's Factory at
+                    // 120 Hz: 90% busy, and the display fell behind and showed strips of garbage).
+                    // Nothing is published, so the presenter repeats the real frame; the shadows
+                    // warm up again (three presents) once things move, as their targets are stale.
+                    bool still = m_shadows != 0;
+                    for (size_t v = 0; still && v < m_shadowBatchVerts.size(); ++v)
+                        still = m_shadowBatchVerts[v].motion == 0u;
+                    if (still && m_shadows && !m_shadowBatchVerts.empty())
+                    {
+                        m_shadowBatches.clear();
+                        m_shadowBatchVerts.clear();
+                        m_shadowWarm = 0;
+                    }
+                    else if (m_shadows)
+                    {
                         auto shadowCmd = m_dev->request_command_buffer();
                         recordShadows(*shadowCmd, m_shadowBatches, m_shadowBatchVerts);
                         m_shadowBatches.clear();
@@ -1822,6 +1857,7 @@ namespace ps2x::gs
                     t.sy = m_scale * m_yScale;
                     t.snapshot.reset();
                     ++t.drawSerial;
+                    ++t.alphaSerial;
                     std::lock_guard<std::mutex> lock(m_targetPagesMutex);
                     uint32_t first, last;
                     pageRange(fbp * 32u, fbw, GS_PSM_CT32, 0, 0, width, height, first, last);
@@ -1841,6 +1877,7 @@ namespace ps2x::gs
                     info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT; // the depth snapshot (temporal upscalers)
                     info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                     d = m_dev->create_image(info);
+                    ++m_depthGeneration;
                     cmd.image_barrier(*d, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
                                       0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
                     VkClearValue zero = {};
@@ -2038,9 +2075,11 @@ namespace ps2x::gs
             }
 
             // A copy of a target to sample from (refreshed when the target was drawn since).
-            const Vulkan::Image &snapshot(Target &t, Vulkan::CommandBuffer &cmd, bool &passOpen)
+            // alphaOnly: for DATE, which reads the alpha MSB only (Q's Factory: 39 DATE draws a frame,
+            // each copying the whole target and splitting the render pass, GPU 84% at 120 Hz).
+            const Vulkan::Image &snapshot(Target &t, Vulkan::CommandBuffer &cmd, bool &passOpen, bool alphaOnly = false)
             {
-                if (t.snapshot && t.snapshotSerial == t.drawSerial)
+                if (t.snapshot && (t.snapshotSerial == t.drawSerial || (alphaOnly && t.snapshotAlphaSerial == t.alphaSerial)))
                     return *t.snapshot;
                 endPass(cmd, passOpen);
                 ++m_stats.snapshots;
@@ -2067,6 +2106,7 @@ namespace ps2x::gs
                                   VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                                   VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
                 t.snapshotSerial = t.drawSerial;
+                t.snapshotAlphaSerial = t.alphaSerial;
                 return *t.snapshot;
             }
 
@@ -2315,8 +2355,12 @@ namespace ps2x::gs
                     const uint64_t test = ctx.test;
                     const bool date = (test >> 14) & 1u;
                     const Vulkan::ImageView *destView = &m_white->get_view();
-                    if (date)
-                        destView = &snapshot(t, cmd, passOpen).get_view();
+                    // Through the stencil, it is set from the alpha once per run of DATE draws (the
+                    // DATE draws keep it in step); a snapshot only to set it.
+                    const bool stencilValid = dateStencil && t.stencilDepth == depthImage && t.stencilSerial == t.alphaSerial &&
+                                              t.stencilGeneration == m_depthGeneration && t.stencilPrepass == m_stencilPrepasses;
+                    if (date && !stencilValid)
+                        destView = &snapshot(t, cmd, passOpen, true).get_view();
 
                     // Motion for TAA: a second attachment on the frame's targets while it is wanted.
                     Vulkan::Image *motionImage = nullptr;
@@ -2359,11 +2403,23 @@ namespace ps2x::gs
                         m_passMotion = motionImage;
                     }
                     ++t.drawSerial;
+                    if (((ctx.frame.fbmsk >> 24) & 0xFFu) != 0xFFu && fpsm != GS_PSM_CT24 && !toMap)
+                        ++t.alphaSerial;
 
                     const float devW = static_cast<float>(t.color->get_width()), devH = static_cast<float>(t.color->get_height());
                     const float sx = static_cast<float>(t.sx), sy = static_cast<float>(t.sy);
                     if (dateStencil)
-                        dateStencilPrepass(cmd, b, vertices, ctx, *destView, sx, sy, devW, devH);
+                    {
+                        if (!stencilValid)
+                        {
+                            dateStencilPrepass(cmd, *destView, devW, devH);
+                            ++m_stencilPrepasses; // (another target sharing the Z buffer must set it again)
+                        }
+                        t.stencilPrepass = m_stencilPrepasses;
+                        t.stencilDepth = depthImage;
+                        t.stencilSerial = t.alphaSerial; // (this draw's alpha writes: the stencil ops follow them)
+                        t.stencilGeneration = m_depthGeneration;
+                    }
 
                     // The pipeline's state (applyPipe; noted for the next start's warm-up).
                     PipeKey key;
@@ -2920,27 +2976,14 @@ namespace ps2x::gs
             // DATE through the stencil: before the batch, stencil bit 0 = the target's alpha MSB (from
             // its snapshot) where the batch can draw (its bounding box inside the scissor; shadows
             // cover little of the frame).
-            void dateStencilPrepass(Vulkan::CommandBuffer &cmd, const Batch &b, const std::vector<HwVertex> &vertices,
-                                    const GSContext &ctx, const Vulkan::ImageView &dest, float sx, float sy, float devW, float devH)
+            // The whole target's stencil from its alpha MSB (the snapshot `dest`), before a run of
+            // DATE draws.
+            void dateStencilPrepass(Vulkan::CommandBuffer &cmd, const Vulkan::ImageView &dest, float devW, float devH)
             {
-                float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
-                for (uint32_t i = b.firstVertex; i < b.firstVertex + b.vertexCount && i < vertices.size(); ++i)
-                {
-                    bx0 = std::min(bx0, vertices[i].x), bx1 = std::max(bx1, vertices[i].x);
-                    by0 = std::min(by0, vertices[i].y), by1 = std::max(by1, vertices[i].y);
-                }
-                const float x0 = std::max(static_cast<float>(ctx.scissor.x0), std::floor(bx0)) * sx;
-                const float y0 = std::max(static_cast<float>(ctx.scissor.y0), std::floor(by0)) * sy;
-                const float x1 = std::min(static_cast<float>(ctx.scissor.x1) + 1.0f, std::ceil(bx1) + 1.0f) * sx;
-                const float y1 = std::min(static_cast<float>(ctx.scissor.y1) + 1.0f, std::ceil(by1) + 1.0f) * sy;
                 VkClearRect rect = {};
-                rect.rect.offset.x = static_cast<int32_t>(std::clamp(x0, 0.0f, devW));
-                rect.rect.offset.y = static_cast<int32_t>(std::clamp(y0, 0.0f, devH));
-                rect.rect.extent.width = static_cast<uint32_t>(std::max(0.0f, std::clamp(x1, 0.0f, devW) - rect.rect.offset.x));
-                rect.rect.extent.height = static_cast<uint32_t>(std::max(0.0f, std::clamp(y1, 0.0f, devH) - rect.rect.offset.y));
+                rect.rect.extent.width = static_cast<uint32_t>(devW);
+                rect.rect.extent.height = static_cast<uint32_t>(devH);
                 rect.layerCount = 1;
-                if (!rect.rect.extent.width || !rect.rect.extent.height)
-                    return;
                 VkClearValue zero = {};
                 cmd.clear_quad(0, rect, zero, VK_IMAGE_ASPECT_STENCIL_BIT);
                 cmd.set_program(m_dateStencilProgram);
@@ -3350,6 +3393,7 @@ namespace ps2x::gs
             std::vector<HwVertex> m_shadowBatchVerts;
             Vulkan::ImageHandle m_shadowScan[kMaxShadows][3];
             uint32_t m_shadowIndex = 0, m_shadowSlot = 0;
+            uint32_t m_shadowsWanted = 0; // shadows asked for (m_shadows: 0 while paused)
             uint32_t m_shadowWarm = 0; // presents since the shadows (re)started: their buffers fill first
             const Vulkan::Image *m_passColor = nullptr, *m_passDepth = nullptr;
             Vulkan::ImageHandle m_scanout[3];
@@ -3371,6 +3415,8 @@ namespace ps2x::gs
             Vulkan::Program *m_depthCopyProgram = nullptr;
             Vulkan::Program *m_dateStencilProgram = nullptr; // DATE: the stencil from the alpha MSB
             bool m_stencilDate = false;                      // DATE through the stencil (D32S8 Z buffers)
+            uint64_t m_depthGeneration = 1;                  // bumped when a Z buffer is made or loaded
+            uint64_t m_stencilPrepasses = 0;
             VkFormat m_depthFormat = VK_FORMAT_D32_SFLOAT;
             bool m_depthRequested = false;
             uint32_t m_depthRequestZbp = 0, m_depthRequestFbp = 0, m_depthIndex = 0;

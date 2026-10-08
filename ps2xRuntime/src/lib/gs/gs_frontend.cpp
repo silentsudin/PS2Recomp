@@ -569,7 +569,7 @@ void GS::latchHostPresentationFrame(bool keepOnGpu, bool readback)
             request.frame3D = (1ull << 62) + ++m_fallbackFrame3D;
         const auto skipped = m_fbpSkipped.find(fbp);
         request.frameSkipped = skipped != m_fbpSkipped.end() && skipped->second;
-        request.pauseShadows = m_paceLevel >= 1u;
+        request.pauseShadows = m_paceLevel >= 1u || m_gpuOverload.load(std::memory_order_relaxed);
         const auto it = m_jitterByFbp.find(fbp);
         const float *j = it != m_jitterByFbp.end() ? it->second.data() : m_snapJitter;
         std::copy(j, j + 4, m_presentJitter);

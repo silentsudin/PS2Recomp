@@ -130,6 +130,25 @@ namespace ps2x::gs
             return on;
         }
 
+        // RT_PRESENT_LOG=1: one line per present ([plog]): what the render thread made (tag: R real,
+        // S shadow, fallbacks w = no shadow published, s = stale serial, d = 2D/size, r = repeat),
+        // its guest vblank and subframe, and when it was rendered, queued and handed to the driver.
+        static bool presentLogOn()
+        {
+            static const bool on = [] { const char *e = std::getenv("RT_PRESENT_LOG"); return e && *e == '1'; }();
+            return on;
+        }
+        static int64_t plNow()
+        {
+            return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+        std::atomic<char> g_plTag{'?'};
+        std::atomic<uint64_t> g_plTick{0};
+        std::atomic<uint32_t> g_plSub{0};
+        std::atomic<int64_t> g_plRender{0};
+        std::atomic<uint64_t> g_plSeq{0};
+        std::atomic<uint64_t> g_plPic{0}, g_plPres{0};
+
         class PresentQueue
         {
         public:
@@ -173,6 +192,8 @@ namespace ps2x::gs
                 if (!info || info->swapchainCount != 1 || info->waitSemaphoreCount > 4)
                     return false;
                 Job job;
+                job.tag = g_plTag.load(), job.tick = g_plTick.load(), job.sub = g_plSub.load(), job.renderUs = g_plRender.load();
+                job.pushUs = plNow(), job.seq = g_plSeq.load(), job.pic = g_plPic.load(), job.pres = g_plPres.load();
                 job.swapchain = info->pSwapchains[0];
                 job.index = info->pImageIndices[0];
                 job.waitCount = info->waitSemaphoreCount;
@@ -282,6 +303,10 @@ namespace ps2x::gs
                 VkFence fence = VK_NULL_HANDLE;
                 VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
                 VkPresentTimeGOOGLE time = {};
+                char tag = '?';
+                uint64_t tick = 0, seq = 0, pic = 0, pres = 0;
+                uint32_t sub = 0;
+                int64_t renderUs = 0, pushUs = 0;
             };
 
             void run()
@@ -317,6 +342,8 @@ namespace ps2x::gs
                         fence.pNext = chain, fence.swapchainCount = 1, fence.pFences = &job.fence, chain = &fence;
                     if (job.hasMode)
                         mode.pNext = chain, mode.swapchainCount = 1, mode.pPresentModes = &job.mode, chain = &mode;
+                    if (!job.hasTime && presentLogOn())
+                        job.hasTime = true, job.time = {static_cast<uint32_t>(job.seq), 0};
                     if (job.hasTime)
                         time.pNext = chain, time.swapchainCount = 1, time.pTimes = &job.time, chain = &time;
                     info.pNext = chain;
@@ -333,6 +360,27 @@ namespace ps2x::gs
                             m_granite->external_queue_unlock();
                         }
                     }
+                    if (presentLogOn())
+                    {
+                        static PFN_vkGetPastPresentationTimingGOOGLE past =
+                            reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(vkGetDeviceProcAddr(m_device, "vkGetPastPresentationTimingGOOGLE"));
+                        if (past)
+                        {
+                            VkPastPresentationTimingGOOGLE t[16];
+                            uint32_t n = 16;
+                            std::lock_guard<std::mutex> swapchain(swapchainMutex(job.swapchain));
+                            if (past(m_device, job.swapchain, &n, t) >= 0)
+                                for (uint32_t i = 0; i < n; ++i)
+                                    std::fprintf(stderr, "[past] %u actual %llu earliest %llu margin %llu sc %llx\n", t[i].presentID,
+                                                 (unsigned long long)t[i].actualPresentTime, (unsigned long long)t[i].earliestPresentTime,
+                                                 (unsigned long long)t[i].presentMargin, (unsigned long long)(uintptr_t)job.swapchain & 0xFFFFull);
+                        }
+                    }
+                    if (presentLogOn())
+                        std::fprintf(stderr, "[plog] %llu %c v%llu.%u pic %llu pres %llu render %lld queued %lld done %lld sc %llx\n",
+                                     (unsigned long long)job.seq, job.tag, (unsigned long long)job.tick, job.sub, (unsigned long long)job.pic, (unsigned long long)job.pres,
+                                     (long long)job.renderUs, (long long)job.pushUs, (long long)plNow(),
+                                     (unsigned long long)(uintptr_t)job.swapchain & 0xFFFFull);
                     {
                         std::lock_guard<std::mutex> lock(m_mutex);
                         if (r != VK_SUCCESS)
@@ -488,7 +536,7 @@ namespace ps2x::gs
         public:
             std::vector<const char *> get_device_extensions() override
             {
-                if (presentAtTimeWanted())
+                if (presentAtTimeWanted() || presentLogOn())
                     return {"VK_KHR_swapchain", "VK_GOOGLE_display_timing"};
                 return {"VK_KHR_swapchain"};
             }
@@ -1857,18 +1905,38 @@ namespace ps2x::gs
                     // frame with the 3D moved on (gs_pgs_backend.cpp). 2D screens repeat the real one.
                     if (fresh || !m_lastPicture)
                     {
+                        // The same 3D as the last vblank's (the game's frame missed the vblank): the
+                        // last picture shown stays. Going back to the real frame after its
+                        // generated one stepped everything that moves back half a frame (flicker).
+                        if (fresh && m_lastPicture && m_lastShown && !m_frame2D && m_shared.pictureSerial == m_lastRealPicture &&
+                            m_shared.pictureSerial < (1ull << 62))
+                        {
+                            m_final = m_lastShown;
+                            m_finalRcas = m_lastShownRcas;
+                            m_realSerial = m_shared.presentSerial;
+                            m_plTag = 'h';
+                            return;
+                        }
                         preparePicture(cmd, fw, fh);
                         m_lastPicture = m_final;
                         m_lastRcas = m_finalRcas;
+                        m_lastShown = m_final;
+                        m_lastShownRcas = m_finalRcas;
+                        m_lastRealPicture = m_shared.pictureSerial;
                         m_realSerial = m_shared.presentSerial;
+                        m_plTag = 'R';
                         return;
                     }
                     const uint32_t step = m_subframe * m_fg.factor / std::max(m_presents, m_fg.factor);
                     const Vulkan::Image *raw = (m_shared.attached ? m_shared.scanout : m_cpuFrame).get();
                     const Vulkan::Image *shadow = step >= 1 && step <= 3 ? m_shared.shadowScanout[step - 1].get() : nullptr;
+                    m_plTag = shadow ? 'S' : 'w';
                     // Only this real frame's own shadow (the worker may still be on it).
                     if (shadow && m_shared.shadowSerial[step - 1] != m_realSerial)
-                        shadow = nullptr;
+                        shadow = nullptr, m_plTag = 's';
+                    if (shadow && !(raw && !m_frame2D && shadow->get_width() == raw->get_width() &&
+                                    shadow->get_height() == raw->get_height()))
+                        m_plTag = 'd';
                     if (shadow && raw && !m_frame2D && shadow->get_width() == raw->get_width() &&
                         shadow->get_height() == raw->get_height())
                     {
@@ -1877,11 +1945,14 @@ namespace ps2x::gs
                         m_noTemporal = true;
                         preparePicture(cmd, fw, fh);
                         m_noTemporal = false;
+                        m_lastShown = m_final;
+                        m_lastShownRcas = m_finalRcas;
                     }
                     else
                     {
-                        m_final = m_lastPicture;
-                        m_finalRcas = m_lastRcas;
+                        // (after a held vblank: the picture held, not the real frame before it)
+                        m_final = m_lastShown ? m_lastShown : m_lastPicture;
+                        m_finalRcas = m_lastShown ? m_lastShownRcas : m_lastRcas;
                     }
                     return;
                 }
@@ -2218,6 +2289,7 @@ namespace ps2x::gs
                 VkSwapchainKHR swapchain = VK_NULL_HANDLE;
                 VkExtent2D extent = {};
                 bool outOfDate = false;
+                VkFence acquireFence = VK_NULL_HANDLE; // the acquire's own fence (see renderSecondScreen)
                 std::vector<Vulkan::ImageHandle> images;
                 std::vector<Vulkan::ImageViewHandle> views;
                 std::vector<Vulkan::Semaphore> release; // per image, until it is acquired again
@@ -2386,11 +2458,20 @@ namespace ps2x::gs
 #if defined(PS2X_PGS_PRESENTER_UI)
                 if (!ui)
                     return;
-                Vulkan::Semaphore acquire = dev.request_semaphore(VK_SEMAPHORE_TYPE_BINARY);
+                // The image is acquired with a fence of our own and waited for before drawing:
+                // a semaphore handed to add_wait_semaphore joins the device's next submission,
+                // which another thread's work could take, and then this screen was drawn into an
+                // image still being shown (strips of garbage on the Thor's lower screen when the
+                // GPU was busy, e.g. Q's Factory).
                 uint32_t index = 0;
                 const auto &table = dev.get_device_table();
+                if (m_second.acquireFence == VK_NULL_HANDLE)
+                {
+                    VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                    table.vkCreateFence(dev.get_device(), &fi, nullptr, &m_second.acquireFence);
+                }
                 const VkResult acquired = table.vkAcquireNextImageKHR(dev.get_device(), m_second.swapchain, 0,
-                                                                      acquire->get_semaphore(), VK_NULL_HANDLE, &index);
+                                                                      VK_NULL_HANDLE, m_second.acquireFence, &index);
                 if (acquired == VK_ERROR_OUT_OF_DATE_KHR || acquired == VK_ERROR_SURFACE_LOST_KHR)
                 {
                     m_second.outOfDate = true;
@@ -2398,9 +2479,8 @@ namespace ps2x::gs
                 }
                 if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR)
                     return; // no image free yet (the screen is behind): skip it this frame
-                acquire->signal_external();
-                dev.add_wait_semaphore(Vulkan::CommandBuffer::Type::Generic, std::move(acquire),
-                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, true);
+                table.vkWaitForFences(dev.get_device(), 1, &m_second.acquireFence, VK_TRUE, UINT64_MAX);
+                table.vkResetFences(dev.get_device(), 1, &m_second.acquireFence);
 
                 ImGuiContext *previous = ImGui::GetCurrentContext();
                 ImGui::SetCurrentContext(static_cast<ImGuiContext *>(ui));
@@ -2555,7 +2635,10 @@ namespace ps2x::gs
                 {
                     static const uint64_t from = std::strtoull(std::getenv("RT_PRESENT_DUMP_FROM") ? std::getenv("RT_PRESENT_DUMP_FROM") : "0", nullptr, 10);
                     static const uint64_t to = std::strtoull(std::getenv("RT_PRESENT_DUMP_TO") ? std::getenv("RT_PRESENT_DUMP_TO") : "0", nullptr, 10);
-                    if (m_lastTick >= from && m_lastTick <= to)
+                    // RT_PRESENT_DUMP_EVERY=k: only vblanks from + k*i (all presents) and the next one's real frame.
+                    static const uint64_t every = std::max<uint64_t>(1, std::strtoull(std::getenv("RT_PRESENT_DUMP_EVERY") ? std::getenv("RT_PRESENT_DUMP_EVERY") : "1", nullptr, 10));
+                    const uint64_t phase = (m_lastTick - from) % every;
+                    if (m_lastTick >= from && m_lastTick <= to && (every == 1 || phase == 0 || ((phase == 1 || phase == every - 1) && m_subframe == 0)))
                     {
                         char name[64];
                         std::snprintf(name, sizeof(name), "/v%06llu_%u.png", static_cast<unsigned long long>(m_lastTick), m_subframe);
@@ -2574,8 +2657,15 @@ namespace ps2x::gs
                         dev.register_time_interval("GPU", std::move(tsFlicker), cmd->write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
                                                    "post: flicker blending");
                 }
+                m_plTag = fresh ? 'R' : 'r';
                 if (m_fg.factor > 1)
                     generatedPicture(cmd, fw, fh, fresh);
+                if (presentLogOn())
+                {
+                    g_plTag = m_plTag, g_plTick = m_lastTick, g_plSub = m_subframe, g_plRender = plNow();
+                    g_plPic = m_shared.pictureSerial, g_plPres = m_shared.presentSerial;
+                    g_plSeq.fetch_add(1);
+                }
                 else if (fresh || !m_lastPicture)
                 {
                     preparePicture(cmd, fw, fh);
@@ -2938,7 +3028,11 @@ namespace ps2x::gs
             bool m_lastRcas = false;
             const Vulkan::Image *m_sourceOverride = nullptr; // a shadow frame shown instead of the scanout
             bool m_noTemporal = false;                       // processing a shadow frame: no TAA/MetalFX history
-            float m_shadowT = 0.5f;                          // that shadow's time after the real frame (frames)
+            float m_shadowT = 0.5f;
+            char m_plTag = '?';
+            const Vulkan::Image *m_lastShown = nullptr; // frame generation: the picture shown last (real or generated)
+            bool m_lastShownRcas = false;
+            uint64_t m_lastRealPicture = ~0ull;         // the 3D of the last real frame prepared                          // that shadow's time after the real frame (frames)
             double m_lockWaitMs = 0.0, m_lockHeldMs = 0.0;   // this present's device lock (RT_PRESENT_DEBUG)
             double m_latchMs = 0.0;
             struct

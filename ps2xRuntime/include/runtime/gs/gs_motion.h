@@ -43,7 +43,8 @@ namespace ps2x::gs
         bool enabled() const { return m_enabled.load(std::memory_order_relaxed); }
 
         // GIF/VIF1 worker, before each VU1 MSCAL run: the context id to mark that run's XGKICKs
-        // with (0 = none: setup runs, or not enabled).
+        // with (0 = none: setup runs, or not enabled). The same id as the last call when the run's
+        // context hasn't changed: the marker already sent still stands.
         uint32_t onMscal(uint32_t startPC, const uint8_t *vuData);
         // EE, at the game's clear (the VIF queue is drained): this frame's objects become last
         // frame's.
@@ -93,25 +94,35 @@ namespace ps2x::gs
             double tx, ty, tz; // world translation (W's last column)
             double r[9];       // world rotation (W's 3x3, columns normalised)
             Mat4 base;         // C before any batch offset
+            Mat4 cam, world;   // C = cam * world
         };
 
-        Mat4 matchPrevious(const Object &obj, uint32_t ordinal) const;
+        const Object *matchPrevious(const Object &obj, uint32_t ordinal) const;
+        Mat4 previousBase(const Object &obj, const Object *prev) const;
 
         std::atomic<bool> m_enabled{false};
         mutable std::mutex m_mutex;
         std::vector<Object> m_cur[3], m_prev[3];
-        // The object whose vertex MSCALs follow.
-        bool m_haveActive = false;
+        // The object whose vertex MSCALs follow (VU1 thread; frameStart clears m_haveActive).
+        std::atomic<bool> m_haveActive{false};
         Kind m_activeKind = Kind::Init;
         Mat4 m_activeBase{}, m_activePrevBase{};
+        Mat4 m_activeInv{}; // m_activeBase's inverse, once per object (false: singular)
+        bool m_activeInvOk = false;
+        // The context last published (VU1 thread): a run with the same one reuses its id, and the
+        // caller sends no new marker (thousands of runs a frame share a handful of contexts).
+        uint32_t m_lastId = 0;
+        bool m_lastOffset = false;
+        float m_lastT[3] = {};
+        uint64_t m_lastJitter = 0;
         // Contexts by id (a ring; ids start at 1).
         static constexpr uint32_t kRing = 1u << 14;
         std::vector<MotionContext> m_ring = std::vector<MotionContext>(kRing);
-        // Written by the VU1 thread under m_mutex; context() reads the ring without the lock (the
+        // Written by the VU1 thread; context() reads the ring without the lock (the
         // GS thread asks once per PATH1 packet, and waiting behind onMscal's matching cost it
         // ~40% of its time on the Thor): the entry is published by the release store of m_nextId.
         std::atomic<uint32_t> m_nextId{1};
-        float m_cameraJitter[2] = {};
+        std::atomic<uint64_t> m_cameraJitter{0}; // two floats (x low), read without the lock
         Stats m_stats{}, m_lastStats{};
     };
 }

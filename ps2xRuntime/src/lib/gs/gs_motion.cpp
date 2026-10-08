@@ -114,7 +114,7 @@ namespace ps2x::gs
 
     void MotionTracker::setEnabled(bool enabled) { m_enabled.store(enabled, std::memory_order_relaxed); }
 
-    Mat4 MotionTracker::matchPrevious(const Object &obj, uint32_t ordinal) const
+    const MotionTracker::Object *MotionTracker::matchPrevious(const Object &obj, uint32_t ordinal) const
     {
         // Measured at a race start (about 224 objects per frame): an object at the same draw
         // position as last frame is the same object 93% of the time and moved 0.5-0.75 units;
@@ -135,7 +135,7 @@ namespace ps2x::gs
         };
         constexpr double kNear = 3.0 * 3.0;
         if (ordinal < prev.size() && dt2(prev[ordinal]) < kNear)
-            return prev[ordinal].base;
+            return &prev[ordinal];
         const Object *best = nullptr;
         double bestScore = 0.0;
         for (const Object &o : prev)
@@ -150,32 +150,62 @@ namespace ps2x::gs
                 best = &o;
             }
         }
-        return best ? best->base : obj.base; // unmatched: no motion
+        return best; // unmatched: no motion
+    }
+
+    Mat4 MotionTracker::previousBase(const Object &obj, const Object *prev) const
+    {
+        if (!prev)
+            return obj.base; // unmatched: no motion
+        // A part turning fast about itself (wheels: a wheel turns tens of degrees a frame at
+        // speed) can't move along straight per-vertex motion: moved on by part of a frame, its
+        // corners cut the arc's chord (inwards between the two frames, outwards past the newer
+        // one), so in generated frames the tyres grew and shrank and the car's bottom edge jumped
+        // 60 times a second. Such a part moves with its translation only, at this frame's
+        // orientation (a spinning wheel looks the same turned): last frame's camera, this frame's
+        // rotation, last frame's position. RT_MOTION_SPIN=0 keeps the full motion (A/B).
+        static const bool spinFix = [] { const char *e = std::getenv("RT_MOTION_SPIN"); return !(e && *e == '0'); }();
+        if (!spinFix)
+            return prev->base;
+        // cos of the angle between the two orientations: (trace(Rp^T Rc) - 1) / 2.
+        double trace = 0.0;
+        for (int k = 0; k < 9; ++k)
+            trace += prev->r[k] * obj.r[k];
+        constexpr double kCosMax = 0.9848; // 10 degrees a frame
+        if ((trace - 1.0) * 0.5 >= kCosMax)
+            return prev->base;
+        Mat4 world = obj.world;
+        world.m[12] = prev->world.m[12];
+        world.m[13] = prev->world.m[13];
+        world.m[14] = prev->world.m[14];
+        return mul(prev->cam, world);
     }
 
     uint32_t MotionTracker::onMscal(uint32_t startPC, const uint8_t *vuData)
     {
         if (!enabled() || !vuData)
             return 0;
-        std::lock_guard<std::mutex> lock(m_mutex);
         // Setup runs: work out this object's C and last frame's.
         if (startPC == 0x10 || startPC == 0x70 || startPC == 0x00)
         {
+            std::lock_guard<std::mutex> lock(m_mutex); // the object lists (frameStart swaps them)
             Object obj{};
             Mat4 world = identity();
             if (startPC == 0x10)
             {
                 obj.kind = Kind::SetupB;
                 world = load(vuData, 0);
-                obj.base = mul(load(vuData, 4), world);
+                obj.cam = load(vuData, 4);
             }
             else
             {
                 obj.kind = startPC == 0x70 ? Kind::SetupA : Kind::Init;
                 if (startPC == 0x70)
                     world = load(vuData, 0);
-                obj.base = mul(mul(load(vuData, 12), load(vuData, 8)), world);
+                obj.cam = mul(load(vuData, 12), load(vuData, 8));
             }
+            obj.world = world;
+            obj.base = mul(obj.cam, world);
             obj.tx = world.m[12];
             obj.ty = world.m[13];
             obj.tz = world.m[14];
@@ -187,43 +217,65 @@ namespace ps2x::gs
                     obj.r[c * 3 + k] = len > 1e-12 ? col[k] / len : 0.0;
             }
             auto &list = m_cur[static_cast<int>(obj.kind)];
-            m_activePrevBase = matchPrevious(obj, static_cast<uint32_t>(list.size()));
+            const Object *match = matchPrevious(obj, static_cast<uint32_t>(list.size()));
+            m_activePrevBase = previousBase(obj, match);
             ++m_stats.objects;
             if (std::memcmp(&m_activePrevBase, &obj.base, sizeof(Mat4)) != 0)
                 ++m_stats.matched; // found last frame's (a different C; identical ones also mean "still")
             m_activeBase = obj.base;
             m_activeKind = obj.kind;
-            m_haveActive = true;
+            m_activeInvOk = invert(obj.base, m_activeInv);
+            m_lastId = 0;
+            m_haveActive.store(true, std::memory_order_relaxed);
             list.push_back(obj);
             return 0;
         }
-        if (!m_haveActive)
+        // Vertex runs (thousands a frame): no lock, no inversion, and no new context when it's
+        // the last one again (on the Thor this path took ~10% of the VU1 thread and its marker
+        // packets as much again on the way to the GS).
+        if (!m_haveActive.load(std::memory_order_relaxed) || !m_activeInvOk)
             return 0;
+        const uint64_t jitter = m_cameraJitter.load(std::memory_order_relaxed);
+        // Loops 8 and 6 add the batch offset VU26 to positions.
+        const bool offset = startPC == 0x40 || startPC == 0x30;
+        float t[3] = {};
+        if (offset)
+            std::memcpy(t, vuData + 26 * 16, sizeof(t));
+        if (m_lastId && offset == m_lastOffset && jitter == m_lastJitter &&
+            (!offset || std::memcmp(t, m_lastT, sizeof(t)) == 0))
+            return m_lastId;
         MotionContext ctx;
         ctx.cur = m_activeBase;
         ctx.prev = m_activePrevBase;
-        ctx.jitter[0] = m_cameraJitter[0];
-        ctx.jitter[1] = m_cameraJitter[1];
-        // Loops 8 and 6 add the batch offset VU26 to positions.
-        if (startPC == 0x40 || startPC == 0x30)
+        ctx.curInv = m_activeInv;
+        std::memcpy(ctx.jitter, &jitter, sizeof(ctx.jitter));
+        if (offset)
         {
-            const Mat4 t = translate(vuData, 26);
-            ctx.cur = mul(ctx.cur, t);
-            ctx.prev = mul(ctx.prev, t);
+            const Mat4 tm = translate(vuData, 26);
+            ctx.cur = mul(ctx.cur, tm);
+            ctx.prev = mul(ctx.prev, tm);
+            // (C T)^-1 = T^-1 C^-1: C's inverse moved back by the offset.
+            Mat4 back = identity();
+            for (int i = 0; i < 3; ++i)
+                back.m[12 + i] = -tm.m[12 + i];
+            ctx.curInv = mul(back, m_activeInv);
         }
-        if (!invert(ctx.cur, ctx.curInv))
-            return 0;
         const uint32_t id = m_nextId.load(std::memory_order_relaxed);
         m_ring[id % kRing] = ctx;
         m_nextId.store(id + 1 == 0 ? 1 : id + 1, std::memory_order_release);
+        m_lastId = id;
+        m_lastOffset = offset;
+        m_lastJitter = jitter;
+        std::memcpy(m_lastT, t, sizeof(t));
         return id;
     }
 
     void MotionTracker::noteCameraJitter(float x, float y)
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_cameraJitter[0] = x;
-        m_cameraJitter[1] = y;
+        float xy[2] = {x, y};
+        uint64_t bits;
+        std::memcpy(&bits, xy, sizeof(bits));
+        m_cameraJitter.store(bits, std::memory_order_relaxed);
     }
 
     void MotionTracker::frameStart()
@@ -235,7 +287,7 @@ namespace ps2x::gs
         // the next frame still finds its objects' previous positions.
         if (m_cur[0].empty() && m_cur[1].empty() && m_cur[2].empty())
         {
-            m_haveActive = false;
+            m_haveActive.store(false, std::memory_order_relaxed);
             m_lastStats = m_stats;
             m_stats = {};
             return;
@@ -245,7 +297,7 @@ namespace ps2x::gs
             m_prev[k].swap(m_cur[k]);
             m_cur[k].clear();
         }
-        m_haveActive = false;
+        m_haveActive.store(false, std::memory_order_relaxed);
         m_lastStats = m_stats;
         m_stats = {};
     }
@@ -292,9 +344,12 @@ namespace ps2x::gs
     void MotionTracker::packetMotion(const uint8_t *data, uint32_t size, const MotionContext &ctx, std::vector<uint32_t> &out)
     {
         out.clear();
+        // Back to object space with C^-1, forward with last frame's C: one matrix, prev * C^-1
+        // (the object-space w divides out in the projection; it is still checked, as before).
+        const double *inv = ctx.curInv.m;
+        const Mat4 pc = mul(ctx.prev, ctx.curInv);
+        const double *p = pc.m;
         auto vertex = [&](uint16_t gx, uint16_t gy, uint32_t gz) {
-            // Back to object space with C^-1 (w from the row that must give 1), forward with last
-            // frame's C.
             const double X = gx / 16.0, Y = gy / 16.0, Z = static_cast<double>(gz);
             // Far outside the screen (the guard band, culled triangles): no motion needed.
             if (std::fabs(X - 2048.0) > 1024.0 || std::fabs(Y - 2048.0) > 512.0)
@@ -302,20 +357,14 @@ namespace ps2x::gs
                 out.push_back(0);
                 return;
             }
-            const double *inv = ctx.curInv.m;
             const double ww = inv[3] * X + inv[7] * Y + inv[11] * Z + inv[15];
             uint32_t packed = 0;
             if (std::fabs(ww) > 1e-20)
             {
-                const double w = 1.0 / ww;
-                double obj[4];
-                for (int r = 0; r < 4; ++r)
-                    obj[r] = (inv[r] * X + inv[4 + r] * Y + inv[8 + r] * Z + inv[12 + r]) * w;
-                const double *p = ctx.prev.m;
-                const double px = p[0] * obj[0] + p[4] * obj[1] + p[8] * obj[2] + p[12] * obj[3];
-                const double py = p[1] * obj[0] + p[5] * obj[1] + p[9] * obj[2] + p[13] * obj[3];
-                const double pw = p[3] * obj[0] + p[7] * obj[1] + p[11] * obj[2] + p[15] * obj[3];
-                if (std::fabs(pw) > 1e-20)
+                const double px = p[0] * X + p[4] * Y + p[8] * Z + p[12];
+                const double py = p[1] * X + p[5] * Y + p[9] * Z + p[13];
+                const double pw = p[3] * X + p[7] * Y + p[11] * Z + p[15];
+                if (std::fabs(pw) > 1e-20 * std::fabs(ww))
                 {
                     const float dx = static_cast<float>(X - px / pw), dy = static_cast<float>(Y - py / pw);
                     if (std::isfinite(dx) && std::isfinite(dy))

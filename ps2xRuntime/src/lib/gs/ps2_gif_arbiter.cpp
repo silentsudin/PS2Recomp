@@ -108,7 +108,13 @@ void GifArbiter::drainInto(std::vector<GifArbiterPacket> &out)
         return;
     sortQueue();
     if (out.empty())
+    {
+        // The batch leaves with the queue's buffer; the queue keeps room for as many (else it
+        // grew from nothing again, moving every packet each time: ~3% of the VU1 thread).
+        const size_t room = m_queue.capacity();
         out.swap(m_queue);
+        m_queue.reserve(room);
+    }
     else
     {
         std::move(m_queue.begin(), m_queue.end(), std::back_inserter(out));

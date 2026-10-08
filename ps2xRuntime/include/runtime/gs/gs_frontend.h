@@ -129,6 +129,9 @@ public:
     // behind, the drawing of every other frame is skipped (the game, VU1 and the GIF stream still
     // run every frame; the picture on display stays the last one drawn). Off: the game slows.
     void setFrameSkip(bool on) { m_frameSkipOn.store(on, std::memory_order_relaxed); }
+    // The GPU is near its limit (the app watches it): generated frames pause, as at frame skip
+    // level 1 (on the Thor a GPU kept near 100% made the display fall behind: strips of garbage).
+    void setGpuOverload(bool on) { m_gpuOverload.store(on, std::memory_order_relaxed); }
     // 0 keeping up, 1 frame generation paused, 2 skipping frames; frames skipped so far.
     uint32_t frameSkipLevel() const { return m_paceLevelOut.load(std::memory_order_relaxed); }
     uint64_t framesSkipped() const { return m_framesSkipped.load(std::memory_order_relaxed); }
@@ -286,6 +289,7 @@ private:
     uint32_t m_lastFbp3D = 0;
     // Frame skip (setFrameSkip; decided at each frame start on the EE thread, under m_stateMutex).
     std::atomic<bool> m_frameSkipOn{false};
+    std::atomic<bool> m_gpuOverload{false};
     bool m_skipDraw = false;            // this frame's drawing is skipped
     bool m_skippedLast = false;
     uint64_t m_paceTick = 0, m_paceFrames3D = 0, m_paceSince = 0, m_paceLastLate = 0;

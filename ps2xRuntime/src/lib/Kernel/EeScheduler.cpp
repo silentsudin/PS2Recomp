@@ -1942,6 +1942,29 @@ void EeScheduler::resyncHostDeadlines()
                      std::chrono::duration<double, std::milli>(lag).count());
 }
 
+// After a state load (m_eventMutex held): the next vblank is due within one period of now, and
+// every host deadline moves with it. A state's deadlines are stored relative to the moment of the
+// save, which may be far behind the host clock (saved while held) or ahead of it, and ahead the game
+// waited that long without a vblank.
+void EeScheduler::restartHostTimelineLocked(std::chrono::steady_clock::time_point now)
+{
+    if (m_virtualTime)
+        return;
+    const auto next = std::find_if(m_deadlines.begin(), m_deadlines.end(), [](const ScheduledEvent &item)
+                                   { return item.event.type == EeEventType::VBlankStart; });
+    if (next == m_deadlines.end())
+        return;
+    const auto due = std::clamp(next->hostDeadline, now, now + std::chrono::steady_clock::duration(kVBlankPeriod));
+    const auto shift = due - next->hostDeadline;
+    for (ScheduledEvent &item : m_deadlines)
+        item.hostDeadline += shift;
+    static const bool jitter = [] { const char *e = std::getenv("RT_VBLANK_JITTER"); return e && *e == '1'; }();
+    if (jitter)
+        std::fprintf(stderr, "[vblank] state loaded: the next vblank was due in %.1f ms, now in %.1f ms\n",
+                     std::chrono::duration<double, std::milli>(next->hostDeadline - shift - now).count(),
+                     std::chrono::duration<double, std::milli>(next->hostDeadline - now).count());
+}
+
 void EeScheduler::processEvent(const EeEvent &event)
 {
     switch (event.type)

@@ -597,13 +597,26 @@ bool PS2Runtime::syncCoreSubsystems()
                                          cpuContext = &m_cpuContext;
                                      }
                                      // Motion vectors: tag this run's XGKICKs with the object's
-                                     // matrices (gs_motion.h).
-                                     if (const uint32_t motionId =
-                                             ps2x::gs::MotionTracker::instance().onMscal(startPC, m_memory.getVU1Data()))
+                                     // matrices (gs_motion.h). A run without them (a setup run,
+                                     // an object whose matrix can't be inverted: the cars' ground
+                                     // shadows are flattened onto the road) is tagged 0, no
+                                     // motion: untagged, its vertices took the last object's
+                                     // matrices, and in generated frames each car's shadow
+                                     // jumped.
+                                     auto &motion = ps2x::gs::MotionTracker::instance();
+                                     // A run in the context already marked sends nothing
+                                     // (this thread alone sends markers).
+                                     if (motion.enabled())
                                      {
-                                         uint8_t marker[32];
-                                         ps2x::gs::MotionTracker::makeMarker(motionId, marker);
-                                         m_memory.submitGifPacket(GifPathId::Path1, marker, sizeof(marker));
+                                         static uint32_t lastMarker = ~0u;
+                                         const uint32_t id = motion.onMscal(startPC, m_memory.getVU1Data());
+                                         if (id != lastMarker)
+                                         {
+                                             uint8_t marker[32];
+                                             ps2x::gs::MotionTracker::makeMarker(id, marker);
+                                             m_memory.submitGifPacket(GifPathId::Path1, marker, sizeof(marker));
+                                             lastMarker = id;
+                                         }
                                      }
                                      m_vu1.state().dBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
@@ -2613,6 +2626,45 @@ void PS2Runtime::run()
             if (newTick != pacedTick)
                 lockVBlankToDisplay();
             pacedTick = newTick;
+            // Latch the picture after the game's flip for this vblank, not before it. The game
+            // flips its buffers (DISPFB) right after it wakes from the vblank, while this loop
+            // latches within a quarter millisecond of the tick: which came first varied, so some
+            // vblanks showed the picture before last (and the next one skipped one). At 60 Hz that
+            // is a judder; with frame generation the generated frame after it stepped back half a
+            // frame on everything that moves (flicker). Waits at most RT_FLIP_WAIT_US (4 ms); a
+            // game that doesn't flip every frame (a repeat, a constant DISPFB) stops the waits after
+            // 8 timeouts in a row until a flip shows up again in time.
+            static const int64_t flipWaitUs = [] {
+                const char *e = std::getenv("RT_FLIP_WAIT_US");
+                return e && *e ? std::max<int64_t>(0, std::atoll(e)) : int64_t{4000};
+            }();
+            // (this loop's own state: one presenting loop per process)
+            static uint64_t m_flipWaitTick = ~0ull;
+            static std::pair<uint64_t, uint64_t> m_latchedDispfb{};
+            static uint32_t m_flipTimeouts = 0;
+            if (newTick != m_flipWaitTick && flipWaitUs > 0 && !ps2_test::paused())
+            {
+                m_flipWaitTick = newTick;
+                auto dispfb = [this] {
+                    const volatile uint64_t *a = &m_memory.gs().dispfb1, *b = &m_memory.gs().dispfb2;
+                    return std::make_pair(*a, *b);
+                };
+                const auto t0 = std::chrono::steady_clock::now();
+                bool flipped = dispfb() != m_latchedDispfb;
+                if (!flipped && m_flipTimeouts < 8)
+                {
+                    const auto until = t0 + std::chrono::microseconds(flipWaitUs);
+                    while (!(flipped = dispfb() != m_latchedDispfb) && std::chrono::steady_clock::now() < until && !isStopRequested())
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+                m_flipTimeouts = flipped ? 0u : std::min(m_flipTimeouts + 1u, 1000u);
+                m_latchedDispfb = dispfb();
+                static const bool log = [] { const char *e = std::getenv("RT_PRESENT_LOG"); return e && *e == '1'; }();
+                if (log)
+                    std::fprintf(stderr, "[flip] v%llu %s after %lld us\n", static_cast<unsigned long long>(newTick),
+                                 flipped ? "flipped" : "no flip",
+                                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()));
+            }
         }
 
         if (m_presenter->closeRequested())

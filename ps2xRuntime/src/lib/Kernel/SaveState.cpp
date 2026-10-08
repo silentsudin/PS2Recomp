@@ -255,7 +255,12 @@ void EeScheduler::serializeHostTiming(StateArchive &ar, bool hashOnly)
             e.hostDeadline = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(rel * kHostDeadlineUnit);
     }
     if (ar.loading())
+    {
+        // The host timeline restarts from now (however far behind or ahead of the host clock it
+        // was at the save).
+        restartHostTimelineLocked(now);
         updateNextDeadline();
+    }
 }
 
 std::vector<std::string> EeScheduler::invalidResumePcs(const std::function<bool(uint32_t)> &valid) const
