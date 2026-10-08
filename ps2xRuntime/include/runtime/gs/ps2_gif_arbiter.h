@@ -44,6 +44,10 @@ public:
     // Processed packets' buffers back for reuse (any thread): submit() takes from them instead of
     // allocating a buffer per packet.
     void recycle(std::vector<GifArbiterPacket> &&packets);
+    // A recycled (empty) batch list for `out` when it has no room: a list handed to the GS thread
+    // left its owner empty, and growing it again each batch (1, 2, 4 .. 32, moving every packet)
+    // cost the VU1 thread ~9% on the Thor.
+    void takeBatch(std::vector<GifArbiterPacket> &out);
     bool empty() const { return m_queue.empty(); }
 
 private:
@@ -53,6 +57,7 @@ private:
     std::vector<std::vector<uint8_t>> m_free;     // submit()'s own
     std::mutex m_poolMutex;
     std::vector<std::vector<uint8_t>> m_returned; // from recycle(), under m_poolMutex
+    std::vector<std::vector<GifArbiterPacket>> m_spareBatches; // emptied lists, under m_poolMutex
 
     void sortQueue();
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);

@@ -1393,7 +1393,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 4096;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeChainBuffer();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1730,7 +1730,7 @@ void PS2Memory::processPendingTransfers()
     const bool async = gifVif1WorkerActive();
     if (async)
     {
-        for (const auto &p : m_pendingGifTransfers)
+        for (auto &p : m_pendingGifTransfers)
             enqueueGifVif1(true, p);
     }
     for (size_t idx = 0; !async && idx < m_pendingGifTransfers.size(); ++idx)
@@ -1858,7 +1858,7 @@ void PS2Memory::processPendingTransfers()
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
     if (async)
     {
-        for (const auto &p : m_pendingVif1Transfers)
+        for (auto &p : m_pendingVif1Transfers)
             enqueueGifVif1(false, p);
         m_pendingVif1Transfers.clear();
     }
@@ -1965,13 +1965,25 @@ void PS2Memory::processPendingTransfers()
     }
 }
 
-void PS2Memory::enqueueGifVif1(bool gif, const PendingTransfer &transfer)
+std::vector<uint8_t> PS2Memory::takeChainBuffer()
+{
+    std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
+    if (m_chainBuffers.empty())
+        return {};
+    std::vector<uint8_t> b = std::move(m_chainBuffers.back());
+    m_chainBuffers.pop_back();
+    b.clear();
+    return b;
+}
+
+void PS2Memory::enqueueGifVif1(bool gif, PendingTransfer &transfer)
 {
     GifVif1Job job;
     job.gif = gif;
     if (!transfer.chainData.empty())
     {
-        job.data = transfer.chainData;
+        job.data = std::move(transfer.chainData);
+        transfer.chainData.clear();
     }
     else if (transfer.qwc > 0)
     {
@@ -1987,6 +1999,7 @@ void PS2Memory::enqueueGifVif1(bool gif, const PendingTransfer &transfer)
         const uint8_t *base = transfer.fromScratchpad ? m_scratchpad : m_rdram;
         const uint32_t size = transfer.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
         uint32_t bytesLeft = transfer.qwc * 16u;
+        job.data = takeChainBuffer();
         job.data.reserve(bytesLeft);
         while (bytesLeft > 0)
         {
@@ -2057,6 +2070,8 @@ void PS2Memory::gifVif1WorkerLoop()
         bool wake;
         {
             std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
+            if (job.data.capacity() != 0u && job.data.capacity() <= (4u << 20) && m_chainBuffers.size() < 16u)
+                m_chainBuffers.push_back(std::move(job.data)); // (back to the chain builder)
             const uint64_t done = m_gifVif1Completed.fetch_add(1, std::memory_order_release) + 1;
             wake = !m_vifWaitTargets.empty() && done >= *m_vifWaitTargets.begin();
         }
@@ -2178,6 +2193,7 @@ void PS2Memory::handOffGsBatch()
         m_gsSubmitted.fetch_add(1, std::memory_order_release);
     }
     m_gsPending.clear();
+    m_gifArbiter->takeBatch(m_gsPending);
     m_gsWorkCv.notify_one();
 }
 

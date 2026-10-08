@@ -211,6 +211,7 @@ namespace ps2x::gs
             m_pack.clear();
             m_handedOut.clear();
             m_shapes.clear();
+            m_knownMiss.clear();
             m_ready.clear(); // outcomes for the previous pack
             if (!packDir.empty())
                 indexPack(packDir);
@@ -295,6 +296,18 @@ namespace ps2x::gs
                 m_jobs.pop_front();
             }
             key = contentHash(job.width, job.height, job.rgba);
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (m_knownMiss.count(key) && (m_dumpDir.empty() || m_dumped.count(key)))
+                {
+                    Replacement r;
+                    r.cacheKey = job.cacheKey;
+                    r.stableKey = job.stableKey;
+                    r.contentKey = key;
+                    m_ready.push_back(std::move(r));
+                    continue;
+                }
+            }
             uint64_t shapeKey = 0;
             std::vector<uint32_t> colours;
             const bool hasShape = paletted(job.psm) && indexPattern(job.width, job.height, job.rgba, shapeKey, colours);
@@ -350,7 +363,10 @@ namespace ps2x::gs
                 }
                 auto s = r.hit ? m_shapes.end() : m_shapes.find(shapeKey);
                 if (r.hit)
+                {
                     m_shapes[shapeKey] = {key, colours};
+                    m_knownMiss.clear(); // (a new recolour candidate: misses may fit it now)
+                }
                 else if (s != m_shapes.end() && recolorEnabled() && (++m_stats.fits, fitRecolor(s->second.colours, colours, r.transform)))
                 {
                     ++m_stats.fitted;
@@ -384,6 +400,12 @@ namespace ps2x::gs
             std::lock_guard<std::mutex> lock(m_mutex);
             if (r.hit)
                 m_handedOut.insert(r.contentKey);
+            else
+            {
+                if (m_knownMiss.size() > 65536u)
+                    m_knownMiss.clear();
+                m_knownMiss.insert(key);
+            }
             m_ready.push_back(std::move(r));
         }
     }

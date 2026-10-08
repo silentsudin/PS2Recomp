@@ -79,6 +79,11 @@ namespace ps2x::gs
         std::unordered_set<uint64_t> m_dumped;                // content keys already on disk
         std::unordered_map<uint64_t, std::string> m_pack;     // content key -> replacement PNG
         std::unordered_set<uint64_t> m_handedOut;             // content keys whose pixels were returned
+        // Content keys with no pack image and no recolour (cleared when the pack or the recolour
+        // candidates change): their next decode skips the index pattern and the fit. Textures the
+        // game rewrites every frame (a scrolling one cycles through a few contents) kept this
+        // worker ~5% of a core busy on the Thor.
+        std::unordered_set<uint64_t> m_knownMiss;
         // Paletted textures the pack replaced, by index pattern: their content key and the colour
         // of each index class (in order of first appearance).
         struct ShapeRef

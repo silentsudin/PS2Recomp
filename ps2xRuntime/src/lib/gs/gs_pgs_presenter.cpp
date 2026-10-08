@@ -766,6 +766,7 @@ namespace ps2x::gs
                 m_taa = post(post_spirv::taa_frag, sizeof(post_spirv::taa_frag), 32, 0x1, 0x7);
                 m_depthNormalize = post(post_spirv::depth_normalize_frag, sizeof(post_spirv::depth_normalize_frag), 0, 0x1);
                 m_uiComposite = post(post_spirv::ui_composite_frag, sizeof(post_spirv::ui_composite_frag), 0, 0x1, 0x7);
+                m_rcasUi = post(post_spirv::rcas_ui_frag, sizeof(post_spirv::rcas_ui_frag), 48, 0, 0x7);
                 m_frameGen = post(post_spirv::frame_gen_frag, sizeof(post_spirv::frame_gen_frag), 32, 0x1, 0xF);
                 m_copy = post(post_spirv::copy_frag, sizeof(post_spirv::copy_frag), 0, 0x1);
                 m_flicker = post(post_spirv::flicker_frag, sizeof(post_spirv::flicker_frag), 0, 0x1, 0x7);
@@ -2010,6 +2011,7 @@ namespace ps2x::gs
             // original by the GS's UI mask.
             void spareUi(Vulkan::CommandBuffer &cmd, float fw, float fh)
             {
+                m_uiOriginal = nullptr;
                 // A shadow frame takes its HUD from the real frame (same mask, same HUD).
                 const Vulkan::Image *original = m_sourceOverride ? (m_flickerOut ? m_flickerOut.get()
                                                                                  : (m_shared.attached ? m_shared.scanout : m_cpuFrame).get())
@@ -2018,6 +2020,14 @@ namespace ps2x::gs
                     m_shared.ui->get_width() != original->get_width() || m_shared.ui->get_height() != original->get_height())
                     return;
                 const VkRect2D rect = pictureRect(fw, fh);
+                // In drawGame's pass to the screen (RCAS too, when due): two full-screen passes
+                // fewer per present. RT_FUSED_UI=0: into images first, as before.
+                static const bool fused = [] { const char *e = std::getenv("RT_FUSED_UI"); return !(e && *e == '0'); }();
+                if (fused && (m_rcasUi || !m_finalRcas))
+                {
+                    m_uiOriginal = original;
+                    return;
+                }
                 if (m_finalRcas)
                 {
                     struct
@@ -2043,6 +2053,39 @@ namespace ps2x::gs
                 if (!m_final)
                     return;
                 const VkRect2D rect = pictureRect(fw, fh);
+                if (const Vulkan::Image *original = m_uiOriginal)
+                {
+                    // spareUi's composite (and RCAS) straight into the picture's rectangle.
+                    m_uiOriginal = nullptr;
+                    cmd.set_program(m_finalRcas ? m_rcasUi : m_uiComposite);
+                    cmd.set_opaque_state();
+                    cmd.set_depth_test(false, false);
+                    cmd.set_cull_mode(VK_CULL_MODE_NONE);
+                    cmd.set_viewport({static_cast<float>(rect.offset.x), static_cast<float>(rect.offset.y),
+                                      static_cast<float>(rect.extent.width), static_cast<float>(rect.extent.height), 0.0f, 1.0f});
+                    cmd.set_scissor(rect);
+                    cmd.set_texture(0, 0, m_final->get_view(), m_finalRcas ? Vulkan::StockSampler::NearestClamp : Vulkan::StockSampler::LinearClamp);
+                    cmd.set_texture(0, 1, original->get_view(), Vulkan::StockSampler::LinearClamp);
+                    cmd.set_texture(0, 2, m_shared.ui->get_view(), Vulkan::StockSampler::LinearClamp);
+                    if (m_finalRcas)
+                    {
+                        struct
+                        {
+                            AU1 con[4];
+                            uint32_t origin[4];
+                            float extent[4];
+                        } push = {};
+                        FsrRcasCon(push.con, (1.0f - std::clamp(m_post.sharpness, 0.0f, 1.0f)) * 2.0f);
+                        push.origin[0] = static_cast<uint32_t>(rect.offset.x);
+                        push.origin[1] = static_cast<uint32_t>(rect.offset.y);
+                        push.extent[0] = static_cast<float>(rect.extent.width);
+                        push.extent[1] = static_cast<float>(rect.extent.height);
+                        cmd.push_constants(&push, 0, sizeof(push));
+                    }
+                    cmd.draw(3);
+                    cmd.set_viewport({0.0f, 0.0f, fw, fh, 0.0f, 1.0f});
+                    return;
+                }
                 if (m_finalRcas)
                 {
                     // FSR 1 RCAS, sharpening into the picture's rectangle on the swapchain.
@@ -2987,6 +3030,9 @@ namespace ps2x::gs
             Vulkan::Program *m_depthNormalize = nullptr;
             Vulkan::ImageHandle m_depthNorm;
             Vulkan::Program *m_uiComposite = nullptr;
+            Vulkan::Program *m_rcasUi = nullptr; // RCAS + the UI composite, drawn to the screen
+            // spareUi's composite, done by drawGame in its pass to the screen (no images between).
+            const Vulkan::Image *m_uiOriginal = nullptr;
             Vulkan::ImageHandle m_rcasImage, m_uiImage;
             bool m_temporalValid = false;
             Vulkan::ImageHandle m_taaShadowImage;

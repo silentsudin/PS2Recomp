@@ -50,6 +50,22 @@ void GifArbiter::recycle(std::vector<GifArbiterPacket> &&packets)
         if (m_returned.size() < 4096u && pkt.data.capacity() != 0u)
             m_returned.push_back(std::move(pkt.data));
     packets.clear();
+    if (packets.capacity() != 0u && m_spareBatches.size() < 8u)
+        m_spareBatches.push_back(std::move(packets));
+}
+
+void GifArbiter::takeBatch(std::vector<GifArbiterPacket> &out)
+{
+    if (out.capacity() >= 32u)
+        return;
+    std::lock_guard<std::mutex> lock(m_poolMutex);
+    if (!m_spareBatches.empty())
+    {
+        out = std::move(m_spareBatches.back());
+        m_spareBatches.pop_back();
+    }
+    else
+        out.reserve(32u);
 }
 
 void GifArbiter::sortQueue()

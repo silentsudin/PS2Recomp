@@ -505,7 +505,12 @@ public:
     std::atomic<uint64_t> m_gsBusyNs{0};
     bool m_gifVif1Stop = false;
     void gifVif1WorkerLoop();
-    void enqueueGifVif1(bool gif, const PendingTransfer &transfer);
+    // Takes the transfer's chain data (moved, not copied: async, the pending lists are done with).
+    void enqueueGifVif1(bool gif, PendingTransfer &transfer);
+    // DMA chain buffers come back from the worker for reuse (under m_gifVif1Mutex): a fresh one per
+    // chain, grown by appends and then copied into the job, cost the game thread ~18% on the Thor.
+    std::vector<uint8_t> takeChainBuffer();
+    std::vector<std::vector<uint8_t>> m_chainBuffers;
 
     // GS thread behind the GIF/VIF1 worker: the worker orders GIF packets (GifArbiter) and hands
     // them over in batches; the GS thread feeds them to the GS. syncGifVif1() waits for both.

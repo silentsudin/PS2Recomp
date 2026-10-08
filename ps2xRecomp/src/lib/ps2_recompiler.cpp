@@ -1287,7 +1287,7 @@ namespace ps2recomp
                     std::string generatedName = m_codeGenerator->getFunctionName(function.start);
                     std::stringstream stub;
                     stub << "void " << generatedName
-                         << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+                         << "(uint8_t* __restrict rdram, R5900Context* __restrict ctx, PS2Runtime *runtime) {\n";
                     stub << "#ifdef _DEBUG\n";
                     stub << "    PS_LOG_ENTRY(\"" << generatedName << "\");\n";
                     stub << "#endif\n";
