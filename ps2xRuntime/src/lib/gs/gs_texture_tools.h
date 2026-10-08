@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/gs/gs_texture_pack_cache.h"
+
 // Texture dumps and HD texture packs (Road Trip recomp). paraLLEl-GS decodes every texture it
 // samples into an RGBA8 image (palette and TEXA applied); with texture tools on, each newly
 // decoded texture is read back and named by a hash of its decoded pixels (so the same texture has
@@ -52,6 +54,9 @@ namespace ps2x::gs
             bool hit = false;    // the pack replaces it
             uint32_t width = 0, height = 0;
             std::vector<uint8_t> rgba; // empty if the image for contentKey was handed out before
+            // Or the image as cached ASTC 4x4 (gs_texture_pack_cache.h), for a consumer that takes
+            // it (setCompressedOk): its data empty when there is none.
+            packcache::Compressed astc;
             // Another palette of a texture the pack replaces (same index pattern): its image,
             // recoloured by an affine map fitted between the two palettes. Rows r, g, b, a
             // (dot with the texel, 0..255, PS2 alpha) then the offset.
@@ -84,6 +89,14 @@ namespace ps2x::gs
         // game rewrites every frame (a scrolling one cycles through a few contents) kept this
         // worker ~5% of a core busy on the Thor.
         std::unordered_set<uint64_t> m_knownMiss;
+        std::atomic<bool> m_compressedOk{false};
+
+    public:
+        // The consumer creates ASTC 4x4 images: pack images come from the ASTC cache when it has
+        // them (no PNG decoding).
+        void setCompressedOk(bool ok) { m_compressedOk = ok; }
+
+    private:
         // Paletted textures the pack replaced, by index pattern: their content key and the colour
         // of each index class (in order of first appearance).
         struct ShapeRef

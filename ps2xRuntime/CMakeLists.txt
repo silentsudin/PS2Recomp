@@ -670,6 +670,31 @@ if(PS2X_ENABLE_PGS)
         target_link_libraries(arm_asr PUBLIC granite-volk-headers)
         target_link_libraries(ps2_runtime PRIVATE arm_asr)
         target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_ARM_ASR=1)
+        # Arm ASTC Encoder (Apache-2.0), its library only: texture packs are cached as ASTC
+        # (gs_texture_pack_cache.cpp), loaded with no PNG decoding at a quarter of the memory.
+        FetchContent_Declare(
+            astcenc
+            GIT_REPOSITORY "https://github.com/ARM-software/astc-encoder.git"
+            GIT_TAG 5.7.0
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_GetProperties(astcenc)
+        if(NOT astcenc_POPULATED)
+            FetchContent_Populate(astcenc)
+        endif()
+        file(GLOB _astcenc_sources "${astcenc_SOURCE_DIR}/Source/astcenc_*.cpp")
+        add_library(astcenc_lib STATIC ${_astcenc_sources})
+        target_include_directories(astcenc_lib SYSTEM PUBLIC "${astcenc_SOURCE_DIR}/Source")
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64" OR CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+            target_compile_definitions(astcenc_lib PUBLIC ASTCENC_NEON=1 ASTCENC_SSE=0 ASTCENC_AVX=0 ASTCENC_POPCNT=0 ASTCENC_F16C=0)
+        else()
+            target_compile_definitions(astcenc_lib PUBLIC ASTCENC_NEON=0 ASTCENC_SSE=20 ASTCENC_AVX=0 ASTCENC_POPCNT=0 ASTCENC_F16C=0)
+        endif()
+        set_target_properties(astcenc_lib PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+        target_compile_options(astcenc_lib PRIVATE -w -O3)
+        target_link_libraries(ps2_runtime PRIVATE astcenc_lib)
+        target_sources(ps2_runtime PRIVATE src/lib/gs/gs_texture_pack_cache.cpp)
+        target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_ASTCENC=1)
     endif()
     message(STATUS "paraLLEl-GS Vulkan GS backend: enabled")
 endif()

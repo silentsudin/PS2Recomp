@@ -382,6 +382,20 @@ namespace ps2x::gs
                     }
                 }
             }
+            if (r.hit && !handedOut && m_compressedOk)
+            {
+                std::string packDir;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    packDir = m_packDir;
+                }
+                if (packcache::load(packDir, packPath, r.contentKey, r.astc))
+                {
+                    r.width = r.astc.width;
+                    r.height = r.astc.height;
+                    handedOut = true; // (pixels on their way: no PNG)
+                }
+            }
             if (r.hit && !handedOut)
             {
                 Image image = LoadImage(packPath.c_str());

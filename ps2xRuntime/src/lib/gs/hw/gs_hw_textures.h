@@ -86,8 +86,10 @@ namespace ps2x::gs
         {
             uint32_t width = 0, height = 0;
             std::vector<uint8_t> rgba;
+            packcache::Compressed astc; // or this (ASTC 4x4, all levels)
             bool queued = false;
         };
+        int m_astc = -1; // the device samples ASTC 4x4 (-1: not asked yet)
         static constexpr size_t kCreateBytesPerFrame = 24u << 20;
 
         TextureTools m_tools;
