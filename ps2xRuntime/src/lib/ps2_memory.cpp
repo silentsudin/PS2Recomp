@@ -2137,10 +2137,11 @@ void PS2Memory::syncGifVif1()
         std::chrono::steady_clock::time_point start;
         ~ReportBlocked()
         {
+            const uint64_t ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            memory.m_eeBlockedNs.fetch_add(ns, std::memory_order_relaxed);
             if (memory.m_gifVif1BlockedFn)
-                memory.m_gifVif1BlockedFn(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                    std::chrono::steady_clock::now() - start)
-                                                                    .count()));
+                memory.m_gifVif1BlockedFn(ns);
         }
     } reportBlocked{*this, waitStart};
     std::unique_lock<std::mutex> lock(m_gifVif1Mutex);

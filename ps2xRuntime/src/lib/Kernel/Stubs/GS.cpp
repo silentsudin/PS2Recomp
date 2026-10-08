@@ -1,4 +1,11 @@
 #include "Common.h"
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include "GS.h"
 #include "ps2_log.h"
 #include "runtime/gs/ps2_gs_common.h"
@@ -107,6 +114,44 @@ namespace ps2_stubs
             return {stack0, stack1, stack2};
         }
 
+        // RT_LATE_LOG=1: each frame that starts more than 25 ms after the last (a late frame, two
+        // vblanks or more), with where the EE thread's time went meanwhile (idle = waiting for its
+        // next event, blocked = waiting for VU1/GS, run = the rest: the game, IOP, SPU2) and how
+        // busy the VU1 and GS threads were.
+        void logLateFrame(PS2Runtime *runtime)
+        {
+            static const bool on = [] { const char *e = std::getenv("RT_LATE_LOG"); return e && *e == '1'; }();
+            if (!on)
+                return;
+            struct Sample
+            {
+                std::chrono::steady_clock::time_point at;
+                uint64_t idle, blocked, vu1, gs;
+            };
+            static Sample last{};
+            static uint64_t frames = 0, late = 0;
+            const Sample now{std::chrono::steady_clock::now(), runtime->eeScheduler().idleNanos(),
+                             runtime->memory().eeBlockedNanos(), runtime->memory().gifVif1BusyNanos(),
+                             runtime->memory().gsThreadBusyNanos()};
+            const double ms = std::chrono::duration<double, std::milli>(now.at - last.at).count();
+            ++frames;
+            if (last.at.time_since_epoch().count() != 0 && ms > 25.0 && ms < 500.0)
+            {
+                ++late;
+                const double idle = (now.idle - last.idle) / 1e6, blocked = (now.blocked - last.blocked) / 1e6;
+                std::fprintf(stderr, "[late] frame %.1f ms: EE run %.1f idle %.1f blocked %.1f | VU1 %.1f GS %.1f | EE on cpu %d | %llu of %llu\n", ms,
+                            ms - idle - blocked, idle, blocked, (now.vu1 - last.vu1) / 1e6, (now.gs - last.gs) / 1e6,
+#if defined(__linux__)
+                            sched_getcpu(),
+#else
+                            -1,
+#endif
+                            static_cast<unsigned long long>(late), static_cast<unsigned long long>(frames));
+                std::fflush(stderr);
+            }
+            last = now;
+        }
+
         void applyGsClearPacket(PS2Runtime *runtime, const GsClearMem &clear)
         {
             if (!runtime->syncCoreSubsystems() || !hasSeededGsClearPacket(clear))
@@ -114,6 +159,7 @@ namespace ps2_stubs
                 return;
             }
 
+            logLateFrame(runtime);
             runtime->gs().markFrameStart(); // the game clears once per frame, before drawing it
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);

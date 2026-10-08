@@ -405,6 +405,8 @@ public:
     // Nanoseconds the worker / GS thread spent working (diagnostics: headroom at a capped frame rate).
     [[nodiscard]] uint64_t gifVif1BusyNanos() const { return m_gifVif1BusyNs.load(std::memory_order_relaxed); }
     [[nodiscard]] uint64_t gsThreadBusyNanos() const { return m_gsBusyNs.load(std::memory_order_relaxed); }
+    // Time the EE spent waiting for the GIF/VIF1 worker or the GS thread (syncGifVif1).
+    [[nodiscard]] uint64_t eeBlockedNanos() const { return m_eeBlockedNs.load(std::memory_order_relaxed); }
 
     int pollDmaRegisters();
 
@@ -506,6 +508,7 @@ public:
     std::atomic<uint64_t> m_gifVif1Stalls{0};
     std::atomic<uint64_t> m_gifVif1BusyNs{0};
     BlockedTimeFn m_gifVif1BlockedFn;
+    std::atomic<uint64_t> m_eeBlockedNs{0};
     std::atomic<uint64_t> m_gsBusyNs{0};
     bool m_gifVif1Stop = false;
     void gifVif1WorkerLoop();

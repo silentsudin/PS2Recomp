@@ -2136,6 +2136,17 @@ void EeScheduler::waitForEvent()
     {
         return;
     }
+    struct IdleTime
+    {
+        std::atomic<uint64_t> &sum;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~IdleTime()
+        {
+            sum.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                    std::chrono::steady_clock::now() - start).count()),
+                          std::memory_order_relaxed);
+        }
+    } idle{m_idleNs};
     const uint64_t timerCycles = m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)

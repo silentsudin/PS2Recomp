@@ -1240,7 +1240,7 @@ namespace ps2x::gs
                     FsrEasuCon(push.con, push.con + 4, push.con + 8, push.con + 12, static_cast<AF1>(sw), static_cast<AF1>(sh),
                                static_cast<AF1>(sw), static_cast<AF1>(sh), static_cast<AF1>(rect.extent.width),
                                static_cast<AF1>(rect.extent.height));
-                    static const bool gpuTimesEasu = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && *e == '1'; }();
+                    static const bool gpuTimesEasu = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && (*e == '1' || *e == '2'); }();
                     Vulkan::QueryPoolHandle tsEasu = gpuTimesEasu ? cmd.write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                     offscreenPass(cmd, m_upImage, rect.extent.width, rect.extent.height, m_easu, *m_final, &push, sizeof(push));
                     if (gpuTimesEasu)
@@ -2690,7 +2690,7 @@ namespace ps2x::gs
                 }
                 // RT_GPU_TIMES=1: GPU time of the presenter's passes and the GS's recordings, logged
                 // every 2 s (per occurrence).
-                static const bool gpuTimes = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && *e == '1'; }();
+                static const bool gpuTimes = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && (*e == '1' || *e == '2'); }();
                 Vulkan::QueryPoolHandle tsPost = gpuTimes ? cmd->write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                 if (fresh)
                 {

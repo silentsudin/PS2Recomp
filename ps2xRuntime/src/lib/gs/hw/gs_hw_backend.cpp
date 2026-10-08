@@ -1284,6 +1284,7 @@ namespace ps2x::gs
             {
                 Vulkan::Fence fence;
                 uint32_t outW = 0, outH = 0;
+                bool sliced = false, sliceScan = false;
                 {
                     const auto lock = lockDevice();
                     std::vector<Batch> &batches = m_recordBatches;
@@ -1335,12 +1336,23 @@ namespace ps2x::gs
                                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
                     record(*cmd, batches, vertices);
                     // A frame whose drawing was skipped: the last picture stays (no new scanout).
+                    static const bool presentTimes = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && *e == '2'; }();
+                    Vulkan::QueryPoolHandle scanStart = presentTimes ? cmd->write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                     const Vulkan::Image *scan = request.frameSkipped ? nullptr : scanout(*cmd, request);
+                    if (scanStart)
+                        m_dev->register_time_interval("GPU", std::move(scanStart), cmd->write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
+                                                      "gs present: scanout");
                     noteMapPresent();
                     // Drawing from here on (the next frame) snaps as this scanout shows (snapRules).
                     m_fieldAware = (request.smode2 & 3u) == 3u && !request.progressiveFields;
                     if (scan && m_shared && m_shared->wantUi.load(std::memory_order_relaxed))
+                    {
+                        Vulkan::QueryPoolHandle maskStart = presentTimes ? cmd->write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                         drawUiMask(*cmd);
+                        if (maskStart)
+                            m_dev->register_time_interval("GPU", std::move(maskStart), cmd->write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
+                                                          "gs present: UI mask");
+                    }
                     m_uiDraw.clear();
                     if (scan)
                     {
@@ -1383,6 +1395,16 @@ namespace ps2x::gs
                         m_shadowBatchVerts.clear();
                         m_shadowWarm = 0;
                     }
+                    else if (m_shadows && sliceShadows())
+                    {
+                        // Recorded after the lock is released, in slices (recordShadowsSliced).
+                        m_sliceBatches.swap(m_shadowBatches);
+                        m_sliceVerts.swap(m_shadowBatchVerts);
+                        m_shadowBatches.clear();
+                        m_shadowBatchVerts.clear();
+                        sliced = true;
+                        sliceScan = scan != nullptr;
+                    }
                     else if (m_shadows)
                     {
                         auto shadowCmd = m_dev->request_command_buffer();
@@ -1412,6 +1434,8 @@ namespace ps2x::gs
                     if (m_own)
                         m_dev->next_frame_context();
                 }
+                if (sliced)
+                    recordShadowsSliced(request, sliceScan);
                 static const bool stats = std::getenv("RT_HWGS_STATS") != nullptr;
                 if (stats && ++m_stats.presents == 120)
                 {
@@ -2161,6 +2185,10 @@ namespace ps2x::gs
                 if (passOpen)
                 {
                     cmd.end_render_pass();
+                    if (m_passStart)
+                        m_dev->register_time_interval("GPU", std::move(m_passStart), cmd.write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
+                                                      m_passLabel);
+                    m_passStart = {};
                     passOpen = false;
                     m_passColor = nullptr;
                     m_passDepth = nullptr;
@@ -2192,7 +2220,12 @@ namespace ps2x::gs
                 cmd.image_barrier(*t.snapshot, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT,
                                   VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                static const bool passTimes = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && *e == '2'; }();
+                Vulkan::QueryPoolHandle copyStart = passTimes ? cmd.write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                 cmd.copy_image(*t.snapshot, *t.color);
+                if (copyStart)
+                    m_dev->register_time_interval("GPU", std::move(copyStart), cmd.write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
+                                                  m_inShadow ? "gs shadow snapshot" : "gs real snapshot");
                 cmd.image_barrier(*t.snapshot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                   VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
@@ -2353,7 +2386,7 @@ namespace ps2x::gs
             {
                 ++m_frame;
                 bool passOpen = false;
-                static const bool gpuTimes = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && *e == '1'; }();
+                static const bool gpuTimes = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && (*e == '1' || *e == '2'); }();
                 Vulkan::QueryPoolHandle tsStart = gpuTimes ? cmd.write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) : Vulkan::QueryPoolHandle{};
                 const Vulkan::Buffer *vbo = uploadVertices(vertices);
                 if (!m_inShadow)
@@ -2491,6 +2524,16 @@ namespace ps2x::gs
                         }
                         cmd.begin_render_pass(rp);
                         ++m_stats.passes;
+                        // RT_GPU_TIMES=2: GPU time per render pass of the real frame, by target.
+                        static const bool passTimes = [] { const char *e = std::getenv("RT_GPU_TIMES"); return e && *e == '2'; }();
+                        if (passTimes)
+                        {
+                            m_passStart = cmd.write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+                            char label[64];
+                            std::snprintf(label, sizeof(label), "gs %s pass: fbp %u%s%s", m_inShadow ? "shadow" : "real", ctx.frame.fbp,
+                                          depthImage ? " +Z" : "", toMap ? " (map)" : "");
+                            m_passLabel = label;
+                        }
                         passOpen = true;
                         m_passColor = t.color.get();
                         m_passDepth = depthImage;
@@ -2797,6 +2840,95 @@ namespace ps2x::gs
                     m_inShadow = false;
                     m_set = &m_main;
                 }
+                m_stats.shadowUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            }
+
+            // Shadows in slices: recordShadows above runs under the device lock, which the GS
+            // thread needs to submit the real frame, and in a busy town the shadow's draws took
+            // several milliseconds to record on the Thor: the GS thread waited, the EE waited for
+            // it, frames came two vblanks late and frame skip paused frame generation. Here each
+            // shadow's vertices are moved without the lock, and its batches are recorded in slices
+            // of about a millisecond, each under the lock and submitted before it is released (as
+            // the paraLLEl-GS shadows are replayed). The last slice scans the shadows out and
+            // publishes them. (Unless m_own or RT_HWGS_SHADOW_SLICE=0: one pass under the lock.)
+            bool sliceShadows() const
+            {
+                static const bool on = [] { const char *e = std::getenv("RT_HWGS_SHADOW_SLICE"); return !(e && *e == '0'); }();
+                return on && !m_own;
+            }
+
+            void recordShadowsSliced(const GSPresentationRequest &request, bool scan)
+            {
+                const auto t0 = std::chrono::steady_clock::now();
+                const size_t n = m_sliceBatches.size();
+                std::vector<Batch> sliceBatches;
+                std::vector<HwVertex> sliceVerts;
+                for (uint32_t i = 0; i < m_shadows; ++i)
+                {
+                    moveVertices(m_sliceVerts, static_cast<float>(i + 1) / static_cast<float>(m_shadows + 1), m_shadowVerts);
+                    for (size_t a = 0; a < n || (a == 0 && n == 0);)
+                    {
+                        const size_t b = std::min(n, a + m_slicePer);
+                        // This slice's batches with only their own vertices (record uploads all it gets).
+                        uint32_t lo = ~0u, hi = 0u;
+                        for (size_t k = a; k < b; ++k)
+                        {
+                            lo = std::min(lo, m_sliceBatches[k].firstVertex);
+                            hi = std::max(hi, m_sliceBatches[k].firstVertex + m_sliceBatches[k].vertexCount);
+                        }
+                        hi = std::min<uint32_t>(hi, static_cast<uint32_t>(m_shadowVerts.size()));
+                        sliceBatches.assign(m_sliceBatches.begin() + static_cast<ptrdiff_t>(a), m_sliceBatches.begin() + static_cast<ptrdiff_t>(b));
+                        if (lo < hi)
+                        {
+                            sliceVerts.assign(m_shadowVerts.begin() + lo, m_shadowVerts.begin() + hi);
+                            for (Batch &sb : sliceBatches)
+                                sb.firstVertex -= lo;
+                        }
+                        else
+                            sliceVerts.clear();
+                        const bool last = i + 1u == m_shadows && b == n;
+                        {
+                            const auto lock = lockDevice();
+                            const auto s0 = std::chrono::steady_clock::now();
+                            auto cmd = m_dev->request_command_buffer();
+                            m_set = &m_shadowSets[i];
+                            m_inShadow = true;
+                            if (!sliceBatches.empty())
+                                record(*cmd, sliceBatches, sliceVerts);
+                            m_inShadow = false;
+                            m_set = &m_main;
+                            if (last)
+                            {
+                                m_shadowIndex = (m_shadowIndex + 1u) % 3u;
+                                m_shadowWarm = std::min(m_shadowWarm + 1u, 3u);
+                                for (uint32_t j = 0; j < m_shadows; ++j)
+                                {
+                                    m_set = &m_shadowSets[j];
+                                    m_inShadow = true;
+                                    m_shadowSlot = j;
+                                    const Vulkan::Image *shadowScan = scan ? scanout(*cmd, request) : nullptr;
+                                    m_inShadow = false;
+                                    m_set = &m_main;
+                                    if (shadowScan && m_shadowWarm >= 3u)
+                                    {
+                                        m_shared->shadowScanout[j] = m_shadowScan[j][m_shadowIndex];
+                                        m_shared->shadowSerial[j] = m_shared->presentSerial;
+                                    }
+                                }
+                            }
+                            submitRecorded(cmd);
+                            // About a millisecond a slice from here on (from this slice's rate).
+                            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+                            if (b > a && ms > 0.05)
+                                m_slicePer = std::clamp<size_t>(static_cast<size_t>(static_cast<double>(b - a) * kSliceMs / ms), 32u, 4096u);
+                        }
+                        if (n == 0)
+                            break;
+                        a = b;
+                    }
+                }
+                m_sliceBatches.clear();
+                m_sliceVerts.clear();
                 m_stats.shadowUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
             }
 
@@ -3484,6 +3616,10 @@ namespace ps2x::gs
             uint32_t m_shadows = 0; // shadow frames rendered (PgsShared::wantShadows)
             bool m_inShadow = false;
             std::vector<HwVertex> m_shadowVerts;
+            std::vector<Batch> m_sliceBatches; // this Present's shadow work (recordShadowsSliced)
+            std::vector<HwVertex> m_sliceVerts;
+            size_t m_slicePer = 128; // batches a slice
+            static constexpr double kSliceMs = 1.0;
             std::vector<Batch> m_shadowBatches; // this frame's batches so far, for the shadows
             std::vector<HwVertex> m_shadowBatchVerts;
             Vulkan::ImageHandle m_shadowScan[kMaxShadows][3];
@@ -3524,6 +3660,8 @@ namespace ps2x::gs
             uint32_t m_mapFbp = 0;       // the frame buffer the map being drawn belongs to
             bool m_mapPublished = false; // a map went to the second screen since the last Present
             float m_mapBox[4] = {};
+            Vulkan::QueryPoolHandle m_passStart; // RT_GPU_TIMES=2: the open pass's start
+            std::string m_passLabel;
             float m_mapStable[4] = {}; // the fixed box of the map on show
             bool m_mapClipped[4] = {};  // this frame's map edges the scissor cut
             uint32_t m_scanoutIndex = 0;

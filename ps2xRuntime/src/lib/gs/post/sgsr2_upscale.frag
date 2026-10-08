@@ -39,6 +39,11 @@ layout(push_constant) uniform Push
 layout(location = 0) in highp vec2 vUV;
 layout(location = 0) out mediump vec4 Output;
 
+// From here on half precision unless marked (Qualcomm's shader is written for it: colours, kernel
+// weights and box statistics; positions, UVs and motion stay highp, as do the push constants above,
+// where a 16-bit 1/1280 would move a pixel by ~1 at 1080p). On Adreno mediump runs as fp16.
+precision mediump float;
+
 
 // Catmull-Rom from 9 bilinear taps folded into 5 (the corners dropped): sharp where bilinear
 // blurs a picture moved by a fraction of a pixel.

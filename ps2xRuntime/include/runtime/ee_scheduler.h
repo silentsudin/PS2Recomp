@@ -481,6 +481,8 @@ private:
     void assertExecutor() const;
 public:
     [[nodiscard]] bool onExecutorThread() const noexcept { return m_executorThread == std::this_thread::get_id(); }
+    // Host time the EE thread spent idle, waiting for its next event (a vblank, a timer, a wake-up).
+    [[nodiscard]] uint64_t idleNanos() const noexcept { return m_idleNs.load(std::memory_order_relaxed); }
     // RT_TIME=virtual: guest time comes only from EE cycles, so a run is reproducible whatever the
     // host does. RT_SPEED=<x> paces it at x times real time (default 1), RT_SPEED=max runs it as
     // fast as the host allows.
@@ -508,6 +510,7 @@ private:
     static int waitObjectId(const EeWaitState &wait);
     void writeGuestU32(uint32_t address, uint32_t value);
     void waitForEvent();
+    std::atomic<uint64_t> m_idleNs{0};
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
