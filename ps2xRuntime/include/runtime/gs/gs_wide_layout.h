@@ -67,6 +67,16 @@ namespace ps2x::gs
         enum class VertexClass : uint8_t { Scene, Ui, Neutral };
         void setRecordClasses(bool on) { m_recordClasses = on; }
         const std::vector<VertexClass> &vertexClasses() const { return m_classes; }
+        // A PATH1 packet (the 3D) needs no pass once the frame's kind is known and its HUD hasn't
+        // begun: every vertex is Scene in a driving frame, Ui on a 2D screen, and nothing else
+        // changes. skipPacket() records that: no classes, defaultClass() for every vertex.
+        bool plainPath1() const { return m_mode != Mode::Unknown && (m_mode == Mode::Screen2D || !m_hud); }
+        void skipPacket()
+        {
+            m_classes.clear();
+            m_defaultClass = m_mode == Mode::Driving ? VertexClass::Scene : VertexClass::Ui;
+        }
+        VertexClass defaultClass() const { return m_defaultClass; }
 
         // The game cleared the screen to start a frame (GS::markFrameStart, from its clear routine).
         void frameStart();
@@ -136,6 +146,7 @@ namespace ps2x::gs
         uint32_t m_2DVotes = 0, m_driveVotes = 0;
         bool m_hudStarted = false;
         bool m_recordClasses = false;
+        VertexClass m_defaultClass = VertexClass::Scene; // past the end of m_classes
         std::vector<VertexClass> m_classes;
         Vertex m_unit[2048];
         uint32_t m_unitCount = 0;

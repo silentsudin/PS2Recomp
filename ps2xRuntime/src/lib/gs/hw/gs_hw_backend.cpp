@@ -674,7 +674,8 @@ namespace ps2x::gs
                     }
                     o.fog = v.fog;
                     o.motion = v.motion;
-                    m_stats.motionVertices += v.motion != 0;
+                    if (stats && v.motion) // (a sequentially consistent add per vertex: ~3% of the GS thread)
+                        m_stats.motionVertices.fetch_add(1, std::memory_order_relaxed);
                     return o;
                 };
 
@@ -1780,9 +1781,26 @@ namespace ps2x::gs
                 {
                     const uint32_t w = std::max(1u, (1u << tw) >> l), h = std::max(1u, (1u << th) >> l);
                     data[l].resize(static_cast<size_t>(w) * h);
-                    for (uint32_t y = 0; y < h; ++y)
-                        for (uint32_t x = 0; x < w; ++x)
-                            data[l][static_cast<size_t>(y) * w + x] = texel(s, tex.psm, lv[l].tbp, lv[l].tbw, x, y);
+                    if (isIndexed(tex.psm))
+                    {
+                        // The palette once (TEXA applied), then an index and a lookup per texel: per
+                        // texel it was a palette walk too (the GS thread's busiest decode).
+                        uint32_t palette[256];
+                        const uint32_t entries = isFourBit(tex.psm) ? 16u : 256u;
+                        for (uint32_t i = 0; i < entries; ++i)
+                            palette[i] = clutColor(s, i);
+                        const uint32_t mask = entries - 1u;
+                        for (uint32_t y = 0; y < h; ++y)
+                        {
+                            uint32_t *row = data[l].data() + static_cast<size_t>(y) * w;
+                            for (uint32_t x = 0; x < w; ++x)
+                                row[x] = palette[GSMem::ReadTexture(m_pageCache, m_vram, tex.psm, lv[l].tbp, lv[l].tbw, x, y) & mask];
+                        }
+                    }
+                    else
+                        for (uint32_t y = 0; y < h; ++y)
+                            for (uint32_t x = 0; x < w; ++x)
+                                data[l][static_cast<size_t>(y) * w + x] = texel(s, tex.psm, lv[l].tbp, lv[l].tbw, x, y);
                     init[l] = {data[l].data(), 0, 0};
                 }
                 {

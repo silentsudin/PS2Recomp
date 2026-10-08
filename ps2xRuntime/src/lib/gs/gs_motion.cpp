@@ -341,37 +341,36 @@ namespace ps2x::gs
         return true;
     }
 
+    // Back to object space with C^-1, forward with last frame's C: one matrix, prev * C^-1 (the
+    // object-space w divides out in the projection; it is still checked).
+    Mat4 MotionTracker::motionMatrix(const MotionContext &ctx) { return mul(ctx.prev, ctx.curInv); }
+
+    uint32_t MotionTracker::vertexMotion(const MotionContext &ctx, const Mat4 &pc, double X, double Y, double Z)
+    {
+        // Far outside the screen (the guard band, culled triangles): no motion needed.
+        if (std::fabs(X - 2048.0) > 1024.0 || std::fabs(Y - 2048.0) > 512.0)
+            return 0;
+        const double *inv = ctx.curInv.m, *p = pc.m;
+        const double ww = inv[3] * X + inv[7] * Y + inv[11] * Z + inv[15];
+        if (std::fabs(ww) <= 1e-20)
+            return 0;
+        const double px = p[0] * X + p[4] * Y + p[8] * Z + p[12];
+        const double py = p[1] * X + p[5] * Y + p[9] * Z + p[13];
+        const double pw = p[3] * X + p[7] * Y + p[11] * Z + p[15];
+        if (std::fabs(pw) <= 1e-20 * std::fabs(ww))
+            return 0;
+        const float dx = static_cast<float>(X - px / pw), dy = static_cast<float>(Y - py / pw);
+        if (!std::isfinite(dx) || !std::isfinite(dy))
+            return 0;
+        return toHalf(dx) | (static_cast<uint32_t>(toHalf(dy)) << 16);
+    }
+
     void MotionTracker::packetMotion(const uint8_t *data, uint32_t size, const MotionContext &ctx, std::vector<uint32_t> &out)
     {
         out.clear();
-        // Back to object space with C^-1, forward with last frame's C: one matrix, prev * C^-1
-        // (the object-space w divides out in the projection; it is still checked, as before).
-        const double *inv = ctx.curInv.m;
-        const Mat4 pc = mul(ctx.prev, ctx.curInv);
-        const double *p = pc.m;
+        const Mat4 pc = motionMatrix(ctx);
         auto vertex = [&](uint16_t gx, uint16_t gy, uint32_t gz) {
-            const double X = gx / 16.0, Y = gy / 16.0, Z = static_cast<double>(gz);
-            // Far outside the screen (the guard band, culled triangles): no motion needed.
-            if (std::fabs(X - 2048.0) > 1024.0 || std::fabs(Y - 2048.0) > 512.0)
-            {
-                out.push_back(0);
-                return;
-            }
-            const double ww = inv[3] * X + inv[7] * Y + inv[11] * Z + inv[15];
-            uint32_t packed = 0;
-            if (std::fabs(ww) > 1e-20)
-            {
-                const double px = p[0] * X + p[4] * Y + p[8] * Z + p[12];
-                const double py = p[1] * X + p[5] * Y + p[9] * Z + p[13];
-                const double pw = p[3] * X + p[7] * Y + p[11] * Z + p[15];
-                if (std::fabs(pw) > 1e-20 * std::fabs(ww))
-                {
-                    const float dx = static_cast<float>(X - px / pw), dy = static_cast<float>(Y - py / pw);
-                    if (std::isfinite(dx) && std::isfinite(dy))
-                        packed = toHalf(dx) | (static_cast<uint32_t>(toHalf(dy)) << 16);
-                }
-            }
-            out.push_back(packed);
+            out.push_back(vertexMotion(ctx, pc, gx / 16.0, gy / 16.0, static_cast<double>(gz)));
         };
 
         uint32_t offset = 0;

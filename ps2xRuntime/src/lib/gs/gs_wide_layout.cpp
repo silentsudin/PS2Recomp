@@ -334,6 +334,7 @@ namespace ps2x::gs
     void WideLayout::transformPacket(uint32_t pathIndex, uint8_t *data, uint32_t sizeBytes, const PrimState &start)
     {
         PrimState st = start;
+        m_defaultClass = VertexClass::Scene;
         m_unitCount = 0;
         m_unitOverflow = 0;
         m_classes.clear();

@@ -450,7 +450,7 @@ namespace ps2_save_state
             {fourcc("EESC"), 1}, {fourcc("EETM"), 1}, {fourcc("EERT"), 1}, {fourcc("GSFE"), 1},
             {fourcc("HPAD"), 1}, {fourcc("HMCD"), 1}, {fourcc("HCDV"), 1}, {fourcc("HSIF"), 1},
             {fourcc("HRPC"), 1}, {fourcc("HAUD"), 1}, {fourcc("HDMA"), 1}, {fourcc("HGSS"), 1},
-            {fourcc("HFIO"), 1}, {fourcc("HLIB"), 1}, {fourcc("IOPS"), 1}, {fourcc("SPU2"), 1},
+            {fourcc("HFIO"), 1}, {fourcc("HLIB"), 1}, {fourcc("IOPS"), 2}, {fourcc("SPU2"), 1},
         };
 
         struct SectionDef

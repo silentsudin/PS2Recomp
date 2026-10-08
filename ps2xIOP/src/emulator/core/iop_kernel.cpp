@@ -767,6 +767,8 @@ namespace ps2x::iop::detail
                           IopCpuState &c = t.cpu;
                           a & c.gpr & c.hi & c.lo & c.pc & c.cop0 & c.pendingLoadReg & c.pendingLoadValue & c.pendingLoad;
                           a & c.branchPending & c.branchTarget & c.stopped & c.yielded & c.exception;
+                          if (a.version() >= 2) // (IOPS v2)
+                              a & c.nativeDebt;
                           a & t.entry & t.stackBase & t.stackSize & t.priority & t.initialPriority & t.option & t.attr;
                           a & t.wakeCycle & t.waitId & t.waitBits & t.waitMode & t.waitResultAddress & t.wakeupCount;
                       });

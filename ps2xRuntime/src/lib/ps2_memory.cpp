@@ -2011,6 +2011,19 @@ void PS2Memory::enqueueGifVif1(bool gif, const PendingTransfer &transfer)
 void PS2Memory::gifVif1WorkerLoop()
 {
     t_onGifVif1Worker = true;
+#if defined(__aarch64__)
+    // This thread runs the VU1 microcode: its float mode stays the VU's (round toward zero,
+    // denormals flushed), so a run finds it set and neither switches nor restores it (each FPCR
+    // write serialises the core: ~27 ns a run, ~15% of the busiest program). The thread's other
+    // float work (motion matching) doesn't need round-to-nearest. RT_VU1_STICKY_FPCR=0: per run.
+    if (const char *e = std::getenv("RT_VU1_STICKY_FPCR"); !(e && *e == '0'))
+    {
+        uint64_t fpcr;
+        __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+        fpcr = (fpcr & ~(3ull << 22)) | (3ull << 22) | (1ull << 24);
+        __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+    }
+#endif
     for (;;)
     {
         GifVif1Job job;

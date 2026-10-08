@@ -20,6 +20,7 @@
 #include "imports/iop_vblank.h"
 #include "spu2/iop_spu2.h"
 #include "iop_emulator_const.h"
+#include "ps2x/iop/iop_native.h"
 
 #include <algorithm>
 #include <chrono>
@@ -28,6 +29,37 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <cstring>
+
+namespace ps2x::iop
+{
+    namespace
+    {
+        std::vector<NativeFunction> &nativeRegistry()
+        {
+            static std::vector<NativeFunction> registry;
+            return registry;
+        }
+    }
+
+    void registerNativeFunction(NativeFunction function) { nativeRegistry().push_back(std::move(function)); }
+
+    uint64_t nativeCodeHash(const uint32_t *words, uint32_t count, const std::vector<uint32_t> &relocated)
+    {
+        uint64_t h = 0xCBF29CE484222325ull;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            if (std::find(relocated.begin(), relocated.end(), i) != relocated.end())
+                continue;
+            for (int b = 0; b < 4; ++b)
+            {
+                h ^= (words[i] >> (8 * b)) & 0xFFu;
+                h *= 0x100000001B3ull;
+            }
+        }
+        return h;
+    }
+}
 #include <sstream>
 #include <utility>
 
@@ -129,6 +161,7 @@ namespace ps2x::iop::detail
             spu2Cycles = 0;
             kernel.reset();
             modules.clear();
+            bindNativeFunctions();
             imports.reset();
             rpc.reset();
             cdvd.reset();
@@ -385,10 +418,61 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
+        // Native stand-ins (iop_native.h): bound to loaded modules whose code matches.
+        struct NativeMemoryAdapter final : NativeMemory
+        {
+            IopMemory *m = nullptr;
+            uint8_t read8(uint32_t a) const override { return m->read8(a); }
+            uint16_t read16(uint32_t a) const override { return m->read16(a); }
+            uint32_t read32(uint32_t a) const override { return m->read32(a); }
+            void write8(uint32_t a, uint8_t v) override { m->write8(a, v); }
+            void write16(uint32_t a, uint16_t v) override { m->write16(a, v); }
+            void write32(uint32_t a, uint32_t v) override { m->write32(a, v); }
+        } nativeMemory;
+        std::vector<std::pair<uint32_t, const NativeFunction *>> nativeBound;
+        uint64_t sliceEnd = ~0ull; // runCpu's: where the current time slice ends (instructions)
+
+        void bindNativeFunctions()
+        {
+            nativeBound.clear();
+            nativeMemory.m = &memory;
+            static const bool off = [] { const char *e = std::getenv("RT_IOP_NATIVE"); return e && *e == '0'; }();
+            if (off)
+                return;
+            for (const NativeFunction &fn : nativeRegistry())
+                for (const auto &[id, m] : modules)
+                {
+                    if (m.name.find(fn.module) == std::string::npos || fn.offset + fn.words * 4u > m.size)
+                        continue;
+                    std::vector<uint32_t> words(fn.words);
+                    for (uint32_t i = 0; i < fn.words; ++i)
+                        words[i] = memory.read32(m.base + fn.offset + i * 4u);
+                    if (nativeCodeHash(words.data(), fn.words, fn.relocated) != fn.hash)
+                        continue;
+                    nativeBound.push_back({m.base + fn.offset, &fn});
+                    char line[160];
+                    std::snprintf(line, sizeof(line), "[IOP] native %s+0x%x at 0x%x", m.name.c_str(), fn.offset, m.base + fn.offset);
+                    log(LogLevel::Info, line);
+                }
+        }
+
         bool step(CpuState &cpu)
         {
             if (cpu.stopped)
                 return false;
+            if (cpu.nativeDebt) [[unlikely]]
+            {
+                // A native stand-in's instruction slots (one step each, as many as fit in this
+                // slice), interrupts taken between them as they would be inside the routine.
+                if (checkInterrupt(cpu))
+                    return true;
+                const uint64_t room = sliceEnd > totalInstructions ? sliceEnd - totalInstructions : 1u;
+                const uint64_t k = std::min<uint64_t>(cpu.nativeDebt, std::max<uint64_t>(room, 1u));
+                cpu.nativeDebt -= k;
+                totalInstructions += k;
+                totalCycles += k;
+                return true;
+            }
             if (cpu.pc == kThreadReturnSentinel || cpu.pc == kCallReturnSentinel)
             {
                 cpu.stopped = true;
@@ -404,6 +488,24 @@ namespace ps2x::iop::detail
             }
             if (checkInterrupt(cpu))
                 return true;
+
+            if (!nativeBound.empty()) [[unlikely]]
+                for (const auto &[pc, fn] : nativeBound)
+                    if (cpu.pc == pc)
+                    {
+                        NativeContext ctx;
+                        ctx.gpr = cpu.gpr.data();
+                        ctx.function = pc;
+                        ctx.memory = &nativeMemory;
+                        const uint64_t n = fn->run(ctx);
+                        cpu.gpr[0] = 0;
+                        cpu.nativeDebt = n > 0 ? n - 1u : 0u; // this step is the first
+                        ++totalInstructions;
+                        ++totalCycles;
+                        cpu.pc = cpu.gpr[31];
+                        cpu.branchPending = false;
+                        return !cpu.stopped;
+                    }
 
             if (const auto import = imports.decode(cpu.pc))
             {
@@ -469,6 +571,8 @@ namespace ps2x::iop::detail
             CpuState *previous = activeCpu;
             activeCpu = &cpu;
             const uint64_t start = totalInstructions;
+            const uint64_t previousEnd = sliceEnd;
+            sliceEnd = start + instructionBudget;
             while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
             {
                 if (!step(cpu))
@@ -479,6 +583,7 @@ namespace ps2x::iop::detail
                     servicePendingGuestCallbacks();
             }
             activeCpu = previous;
+            sliceEnd = previousEnd;
             return static_cast<uint32_t>(totalInstructions - start);
         }
 
@@ -733,6 +838,7 @@ namespace ps2x::iop::detail
             result.moduleId = module.id;
             result.startResult = static_cast<int32_t>(startResult);
             modules[module.id] = std::move(module);
+            bindNativeFunctions();
 
             std::ostringstream out;
             out << "[IOP] loaded IRX id=" << result.moduleId
@@ -774,6 +880,7 @@ namespace ps2x::iop::detail
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
             modules.erase(it);
+            bindNativeFunctions();
             kernel.cleanupDeadThreads();
             if (result)
                 *result = 0;
@@ -874,6 +981,8 @@ namespace ps2x::iop::detail
         ar & d.servicingDmaInterrupts & d.servicingGuestCallbacks;
         for (Impl::GuestCallback *cb : {&d.secrMcCommandHandler, &d.secrMcDevIdHandler, &d.checkKelfPathCallback})
             ar & cb->function & cb->gp;
+        if (ar.loading())
+            d.bindNativeFunctions(); // (the modules and their code just came back)
     }
 
     void IopEmulator::serializeSpu2State(ps2x::StateArchive &ar)

@@ -23,6 +23,7 @@ namespace ps2x::iop::detail
         bool stopped = false;
         bool yielded = false;
         bool exception = false;
+        uint64_t nativeDebt = 0; // instruction slots a native stand-in still owes (iop_native.h)
     };
 
     class IopCpuCore

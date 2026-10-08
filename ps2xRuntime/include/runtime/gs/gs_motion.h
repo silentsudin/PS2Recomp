@@ -71,6 +71,10 @@ namespace ps2x::gs
         // Motion of each vertex (XYZ2/XYZF2/XYZ3/XYZF3, in kick order) of a PATH1 GIF packet, as
         // packed half2 (dx, dy) in GS pixels: current minus previous position.
         static void packetMotion(const uint8_t *data, uint32_t size, const MotionContext &ctx, std::vector<uint32_t> &out);
+        // One vertex's motion, as packetMotion gives it, for a parser that already has the vertex
+        // (window X, Y in pixels, Z): `pc` = motionMatrix(ctx), made once per context.
+        static Mat4 motionMatrix(const MotionContext &ctx);
+        static uint32_t vertexMotion(const MotionContext &ctx, const Mat4 &pc, double X, double Y, double Z);
         // Re-rendered frame generation: a copy of a PATH1 GIF packet with every vertex re-projected
         // with the object's matrix moved on by t frames (C + t (C - C_prev): t = 0.5 is half a
         // frame ahead) on screen (Z kept, so coplanar decals stay equal), and perspective texture
