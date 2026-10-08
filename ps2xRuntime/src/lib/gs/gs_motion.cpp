@@ -342,7 +342,7 @@ namespace ps2x::gs
     }
 
     // Back to object space with C^-1, forward with last frame's C: one matrix, prev * C^-1 (the
-    // object-space w divides out in the projection; it is still checked).
+    // object-space w divides out in the projection).
     Mat4 MotionTracker::motionMatrix(const MotionContext &ctx) { return mul(ctx.prev, ctx.curInv); }
 
     uint32_t MotionTracker::vertexMotion(const MotionContext &ctx, const Mat4 &pc, double X, double Y, double Z)
@@ -350,16 +350,15 @@ namespace ps2x::gs
         // Far outside the screen (the guard band, culled triangles): no motion needed.
         if (std::fabs(X - 2048.0) > 1024.0 || std::fabs(Y - 2048.0) > 512.0)
             return 0;
-        const double *inv = ctx.curInv.m, *p = pc.m;
-        const double ww = inv[3] * X + inv[7] * Y + inv[11] * Z + inv[15];
-        if (std::fabs(ww) <= 1e-20)
+        (void)ctx;
+        const double *p = pc.m;
+        const double pw = p[3] * X + p[7] * Y + p[11] * Z + p[15];
+        if (!(std::fabs(pw) > 1e-20)) // (degenerate: no motion)
             return 0;
+        const double r = 1.0 / pw; // one division for both (the GS thread runs this per 3D vertex)
         const double px = p[0] * X + p[4] * Y + p[8] * Z + p[12];
         const double py = p[1] * X + p[5] * Y + p[9] * Z + p[13];
-        const double pw = p[3] * X + p[7] * Y + p[11] * Z + p[15];
-        if (std::fabs(pw) <= 1e-20 * std::fabs(ww))
-            return 0;
-        const float dx = static_cast<float>(X - px / pw), dy = static_cast<float>(Y - py / pw);
+        const float dx = static_cast<float>(X - px * r), dy = static_cast<float>(Y - py * r);
         if (!std::isfinite(dx) || !std::isfinite(dy))
             return 0;
         return toHalf(dx) | (static_cast<uint32_t>(toHalf(dy)) << 16);

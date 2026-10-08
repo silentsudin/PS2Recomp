@@ -479,6 +479,12 @@ struct Vu1Native
         if (bytes == 0u)
             return false;
         uint8_t *dst = vu.m_xgkick.packet.data();
+        vu.m_kickOwned = !vu.m_xgkickSink && vu.m_activeMemory && vu.m_activeMemory->takeGifBuffer(vu.m_kickBuffer);
+        if (vu.m_kickOwned)
+        {
+            vu.m_kickBuffer.resize(bytes);
+            dst = vu.m_kickBuffer.data();
+        }
         if (src + bytes <= dataSize)
             std::memcpy(dst, mem + src, bytes);
         else
@@ -501,6 +507,15 @@ struct Vu1Native
 
     static inline void leanSubmitKick(VU1Interpreter &vu, LeanCtx &c)
     {
+        if (vu.m_kickOwned)
+        {
+            vu.m_kickOwned = false;
+            vu.m_activeMemory->submitGifPacketOwned(std::move(vu.m_kickBuffer));
+            vu.m_kickBuffer.clear(); // (moved from: taken again at the next kick)
+            c.kickPending = false;
+            c.kickLast = 0u;
+            return;
+        }
         vu.m_xgkick.totalBytes = c.kickBytes;
         vu.m_xgkick.active = true;
         vu.finishXgkick();
@@ -635,6 +650,12 @@ struct Vu1Native
             {
                 const uint32_t copied = static_cast<uint32_t>(credits / 2u) * 16u;
                 auto &x = vu.m_xgkick;
+                if (vu.m_kickOwned)
+                {
+                    // The interpreter carries the transfer on from its own buffer.
+                    std::memcpy(x.packet.data(), vu.m_kickBuffer.data(), c.kickBytes);
+                    vu.m_kickOwned = false;
+                }
                 x.clear();
                 x.active = true;
                 x.sourceAddress = c.kickSrc;

@@ -370,6 +370,10 @@ public:
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false);
+    // PATH1 without a copy (VU1 kicks): a pooled buffer to fill, then queued as it is. false: no
+    // GIF arbiter (submitGifPacket then).
+    bool takeGifBuffer(std::vector<uint8_t> &out);
+    void submitGifPacketOwned(std::vector<uint8_t> &&data);
     void processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount);
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr);

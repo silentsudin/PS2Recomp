@@ -890,6 +890,13 @@ void GS::processGIFPacket(uint32_t pathIndex, const uint8_t *data, uint32_t size
 
         if (flg == GIF_FMT_PACKED)
         {
+            if (pathIndex == 0 && m_backendWantsRuns && m_backendWantsPrimitives &&
+                offset + static_cast<uint64_t>(nloop) * nreg * 16u <= sizeBytes &&
+                fastPath1Run(regs, nreg, nloop, data + offset))
+            {
+                offset += nloop * nreg * 16u;
+                continue;
+            }
             for (uint32_t loop = 0; loop < nloop; ++loop)
             {
                 for (uint32_t r = 0; r < nreg; ++r)
@@ -1961,6 +1968,149 @@ void GS::logBatchVertex(const GSVertex &vtx)
     log->z1 = std::max(log->z1, vtx.z);
 }
 
+bool GS::fastPath1Run(const uint8_t *regs, uint32_t nreg, uint32_t nloop, const uint8_t *data)
+{
+    // Road Trip's VU1 programs kick strips and lists as PACKED tags of RGBAQ/ST/UV/XYZ(F)2/FOG with
+    // one vertex per loop; parsed register by register, each vertex went through
+    // writeRegisterPacked and vertexKick and each triangle through its own Submit (about half the
+    // GS thread in busy town scenes on the Thor). Anything else, or any debug recorder, or a
+    // frame being skipped, takes that path (RT_GS_RUNS=0: always).
+    const bool strip = m_prim.type == GS_PRIM_TRISTRIP;
+    if ((!strip && m_prim.type != GS_PRIM_TRIANGLE) || m_vtxCount != 0 || nloop < 3u || m_skipDraw ||
+        !m_debugHistoryPaused || g_batchLogOn || g_stateSurveyOn || !m_wide.vertexClasses().empty())
+        return false;
+    int xyz = -1;
+    for (uint32_t r = 0; r < nreg; ++r)
+        switch (regs[r])
+        {
+        case 0x01: case 0x02: case 0x03: case 0x0A: case 0x0F:
+            break;
+        case 0x04: case 0x05:
+            if (xyz >= 0)
+                return false;
+            xyz = static_cast<int>(r);
+            break;
+        default:
+            return false;
+        }
+    if (xyz < 0)
+        return false;
+    // Every vertex drawn (no ADK: those are kicks that don't draw).
+    for (uint32_t i = 0; i < nloop; ++i)
+        if ((loadLE64(data + (static_cast<size_t>(i) * nreg + static_cast<uint32_t>(xyz)) * 16u + 8u) >> 47) & 1u)
+            return false;
+
+    // The vertices, as writeRegisterPacked builds them.
+    m_runVerts.resize(nloop);
+    const uint8_t *q = data;
+    for (uint32_t i = 0; i < nloop; ++i)
+        for (uint32_t r = 0; r < nreg; ++r, q += 16)
+        {
+            const uint64_t lo = loadLE64(q), hi = loadLE64(q + 8);
+            switch (regs[r])
+            {
+            case 0x01:
+                m_curR = static_cast<uint8_t>(lo & 0xFF);
+                m_curG = static_cast<uint8_t>((lo >> 32) & 0xFF);
+                m_curB = static_cast<uint8_t>(hi & 0xFF);
+                m_curA = static_cast<uint8_t>((hi >> 32) & 0xFF);
+                break;
+            case 0x02:
+            {
+                const uint32_t sBits = static_cast<uint32_t>(lo), tBits = static_cast<uint32_t>(lo >> 32);
+                const uint32_t qBits = static_cast<uint32_t>(hi);
+                std::memcpy(&m_curS, &sBits, 4);
+                std::memcpy(&m_curT, &tBits, 4);
+                std::memcpy(&m_curQ, &qBits, 4);
+                if (m_curQ == 0.0f)
+                    m_curQ = 1.0f;
+                break;
+            }
+            case 0x03:
+                m_curU = static_cast<uint16_t>(lo & 0x3FFFu);
+                m_curV = static_cast<uint16_t>((lo >> 32) & 0x3FFFu);
+                break;
+            case 0x0A:
+                m_curFog = static_cast<uint8_t>((hi >> 36) & 0xFF);
+                break;
+            case 0x04:
+            case 0x05:
+            {
+                GSVertex &vtx = m_runVerts[i];
+                vtx.x = static_cast<float>(static_cast<uint16_t>(lo & 0xFFFF)) / 16.0f;
+                vtx.y = static_cast<float>(static_cast<uint16_t>((lo >> 32) & 0xFFFF)) / 16.0f;
+                vtx.z = regs[r] == 0x04 ? static_cast<float>(static_cast<uint32_t>((hi >> 4) & 0xFFFFFF))
+                                        : static_cast<float>(static_cast<uint32_t>(hi & 0xFFFFFFFF));
+                vtx.r = m_curR;
+                vtx.g = m_curG;
+                vtx.b = m_curB;
+                vtx.a = m_curA;
+                vtx.q = m_curQ;
+                vtx.s = m_curS;
+                vtx.t = m_curT;
+                vtx.u = m_curU;
+                vtx.v = m_curV;
+                vtx.fog = regs[r] == 0x04 ? static_cast<uint8_t>((hi >> 36) & 0xFF) : m_curFog;
+                vtx.motion = m_packetHasMotion ? ps2x::gs::MotionTracker::vertexMotion(m_packetContext, m_packetMatrix, vtx.x, vtx.y, vtx.z) : 0u;
+                break;
+            }
+            default:
+                break;
+            }
+        }
+
+    // What vertexKick does for drawing kicks (once: the state is the same for the whole run).
+    const GSContext &cctx = m_ctx[m_prim.ctxt ? 1 : 0];
+    if (m_curPath == 0)
+    {
+        m_lastZbuf3D = cctx.zbuf;
+        m_lastFbp3D = cctx.frame.fbp;
+        m_haveZbuf3D = true;
+    }
+    {
+        const uint8_t verdict = m_wide.lastFrameWas2D() ? 2u : 1u;
+        std::atomic<uint8_t> &slot = m_wide2DByFbp[cctx.frame.fbp & 0x1FFu];
+        if (slot.load(std::memory_order_relaxed) != verdict)
+            slot.store(verdict, std::memory_order_relaxed);
+    }
+    if (cctx.frame.fbp != m_kickFbp)
+    {
+        m_kickFbp = cctx.frame.fbp;
+        m_fbpSkipped[cctx.frame.fbp] = m_skipDraw;
+    }
+    m_vtxIndex += static_cast<int>(nloop);
+    m_packetKicks += nloop;
+    GSPrimitiveBatch &batch = m_drawBatch;
+    if (m_drawBatchSerial != m_drawStateSerial || batch.stateSerial == 0)
+    {
+        batch = buildDrawBatch(3);
+        m_drawBatchSerial = m_drawStateSerial;
+        batch.stateSerial = ++m_drawBatchSerialOut;
+    }
+    batch.vertexClass = static_cast<uint8_t>(m_wide.defaultClass());
+    batch.vertexCount = 3;
+    for (int i = 0; i < 3; ++i)
+        batch.vertices[static_cast<size_t>(i)] = m_runVerts[static_cast<size_t>(i)];
+    updatePreferredDisplaySourceForDraw(batch);
+    m_backend->SubmitRun(batch, m_runVerts.data(), nloop, strip);
+
+    // The vertex queue as the kicks leave it (a later tag without PRIM continues it).
+    if (strip)
+    {
+        m_vtxQueue[0] = m_runVerts[nloop - 2u];
+        m_vtxQueue[1] = m_runVerts[nloop - 1u];
+        m_vtxCount = 2;
+    }
+    else
+    {
+        const uint32_t left = nloop % 3u;
+        for (uint32_t k = 0; k < left; ++k)
+            m_vtxQueue[k] = m_runVerts[nloop - left + k];
+        m_vtxCount = static_cast<int>(left);
+    }
+    return true;
+}
+
 void GS::vertexKick(bool drawing)
 {
     ++m_vtxCount;
@@ -2147,6 +2297,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
     m_backend = std::move(backend);
     m_packetMirror = dynamic_cast<GSPacketMirror *>(m_backend.get());
     m_backendWantsPrimitives = m_backend->WantsPrimitives();
+    m_backendWantsRuns = m_backend->WantsRuns();
     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
 }
 

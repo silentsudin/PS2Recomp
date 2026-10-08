@@ -227,6 +227,10 @@ private:
                                    const uint8_t *data,
                                    uint32_t sizeBytes);
     void vertexKick(bool drawing);
+    // A PATH1 GIF tag that is a plain triangle strip or list, handed to the backend as one run
+    // (gs_backend.h SubmitRun); false: not one (the caller parses it register by register).
+    bool fastPath1Run(const uint8_t *regs, uint32_t nreg, uint32_t nloop, const uint8_t *data);
+    std::vector<GSVertex> m_runVerts;
 
     void recordDebugEventUnlocked(GSDebugHistoryEntry entry);
     GSDebugHistoryEntry makeDebugEventUnlocked(GSDebugEventKind kind) const;
@@ -385,6 +389,7 @@ private:
     std::unique_ptr<GSRasterBackend> m_backend;
     GSPacketMirror *m_packetMirror = nullptr; // m_backend, if it renders from the raw stream
     bool m_backendWantsPrimitives = true;
+    bool m_backendWantsRuns = false;
 };
 
 #endif

@@ -611,23 +611,13 @@ namespace ps2x::gs
                 return {true, down, true, down};
             }
 
-            void Submit(const GSPrimitiveBatch &batch) override
+            // GS thread: the batch this draw goes into, a new one when the state or the texture
+            // contents changed (decided and resolved without the frame lock: decoding a texture
+            // takes the device lock; m_current is the GS thread's own).
+            void openFor(const GSPrimitiveBatch &batch)
             {
                 const GSDrawState &state = batch.state;
-                const uint32_t type = state.prim.type;
-                if (type == GS_PRIM_POINT || type == GS_PRIM_LINE || type == GS_PRIM_LINESTRIP)
-                {
-                    unsupported("points and lines");
-                    return;
-                }
-                const uint32_t needed = type == GS_PRIM_SPRITE ? 2u : 3u;
-                if (batch.vertexCount < needed)
-                    return;
                 m_gsThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
-
-                // A new batch when the state or the texture contents changed (decided and resolved
-                // without the frame lock: decoding a texture takes the device lock; m_current is the
-                // GS thread's own).
                 const uint64_t epoch = m_epoch.load(std::memory_order_relaxed);
                 // The frontend numbers its draw states: the same serial is the same state.
                 const bool sameSerial = batch.stateSerial != 0 && batch.stateSerial == m_currentSerial;
@@ -648,6 +638,92 @@ namespace ps2x::gs
                     m_haveCurrent = true;
                     m_currentEpoch = epoch;
                 }
+            }
+
+            bool WantsRuns() const override
+            {
+                static const bool on = [] { const char *e = std::getenv("RT_GS_RUNS"); return !(e && *e == '0'); }();
+                return on;
+            }
+
+            // Submit for a whole strip or list: each vertex converted once (Submit converts a
+            // strip's vertices three times, once per triangle), then the triangles as Submit
+            // stages them.
+            void SubmitRun(const GSPrimitiveBatch &batch, const GSVertex *verts, uint32_t count, bool strip) override
+            {
+                const GSDrawState &state = batch.state;
+                if (count < 3u)
+                    return;
+                openFor(batch);
+                const GSContext &ctx = state.context;
+                const float ofx = ctx.xyoffset.ofx / 16.0f, ofy = ctx.xyoffset.ofy / 16.0f;
+                const double zScale = zUnit(ctx.zbuf.psm);
+                const float tw = static_cast<float>(1u << std::min<uint32_t>(ctx.tex0.tw, 10u));
+                const float th = static_cast<float>(1u << std::min<uint32_t>(ctx.tex0.th, 10u));
+                m_runConverted.resize(count);
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    const GSVertex &v = verts[i];
+                    HwVertex &o = m_runConverted[i];
+                    o.x = v.x - ofx;
+                    o.y = v.y - ofy;
+                    o.z = static_cast<float>(std::min(v.z * zScale, 1.0));
+                    o.rgba = v.r | (v.g << 8) | (v.b << 16) | (static_cast<uint32_t>(v.a) << 24);
+                    if (state.prim.fst)
+                    {
+                        o.s = v.u / 16.0f / tw;
+                        o.t = v.v / 16.0f / th;
+                        o.q = 1.0f;
+                    }
+                    else
+                    {
+                        o.s = v.s;
+                        o.t = v.t;
+                        o.q = v.q;
+                    }
+                    o.fog = v.fog;
+                    o.motion = v.motion;
+                }
+                const bool checkQ = state.prim.tme && !state.prim.fst;
+                const uint32_t triangles = strip ? count - 2u : count / 3u;
+                const size_t first = m_stage.size();
+                m_stage.resize(first + static_cast<size_t>(triangles) * 3u);
+                HwVertex *out = m_stage.data() + first;
+                for (uint32_t t = 0; t < triangles; ++t)
+                {
+                    const uint32_t a = strip ? t : 3u * t;
+                    out[0] = m_runConverted[a];
+                    out[1] = m_runConverted[a + 1u];
+                    out[2] = m_runConverted[a + 2u];
+                    if (!state.prim.iip) // flat shading takes the colour of the last vertex
+                        out[0].rgba = out[1].rgba = out[2].rgba;
+                    // 2D as paraLLEl-GS tells it: one Z and, with STQ, one Q.
+                    if (m_current.flat && (verts[a].z != verts[a + 1u].z || verts[a + 1u].z != verts[a + 2u].z ||
+                                           (checkQ && (verts[a].q != verts[a + 1u].q || verts[a + 1u].q != verts[a + 2u].q))))
+                        m_current.flat = false;
+                    out += 3;
+                }
+                if (batch.vertexClass == 1u)
+                    for (size_t i = first; i < m_stage.size(); ++i)
+                        m_uiStage.push_back({m_stage[i].x, m_stage[i].y});
+                if (m_stage.size() >= 1536u)
+                    publish(false);
+            }
+
+            void Submit(const GSPrimitiveBatch &batch) override
+            {
+                const GSDrawState &state = batch.state;
+                const uint32_t type = state.prim.type;
+                if (type == GS_PRIM_POINT || type == GS_PRIM_LINE || type == GS_PRIM_LINESTRIP)
+                {
+                    unsupported("points and lines");
+                    return;
+                }
+                const uint32_t needed = type == GS_PRIM_SPRITE ? 2u : 3u;
+                if (batch.vertexCount < needed)
+                    return;
+                openFor(batch);
+                static const bool stats = std::getenv("RT_HWGS_STATS") != nullptr;
 
                 const GSContext &ctx = state.context;
                 const float ofx = ctx.xyoffset.ofx / 16.0f, ofy = ctx.xyoffset.ofy / 16.0f;
@@ -3395,6 +3471,7 @@ namespace ps2x::gs
             uint64_t m_lastEviction = 0;
             // GS thread: the state (and resolved texture) of the newest batch.
             Batch m_current;
+            std::vector<HwVertex> m_runConverted; // SubmitRun's vertices, converted once
             bool m_haveCurrent = false;
             uint64_t m_currentSerial = 0;
             uint64_t m_currentEpoch = 0;

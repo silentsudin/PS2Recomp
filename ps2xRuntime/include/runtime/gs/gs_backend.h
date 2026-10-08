@@ -53,6 +53,15 @@ public:
     virtual void Reset() = 0;
 
     virtual void Submit(const GSPrimitiveBatch &batch) = 0;
+    // A run of triangles in one draw state (a PATH1 GIF tag's strip or list), for backends that
+    // take it (WantsRuns): `stateBatch` carries the state, serial and vertex class (its vertices
+    // are unused), `verts` the kicked vertices in order; a strip draws (i, i+1, i+2) for each i,
+    // a list (3t, 3t+1, 3t+2). The same draws as Submit per triangle, each vertex handled once.
+    virtual bool WantsRuns() const { return false; }
+    virtual void SubmitRun(const GSPrimitiveBatch &stateBatch, const GSVertex *verts, uint32_t count, bool strip)
+    {
+        (void)stateBatch, (void)verts, (void)count, (void)strip;
+    }
     virtual void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) = 0;
 
     virtual void BeginTransfer(const GSTransferCommand &command) = 0;

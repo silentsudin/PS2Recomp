@@ -35,6 +35,10 @@ public:
     void setProcessPathPacketFn(ProcessPathPacketFn fn) { m_processPathFn = std::move(fn); }
 
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
+    // A pooled packet buffer to fill, and a filled one queued as it is (no copy): VU1 kicks are
+    // copied out of VU memory once, into the buffer the GS thread will read.
+    std::vector<uint8_t> takeBuffer();
+    void submitOwned(GifPathId pathId, std::vector<uint8_t> &&data);
 
     void drain();
     // drain() in two halves: order the queued packets and move them (appended) to `out`, then hand

@@ -43,6 +43,32 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     m_queue.push_back(std::move(pkt));
 }
 
+std::vector<uint8_t> GifArbiter::takeBuffer()
+{
+    if (m_free.empty())
+    {
+        std::lock_guard<std::mutex> lock(m_poolMutex);
+        m_free.swap(m_returned);
+    }
+    if (m_free.empty())
+        return {};
+    std::vector<uint8_t> b = std::move(m_free.back());
+    m_free.pop_back();
+    return b;
+}
+
+void GifArbiter::submitOwned(GifPathId pathId, std::vector<uint8_t> &&data)
+{
+    if (data.size() < 16 || (!m_processFn && !m_processPathFn))
+        return;
+    GifArbiterPacket pkt;
+    pkt.pathId = pathId;
+    pkt.path2DirectHl = false;
+    pkt.path3Image = pathId == GifPathId::Path3 && isImagePacket(data.data(), static_cast<uint32_t>(data.size()));
+    pkt.data = std::move(data);
+    m_queue.push_back(std::move(pkt));
+}
+
 void GifArbiter::recycle(std::vector<GifArbiterPacket> &&packets)
 {
     std::lock_guard<std::mutex> lock(m_poolMutex);
@@ -98,8 +124,18 @@ void GifArbiter::sortQueue()
 
 void GifArbiter::process(const std::vector<GifArbiterPacket> &packets) const
 {
-    for (const auto &pkt : packets)
+    for (size_t i = 0; i < packets.size(); ++i)
     {
+        const auto &pkt = packets[i];
+        // The next packet into the cache while this one is parsed: packets are written on the VU1
+        // thread's core, and the GS thread's first touch of each was ~8% of its time (Thor, town).
+        if (i + 1 < packets.size())
+        {
+            const std::vector<uint8_t> &next = packets[i + 1].data;
+            const size_t bytes = std::min<size_t>(next.size(), 8192u);
+            for (size_t b = 0; b < bytes; b += 64u)
+                __builtin_prefetch(next.data() + b);
+        }
         if (pkt.data.empty())
             continue;
         if (m_processPathFn)

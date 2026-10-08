@@ -2266,6 +2266,23 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
         drainGif();
 }
 
+bool PS2Memory::takeGifBuffer(std::vector<uint8_t> &out)
+{
+    if (!m_gifArbiter)
+        return false;
+    if (out.capacity() == 0u)
+        out = m_gifArbiter->takeBuffer();
+    return true;
+}
+
+void PS2Memory::submitGifPacketOwned(std::vector<uint8_t> &&data)
+{
+    if (!m_gifArbiter || data.size() < 16)
+        return;
+    m_gifArbiter->submitOwned(GifPathId::Path1, std::move(data));
+    drainGif();
+}
+
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
     if (!data || sizeBytes < 16)

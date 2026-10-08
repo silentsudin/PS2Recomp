@@ -256,6 +256,10 @@ private:
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
     XgkickPipeline m_xgkick{};
+    // Lean code's kick, copied once into a GIF queue buffer and handed over as it is
+    // (PS2Memory::submitGifPacketOwned); m_kickOwned: this kick is in it, not in m_xgkick.packet.
+    std::vector<uint8_t> m_kickBuffer;
+    bool m_kickOwned = false;
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
     std::array<uint64_t, 4> m_accReady{};
