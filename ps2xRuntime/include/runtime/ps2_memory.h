@@ -79,10 +79,14 @@ inline constexpr uint32_t PS2_FIO_S_IFREG = 0x2000;
 static_assert((PS2_RAM_SIZE & (PS2_RAM_SIZE - 1u)) == 0u, "PS2_RAM_SIZE must be a power of two");
 static_assert(PS2_RAM_MASK == (PS2_RAM_SIZE - 1u), "PS2_RAM_MASK must match PS2_RAM_SIZE");
 
+// One variable defined by the runtime (ps2_memory.cpp), not a function-local static of an inline
+// function: the recompiled game is a separate module (a DLL on Windows), and an inline function's
+// static would be a second copy there, never set.
+extern std::atomic<uint8_t *> g_ps2ScratchpadHostPtr;
+
 inline std::atomic<uint8_t *> &ps2ScratchpadHostPtrStorage()
 {
-    static std::atomic<uint8_t *> ptr{nullptr};
-    return ptr;
+    return g_ps2ScratchpadHostPtr;
 }
 
 inline void ps2SetScratchpadHostPtr(uint8_t *ptr)

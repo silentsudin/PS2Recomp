@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 class GS;
 class PS2Memory;

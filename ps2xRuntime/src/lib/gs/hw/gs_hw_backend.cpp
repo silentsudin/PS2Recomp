@@ -10,6 +10,7 @@
 // Textures that live inside a render target (the post-pass sampling its own frame buffer, the
 // loading-screen blur) are read from a snapshot of that target.
 
+#include "ps2x_compat.h"
 #include "runtime/gs/gs_hw_backend.h"
 
 #if defined(PS2X_HAVE_PGS)
@@ -345,7 +346,7 @@ namespace ps2x::gs
                 {
                     // A device of its own (headless runs, tests): pictures go back to the CPU.
                     if (!options.vulkanLibrary.empty())
-                        setenv("GRANITE_VULKAN_LIBRARY", options.vulkanLibrary.c_str(), 1);
+                        ps2x::setEnv("GRANITE_VULKAN_LIBRARY", options.vulkanLibrary.c_str());
                     if (!Vulkan::Context::init_loader(nullptr))
                     {
                         error = "could not load a Vulkan library";

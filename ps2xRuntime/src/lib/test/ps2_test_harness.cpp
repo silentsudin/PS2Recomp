@@ -10,11 +10,18 @@
 #include <atomic>
 #include <condition_variable>
 #include <thread>
+#ifdef _WIN32
+// Winsock: the control socket is TCP on the loopback ("tcp:<port>"), since Python on Windows has no AF_UNIX.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <poll.h>
 #include <unistd.h>
-#include <unistd.h>
+#endif
 #include <cstdio>
 #include <cstddef>
 #include <cstring>
@@ -24,6 +31,34 @@
 #include <sstream>
 #include <string_view>
 #include <vector>
+
+
+namespace
+{
+#ifdef _WIN32
+    using SockT = SOCKET;
+    constexpr SockT kBadSock = INVALID_SOCKET;
+    int sockRead(SockT s, void *buf, size_t n) { return ::recv(s, static_cast<char *>(buf), static_cast<int>(n), 0); }
+    int sockWrite(SockT s, const void *buf, size_t n) { return ::send(s, static_cast<const char *>(buf), static_cast<int>(n), 0); }
+    void sockClose(SockT s) { ::closesocket(s); }
+    bool sockWaitReadable(SockT s, int timeoutMs)
+    {
+        WSAPOLLFD p{s, POLLRDNORM, 0};
+        return ::WSAPoll(&p, 1, timeoutMs) > 0;
+    }
+#else
+    using SockT = int;
+    constexpr SockT kBadSock = -1;
+    int sockRead(SockT s, void *buf, size_t n) { return static_cast<int>(::read(s, buf, n)); }
+    int sockWrite(SockT s, const void *buf, size_t n) { return static_cast<int>(::write(s, buf, n)); }
+    void sockClose(SockT s) { ::close(s); }
+    bool sockWaitReadable(SockT s, int timeoutMs)
+    {
+        pollfd p{s, POLLIN, 0};
+        return ::poll(&p, 1, timeoutMs) > 0;
+    }
+#endif
+}
 
 namespace ps2_stubs
 {
@@ -996,7 +1031,7 @@ namespace ps2_test
             return "{\"ok\":false,\"error\":\"unknown command\"}";
         }
 
-        void serveClient(PS2Runtime &runtime, int fd)
+        void serveClient(PS2Runtime &runtime, SockT fd)
         {
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
@@ -1006,7 +1041,7 @@ namespace ps2_test
             char chunk[65536];
             for (;;)
             {
-                const ssize_t n = ::read(fd, chunk, sizeof(chunk));
+                const int n = sockRead(fd, chunk, sizeof(chunk));
                 if (n <= 0)
                     break;
                 buffer.append(chunk, static_cast<size_t>(n));
@@ -1019,14 +1054,14 @@ namespace ps2_test
                     size_t sent = 0;
                     while (sent < reply.size())
                     {
-                        const ssize_t w = ::write(fd, reply.data() + sent, reply.size() - sent);
+                        const int w = sockWrite(fd, reply.data() + sent, reply.size() - sent);
                         if (w <= 0)
                             break;
                         sent += static_cast<size_t>(w);
                     }
                 }
             }
-            ::close(fd);
+            sockClose(fd);
             if (g_quitRequested.load())
                 return; // the normal shutdown is under way (finishes a recorded movie, etc.)
             // The test driver is gone (it crashed or was killed): a test instance has no
@@ -1040,6 +1075,10 @@ namespace ps2_test
         // a crashed or killed test run never leaves games behind.
         void startOrphanWatch()
         {
+#ifdef _WIN32
+            // No getppid on Windows: the harness ends its game with TerminateProcess, and the
+            // client-gone path in serveClient exits a test instance whose driver is lost.
+#else
             const pid_t parent = ::getppid();
             std::thread([parent]
                         {
@@ -1054,6 +1093,7 @@ namespace ps2_test
                                 }
                             } })
                 .detach();
+#endif
         }
     }
 
@@ -1062,28 +1102,61 @@ namespace ps2_test
         const char *path = std::getenv("RT_TEST_SOCKET");
         if (!path)
             return;
-        const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
-        sockaddr_un addr{};
-        addr.sun_family = AF_UNIX;
-        socklen_t addrLen = sizeof(addr);
-        if (path[0] == '@')
+#ifdef _WIN32
+        WSADATA wsa;
+        ::WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+        SockT listener = kBadSock;
+        if (std::strncmp(path, "tcp:", 4) == 0)
         {
-            // Abstract namespace (Linux, Android): no file; `adb forward tcp:N localabstract:<name>`
-            // reaches it from a host, so a harness can drive the game on a device.
-            const size_t n = std::min(std::strlen(path + 1), sizeof(addr.sun_path) - 1);
-            std::memcpy(addr.sun_path + 1, path + 1, n);
-            addrLen = socklen_t(offsetof(sockaddr_un, sun_path) + 1 + n);
+            // "tcp:<port>": the loopback only. Port 0 picks one and prints it.
+            listener = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in in{};
+            in.sin_family = AF_INET;
+            in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            in.sin_port = htons(static_cast<uint16_t>(std::atoi(path + 4)));
+            int yes = 1;
+            ::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&yes), sizeof(yes));
+            if (listener == kBadSock || ::bind(listener, reinterpret_cast<sockaddr *>(&in), sizeof(in)) != 0 ||
+                ::listen(listener, 1) != 0)
+            {
+                std::fprintf(stderr, "[test] cannot listen on %s\n", path);
+                return;
+            }
+            socklen_t len = sizeof(in);
+            ::getsockname(listener, reinterpret_cast<sockaddr *>(&in), &len);
+            std::fprintf(stderr, "[test] control port %u\n", unsigned(ntohs(in.sin_port)));
         }
         else
         {
-            std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
-            ::unlink(path);
-        }
-        if (listener < 0 || ::bind(listener, reinterpret_cast<sockaddr *>(&addr), addrLen) != 0 ||
-            ::listen(listener, 1) != 0)
-        {
-            std::fprintf(stderr, "[test] cannot listen on %s\n", path);
+#ifdef _WIN32
+            std::fprintf(stderr, "[test] RT_TEST_SOCKET on Windows must be tcp:<port>\n");
             return;
+#else
+            listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+            sockaddr_un addr{};
+            addr.sun_family = AF_UNIX;
+            socklen_t addrLen = sizeof(addr);
+            if (path[0] == '@')
+            {
+                // Abstract namespace (Linux, Android): no file; `adb forward tcp:N localabstract:<name>`
+                // reaches it from a host, so a harness can drive the game on a device.
+                const size_t n = std::min(std::strlen(path + 1), sizeof(addr.sun_path) - 1);
+                std::memcpy(addr.sun_path + 1, path + 1, n);
+                addrLen = socklen_t(offsetof(sockaddr_un, sun_path) + 1 + n);
+            }
+            else
+            {
+                std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+                ::unlink(path);
+            }
+            if (listener < 0 || ::bind(listener, reinterpret_cast<sockaddr *>(&addr), addrLen) != 0 ||
+                ::listen(listener, 1) != 0)
+            {
+                std::fprintf(stderr, "[test] cannot listen on %s\n", path);
+                return;
+            }
+#endif
         }
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -1096,16 +1169,15 @@ namespace ps2_test
         std::thread([&runtime, listener]
                     {
                         // One client for the whole run; the game waits at vblank 1 until it attaches.
-                        pollfd waiting{listener, POLLIN, 0};
-                        if (::poll(&waiting, 1, 300 * 1000) <= 0)
+                        if (!sockWaitReadable(listener, 300 * 1000))
                         {
                             std::fprintf(stderr, "[test] no client attached within 300 s; exiting\n");
                             std::fflush(nullptr);
                             std::_Exit(0);
                         }
-                        const int fd = ::accept(listener, nullptr, nullptr);
-                        ::close(listener);
-                        if (fd >= 0)
+                        const SockT fd = ::accept(listener, nullptr, nullptr);
+                        sockClose(listener);
+                        if (fd != kBadSock)
                             serveClient(runtime, fd); })
             .detach();
     }

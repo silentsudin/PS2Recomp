@@ -14,6 +14,12 @@
 #include <string>
 #include <vector>
 
+std::atomic<uint8_t *> g_ps2ScratchpadHostPtr{nullptr};
+namespace ps2x::gs
+{
+    std::atomic<uint32_t> g_displayFieldPhase{0};
+}
+
 namespace
 {
     // True on the GIF/VIF1 worker thread, which never waits for itself.

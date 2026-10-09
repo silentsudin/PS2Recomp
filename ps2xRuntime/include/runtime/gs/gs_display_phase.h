@@ -12,5 +12,7 @@
 
 namespace ps2x::gs
 {
-    inline std::atomic<uint32_t> g_displayFieldPhase{0};
+    // Defined once in the runtime (ps2_memory.cpp): an inline variable would be a second copy in the
+    // recompiled game module on Windows.
+    extern std::atomic<uint32_t> g_displayFieldPhase;
 }

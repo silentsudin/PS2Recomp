@@ -24,6 +24,8 @@
 
 // FidelityFX FSR 1 constants, computed on the CPU (post/ffx, MIT).
 #define A_CPU 1
+#include <cmath>
+#include <math.h>
 #include "post/ffx/ffx_a.h"
 #include "post/ffx/ffx_fsr1.h"
 // SMAA's precomputed area and search textures (post/smaa, MIT).

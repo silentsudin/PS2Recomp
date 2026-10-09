@@ -451,6 +451,13 @@ add_library(ps2_runtime STATIC
     src/lib/test/ps2_test_harness.cpp
 )
 
+if(WIN32)
+    # raylib.h and windows.h both define Rectangle, CloseWindow and ShowCursor: keep GDI and USER
+    # out of every file that includes windows.h (Winsock for the test socket needs neither).
+    target_compile_definitions(ps2_runtime PUBLIC NOGDI NOUSER WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(ps2_runtime PUBLIC ws2_32)
+endif()
+
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1
@@ -816,6 +823,11 @@ endif()
 # VU1 microcode static recompiler (build-time tool; generated code goes into the game library).
 add_executable(ps2_vu1_recomp EXCLUDE_FROM_ALL tools/vu1_recomp/vu1_recomp.cpp)
 target_link_libraries(ps2_vu1_recomp PRIVATE ps2_runtime)
+if(WIN32)
+    # The runtime refers to the game's function table; ld64 let a tool that never runs game code
+    # leave it undefined, lld does not: give the tool the app's empty one.
+    target_sources(ps2_vu1_recomp PRIVATE src/runner/register_functions.cpp)
+endif()
 # The same, as a function (ps2x_vu1_recomp_main) for in-process use.
 add_library(ps2_vu1_recomp_lib STATIC EXCLUDE_FROM_ALL tools/vu1_recomp/vu1_recomp.cpp)
 target_compile_definitions(ps2_vu1_recomp_lib PRIVATE PS2X_VU1_RECOMP_NO_MAIN)

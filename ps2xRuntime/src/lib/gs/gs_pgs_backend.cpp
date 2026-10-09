@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_pgs_backend.h"
+#include "ps2x_compat.h"
 #include "runtime/gs/gs_display_phase.h"
 
 #if defined(PS2X_HAVE_PGS)
@@ -141,7 +142,7 @@ namespace ps2x::gs
                 else
                 {
                     if (!options.vulkanLibrary.empty())
-                        setenv("GRANITE_VULKAN_LIBRARY", options.vulkanLibrary.c_str(), 1);
+                        ps2x::setEnv("GRANITE_VULKAN_LIBRARY", options.vulkanLibrary.c_str());
 
                     if (!Vulkan::Context::init_loader(nullptr))
                     {
