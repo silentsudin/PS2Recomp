@@ -2430,8 +2430,9 @@ void GS::accumulateMotionStats()
     }
 }
 
-void GS::setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY)
+void GS::setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY, uint32_t phases)
 {
+    m_jitterPhases.store(std::max(phases, 1u), std::memory_order_relaxed);
     m_jitterScaleX.store(fbPerPixelX, std::memory_order_relaxed);
     m_jitterScaleY.store(fbPerPixelY, std::memory_order_relaxed);
     m_jitterOn.store(on, std::memory_order_relaxed);
@@ -2453,7 +2454,7 @@ bool GS::cameraJitter(float &x, float &y) const
         }
         return r;
     };
-    const uint32_t i = (m_frameIndex.load(std::memory_order_relaxed) % 8u) + 1u;
+    const uint32_t i = (m_frameIndex.load(std::memory_order_relaxed) % m_jitterPhases.load(std::memory_order_relaxed)) + 1u;
     x = (halton(i, 2) - 0.5f) * m_jitterScaleX.load(std::memory_order_relaxed);
     y = (halton(i, 3) - 0.5f) * m_jitterScaleY.load(std::memory_order_relaxed);
     ps2x::gs::MotionTracker::instance().noteCameraJitter(x, y);

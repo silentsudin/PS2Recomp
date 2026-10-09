@@ -56,12 +56,15 @@ namespace ps2x
         struct PostProcess
         {
             enum class AntiAliasing : uint8_t { None, Fxaa, Smaa, Taa };
-            enum class Scaling : uint8_t { Bilinear, Fsr1, MetalFxSpatial, MetalFxTemporal, SnapdragonGsr1, SnapdragonGsr2, ArmAsr };
+            enum class Scaling : uint8_t { Bilinear, Fsr1, MetalFxSpatial, MetalFxTemporal, SnapdragonGsr1, SnapdragonGsr2, ArmAsr, Fsr3, Dlss, Xess };
             AntiAliasing aa = AntiAliasing::None;
             Scaling scaling = Scaling::Bilinear;
             float sharpness = 0.5f; // FSR 1 RCAS, 0 (soft) .. 1 (sharpest)
         };
         virtual bool supportsPostProcess() const { return false; }
+        // The upscaler plugins that work on this machine (RTU_KIND_ bits of runtime/gs/rt_upscaler_api.h:
+        // 1 FSR 3, 2 DLSS, 4 XeSS; Windows). 0 without the plugins or a capable GPU.
+        virtual uint32_t availableUpscalerPlugins() const { return 0; }
         virtual void setPostProcess(const PostProcess &post) { (void)post; }
 
         // Frame generation for displays faster than the game's 60 Hz: `factor` frames are

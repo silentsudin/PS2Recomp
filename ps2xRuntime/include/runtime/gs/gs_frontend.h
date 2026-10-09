@@ -147,7 +147,10 @@ public:
     // Temporal AA / upscaling: a sub-pixel camera jitter per frame (Halton 2,3), in frame-buffer
     // pixels, sized so it spans one pixel of the picture (fbPerPixel: frame-buffer pixels per
     // picture pixel). The game hook adds it to the player cameras (cameraJitter).
-    void setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY);
+    // `phases` is the length of the jitter sequence: 8 suits the upscalers of the FSR 2 family and TAA;
+    // FSR 3, DLSS, XeSS and MetalFX want about 8 x (display / render)^2 and crawl at the sequence's
+    // period with fewer.
+    void setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY, uint32_t phases = 8);
     // Also notes it for the motion contexts (MotionTracker::noteCameraJitter).
     bool cameraJitter(float &x, float &y) const;
     // The jitter of the frame whose depth/motion were last kept, and of the one before.
@@ -284,6 +287,7 @@ private:
     std::vector<uint8_t> m_shadowKeep;        // per vertex: UI, not moved in shadow frames
     std::atomic<float> m_jitterScaleX{0.5f}, m_jitterScaleY{0.25f};
     std::atomic<uint32_t> m_frameIndex{0};
+    std::atomic<uint32_t> m_jitterPhases{8};
     float m_snapJitter[4] = {}; // cur x, y, prev x, y (under m_stateMutex)
     // The same per frame buffer the 3D drew into (FBP), and that of the buffer on display when
     // the presenter last latched a picture: the GS thread may have drawn the next frame's 3D by

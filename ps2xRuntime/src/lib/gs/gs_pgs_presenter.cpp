@@ -10,6 +10,7 @@
 #if defined(PS2X_HAVE_PGS) && defined(PS2X_PGS_PRESENTER)
 
 #include "gs_pgs_shared.h"
+#include "gs_upscaler_plugins.h"
 #include "runtime/gs/gs_motion.h"
 #include "imgui_spirv.h"
 #if defined(__APPLE__)
@@ -474,11 +475,20 @@ namespace ps2x::gs
             return g_realWaitForPresent(device, swapchain, id, timeout);
         }
 
-        // Makes the device with one more queue in the graphics family, when it has one to spare,
-        // for the presents (PresentQueue).
+        // Makes the device: with one more queue in the graphics family, when it has one to spare, for
+        // the presents (PresentQueue); and with the device extensions the upscaler plugins ask for
+        // that this GPU has (NVIDIA's NVX ones for DLSS, ...). Granite itself fails on an extension the
+        // driver lacks, so they are added here, after it chose the GPU, and filtered.
         class PresentDeviceFactory final : public Vulkan::DeviceFactory
         {
         public:
+            void configure(ps2x::UpscalerPlugins *plugins, VkInstance instance, bool spareQueue)
+            {
+                m_plugins = plugins;
+                m_instance = instance;
+                m_spareQueue = spareQueue;
+            }
+
             VkDevice create_device(VkPhysicalDevice gpu, const VkDeviceCreateInfo *info) override
             {
                 uint32_t familyCount = 0;
@@ -489,6 +499,8 @@ namespace ps2x::gs
                 std::vector<float> priorities;
                 for (auto &q : queues)
                 {
+                    if (!m_spareQueue)
+                        break;
                     if (q.queueFamilyIndex >= familyCount || !(families[q.queueFamilyIndex].queueFlags & VK_QUEUE_GRAPHICS_BIT) ||
                         q.queueCount >= families[q.queueFamilyIndex].queueCount)
                         continue;
@@ -500,9 +512,33 @@ namespace ps2x::gs
                     ++q.queueCount;
                     break;
                 }
-                std::fprintf(stderr, "[present] graphics family: %s\n", m_index != UINT32_MAX ? "a spare queue for presents" : "no spare queue");
+                if (m_spareQueue)
+                    std::fprintf(stderr, "[present] graphics family: %s\n", m_index != UINT32_MAX ? "a spare queue for presents" : "no spare queue");
+
+                std::vector<const char *> extensions(info->ppEnabledExtensionNames, info->ppEnabledExtensionNames + info->enabledExtensionCount);
+                std::vector<std::string> wanted;
+                if (m_plugins && m_plugins->loaded())
+                {
+                    uint32_t n = 0;
+                    vkEnumerateDeviceExtensionProperties(gpu, nullptr, &n, nullptr);
+                    std::vector<VkExtensionProperties> have(n);
+                    vkEnumerateDeviceExtensionProperties(gpu, nullptr, &n, have.data());
+                    wanted = m_plugins->deviceExtensions(m_instance, gpu, reinterpret_cast<void *>(SDL_Vulkan_GetVkGetInstanceProcAddr()));
+                    for (const std::string &w : wanted)
+                    {
+                        bool supported = false, present = false;
+                        for (const auto &h : have)
+                            supported = supported || w == h.extensionName;
+                        for (const char *e : extensions)
+                            present = present || w == e;
+                        if (supported && !present)
+                            extensions.push_back(w.c_str());
+                    }
+                }
                 VkDeviceCreateInfo copy = *info;
                 copy.pQueueCreateInfos = queues.data();
+                copy.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+                copy.ppEnabledExtensionNames = extensions.data();
                 VkDevice device = VK_NULL_HANDLE;
                 if (vkCreateDevice(gpu, &copy, nullptr, &device) != VK_SUCCESS)
                     return VK_NULL_HANDLE;
@@ -516,6 +552,9 @@ namespace ps2x::gs
             VkQueue presentQueue() const { return m_queue; }
 
         private:
+            ps2x::UpscalerPlugins *m_plugins = nullptr;
+            VkInstance m_instance = VK_NULL_HANDLE;
+            bool m_spareQueue = true;
             uint32_t m_family = UINT32_MAX, m_index = UINT32_MAX;
             VkQueue m_queue = VK_NULL_HANDLE;
         };
@@ -563,11 +602,31 @@ namespace ps2x::gs
                 SDL_Vulkan_DestroySurface(instance, surface, nullptr);
             }
 
+            // Instance extensions the upscaler plugins want (kept only if the loader has them).
+            void setExtraInstanceExtensions(std::vector<std::string> names) { m_extraInstance = std::move(names); }
+
             std::vector<const char *> get_instance_extensions() override
             {
                 Uint32 count = 0;
                 const char *const *names = SDL_Vulkan_GetInstanceExtensions(&count);
-                return names ? std::vector<const char *>(names, names + count) : std::vector<const char *>{};
+                std::vector<const char *> out = names ? std::vector<const char *>(names, names + count) : std::vector<const char *>{};
+                if (m_extraInstance.empty())
+                    return out;
+                uint32_t n = 0;
+                vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+                std::vector<VkExtensionProperties> have(n);
+                vkEnumerateInstanceExtensionProperties(nullptr, &n, have.data());
+                for (const std::string &want : m_extraInstance)
+                {
+                    bool supported = false, present = false;
+                    for (const auto &h : have)
+                        supported = supported || want == h.extensionName;
+                    for (const char *o : out)
+                        present = present || want == o;
+                    if (supported && !present)
+                        out.push_back(want.c_str());
+                }
+                return out;
             }
 
             uint32_t get_surface_width() override
@@ -593,6 +652,7 @@ namespace ps2x::gs
         private:
             SDL_Window *m_window;
             bool m_surface;
+            std::vector<std::string> m_extraInstance;
         };
 
         // ImGui's vertex layout, also used for the game picture's quad.
@@ -646,7 +706,9 @@ namespace ps2x::gs
                     return fail("Vulkan loader", "vkGetInstanceProcAddr unavailable");
 
                 pgsRegisterThread();
+                m_plugins.load(); // FSR 3 / DLSS / XeSS plugins beside the executable (Windows)
                 m_platform = std::make_unique<SdlPlatform>(m_window, !m_metalPresent);
+                m_platform->setExtraInstanceExtensions(m_plugins.instanceExtensions());
                 m_wsi.set_platform(m_platform.get());
                 m_wsi.set_present_mode(m_options.vsync ? Vulkan::PresentMode::SyncToVBlank
                                                        : Vulkan::PresentMode::UnlockedMaybeTear);
@@ -658,7 +720,9 @@ namespace ps2x::gs
                 Vulkan::Context::SystemHandles handles = {};
                 // As the GS's own device: push descriptors, no descriptor buffers/heaps.
                 const bool presentThread = presentThreadWanted() && !m_metalPresent;
-                if (presentThread)
+                // The device is made by our factory when a present thread needs a queue of its own, or
+                // the plugins need device extensions Granite doesn't know.
+                if (presentThread || m_plugins.loaded())
                 {
                     // As WSI::init_context_from_platform, with a device made by PresentDeviceFactory.
                     const Vulkan::ContextCreationFlags flags =
@@ -672,6 +736,7 @@ namespace ps2x::gs
                     auto deviceExt = m_platform->get_device_extensions();
                     if (!context->init_instance(instanceExt.data(), instanceExt.size(), flags))
                         return fail("Vulkan", "instance creation failed");
+                    m_deviceFactory.configure(&m_plugins, context->get_instance(), presentThread);
                     VkSurfaceKHR probe = m_platform->create_surface(context->get_instance(), VK_NULL_HANDLE);
                     const bool made = context->init_device(VK_NULL_HANDLE, probe, deviceExt.data(), deviceExt.size(), flags);
                     if (probe)
@@ -717,6 +782,33 @@ namespace ps2x::gs
                     m_presentAtTime = true;
                 }
                 m_shared.device = &m_wsi.get_device();
+                if (m_plugins.loaded())
+                {
+                    const Vulkan::Context &vk = m_wsi.get_context();
+                    RtuInit ri = {};
+                    ri.instance = vk.get_instance();
+                    ri.physical_device = vk.get_gpu();
+                    ri.device = vk.get_device();
+                    ri.get_instance_proc_addr = reinterpret_cast<void *>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+                    ri.get_device_proc_addr = reinterpret_cast<void *>(vkGetDeviceProcAddr);
+                    ri.queue = vk.get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS];
+                    ri.queue_family = vk.get_queue_info().family_indices[Vulkan::QUEUE_INDEX_GRAPHICS];
+                    ri.vendor_id = vk.get_gpu_props().vendorID;
+                    ri.device_id = vk.get_gpu_props().deviceID;
+                    ri.driver_version = vk.get_gpu_props().driverVersion;
+                    ri.api_version = vk.get_gpu_props().apiVersion;
+                    static const std::string dataDir = [] {
+                        const char *e = std::getenv("RT_DATA_DIR");
+                        return std::string(e ? e : ".");
+                    }();
+                    static const std::string pluginDir = [] {
+                        const char *e = std::getenv("RT_UPSCALER_DIR");
+                        return std::string(e ? e : ".");
+                    }();
+                    ri.app_data_dir = dataDir.c_str();
+                    ri.plugin_dir = pluginDir.c_str();
+                    m_pluginKinds = m_plugins.init(ri);
+                }
                 // paraLLEl-GS advances a frame context on every flush, and the swapchain on every
                 // frame: with Granite's default of 2 the game thread waits for the GPU inside a
                 // flush. 4, as the GS's own device had.
@@ -1228,7 +1320,7 @@ namespace ps2x::gs
                 // RT_SGSR2_SHADOW=0 keeps FSR 1 for GSR 2's shadows too (A/B).
                 static const bool shadowSgsr2 = [] { const char *e = std::getenv("RT_SGSR2_SHADOW"); return !(e && *e == '0'); }();
                 const bool temporalUpscaler = m_post.scaling == PostProcess::Scaling::SnapdragonGsr2 ||
-                                              m_post.scaling == PostProcess::Scaling::ArmAsr;
+                                              m_post.scaling == PostProcess::Scaling::ArmAsr || pluginKindOf(m_post.scaling) != 0;
                 if (shadowSgsr2 && m_noTemporal && m_post.scaling == PostProcess::Scaling::SnapdragonGsr2 && rect.extent.width > sw &&
                     upscaleSgsr2Shadow(cmd, sw, sh, rect.extent.width, rect.extent.height))
                     return;
@@ -1259,6 +1351,15 @@ namespace ps2x::gs
                     upscaleArmAsr(cmdHandle, sw, sh, rect.extent.width, rect.extent.height))
                     return;
 #endif
+                if (const uint32_t pluginKind = pluginKindOf(m_post.scaling); pluginKind && !m_noTemporal && rect.extent.width > sw)
+                {
+                    // As far as the library goes (DLSS and XeSS stop near 3x); the presentation scales the rest.
+                    const float k = std::min({m_plugins.maxScale(pluginKind), float(rect.extent.width) / float(sw),
+                                              float(rect.extent.height) / float(sh)});
+                    const uint32_t ow = uint32_t(float(sw) * k), oh = uint32_t(float(sh) * k);
+                    if (k > 1.0f && upscalePlugin(cmdHandle, pluginKind, sw, sh, ow, oh, ow == rect.extent.width && oh == rect.extent.height))
+                        return;
+                }
                 if (m_post.scaling == PostProcess::Scaling::SnapdragonGsr1 && m_sgsr1 && rect.extent.width > sw)
                 {
                     // Snapdragon GSR 1: upscaling and sharpening in one pass (no RCAS after it).
@@ -1276,7 +1377,7 @@ namespace ps2x::gs
                 const bool on = m_post.aa == PostProcess::AntiAliasing::Taa ||
                                 m_post.scaling == PostProcess::Scaling::MetalFxTemporal ||
                                 m_post.scaling == PostProcess::Scaling::SnapdragonGsr2 ||
-                                m_post.scaling == PostProcess::Scaling::ArmAsr;
+                                m_post.scaling == PostProcess::Scaling::ArmAsr || pluginKindOf(m_post.scaling) != 0;
                 // Per-pixel motion and depth: the temporal passes and the picture-warping frame
                 // generation. Re-rendered frame generation needs only the tracker's per-vertex
                 // motion (the side data stays on for the UI mask), not the GPU's motion attachment
@@ -1294,10 +1395,24 @@ namespace ps2x::gs
                 const Vulkan::Image *pic = m_shared.scanout.get();
                 const float sx = pic ? 640.0f / static_cast<float>(pic->get_width()) : 0.5f;
                 const float sy = pic ? 224.0f / static_cast<float>(pic->get_height()) : 0.25f;
-                runtime.gsUnsynced().setTemporalJitter(on, sx, sy);
+                // The jitter sequence's length: the FSR 3 / DLSS / XeSS / MetalFX family accumulate over
+                // 8 x ratio^2 positions (ratio = the picture on screen over the picture rendered, at most
+                // the scaler's own limit of 3), and crawl at the period of a shorter one. ASR, GSR 2 and
+                // TAA do well with 8.
+                uint32_t phases = 8;
+                if (pic && (pluginKindOf(m_post.scaling) != 0 || m_post.scaling == PostProcess::Scaling::MetalFxTemporal))
+                {
+                    int ww = 0, wh = 0;
+                    SDL_GetWindowSizeInPixels(m_window, &ww, &wh);
+                    const float ratio = std::clamp(static_cast<float>(wh) / static_cast<float>(pic->get_height()), 1.0f, 3.0f);
+                    phases = std::clamp(static_cast<uint32_t>(std::ceil(8.0f * ratio * ratio)), 8u, 72u);
+                }
+                if (const char *e = std::getenv("RT_JITTER_PHASES"); e && *e) // A/B: a fixed length
+                    phases = std::clamp(static_cast<uint32_t>(std::atoi(e)), 1u, 256u);
+                runtime.gsUnsynced().setTemporalJitter(on, sx, sy, phases);
                 m_temporalOn = on;
                 if (!on)
-                    m_taaValid = m_sgsr2Valid = m_asrValid = false;
+                    m_taaValid = m_sgsr2Valid = m_asrValid = m_puValid = false;
                 // Any post-processing (and frame generation) spares the UI (the GS marks where the HUD and 2D
                 // screens drew).
                 m_shared.wantUi = m_post.aa != PostProcess::AntiAliasing::None || m_post.scaling != PostProcess::Scaling::Bilinear ||
@@ -1673,6 +1788,151 @@ namespace ps2x::gs
                 return true;
             }
 #endif
+
+            // FSR 3, DLSS or XeSS through a plugin (gs_upscaler_plugins.h): Arm ASR's inputs and
+            // bookkeeping, the library behind a C interface. Depth is normalised as for ASR (0..1,
+            // larger = nearer, infinite far plane), motion is the GS's (current minus previous, GS
+            // pixels) with the scale that turns it into "to the previous picture, in render pixels".
+            struct PluginScaler
+            {
+                ps2x::UpscalerPlugins::ContextPtr context{nullptr, nullptr};
+                uint32_t kind = 0, renderW = 0, renderH = 0, displayW = 0, displayH = 0;
+                uint32_t retireFrames = 0; // dropped: destroyed when this counts down (the GPU is done)
+            };
+
+            static uint32_t pluginKindOf(PostProcess::Scaling scaling)
+            {
+                switch (scaling)
+                {
+                case PostProcess::Scaling::Fsr3: return RTU_KIND_FSR3;
+                case PostProcess::Scaling::Dlss: return RTU_KIND_DLSS;
+                case PostProcess::Scaling::Xess: return RTU_KIND_XESS;
+                default: return 0;
+                }
+            }
+
+            bool upscalePlugin(Vulkan::CommandBufferHandle &cmd, uint32_t kind, uint32_t sw, uint32_t sh, uint32_t w, uint32_t h, bool exactFit)
+            {
+                if ((m_pluginFailed & kind) || !(m_pluginKinds & kind) || !m_shared.motion || !m_shared.depth ||
+                    m_shared.motion->get_width() != sw || m_shared.motion->get_height() != sh || m_shared.depth->get_width() != sw ||
+                    m_shared.depth->get_height() != sh)
+                {
+                    m_puValid = false;
+                    return false;
+                }
+                Vulkan::Device &dev = *m_shared.device;
+                // Contexts for up to two sizes; a dropped one is destroyed some frames later (no GPU
+                // waits here: Granite's wait_idle would wait for this very command buffer).
+                for (auto it = m_puRetired.begin(); it != m_puRetired.end();)
+                    it = --(*it)->retireFrames == 0 ? m_puRetired.erase(it) : it + 1;
+                auto matches = [&](const std::unique_ptr<PluginScaler> &a) {
+                    return a && a->kind == kind && a->renderW == sw && a->renderH == sh && a->displayW == w && a->displayH == h;
+                };
+                if (!matches(m_pu) && matches(m_puOther))
+                {
+                    std::swap(m_pu, m_puOther);
+                    m_puValid = false;
+                }
+                if (!matches(m_pu))
+                {
+                    RtuCreateInfo ci = {};
+                    ci.kind = kind;
+                    ci.render_width = sw, ci.render_height = sh, ci.display_width = w, ci.display_height = h;
+                    auto context = m_plugins.create(ci);
+                    if (!context)
+                    {
+                        std::fprintf(stderr, "[upscaler] kind %u could not be created at %ux%u -> %ux%u; scaling without it\n", kind, sw,
+                                     sh, w, h);
+                        m_pluginFailed |= kind;
+                        return false;
+                    }
+                    if (m_puOther)
+                    {
+                        m_puOther->retireFrames = 8;
+                        m_puRetired.push_back(std::move(m_puOther));
+                    }
+                    m_puOther = std::move(m_pu);
+                    m_pu = std::make_unique<PluginScaler>();
+                    m_pu->context = std::move(context);
+                    m_pu->kind = kind;
+                    m_pu->renderW = sw, m_pu->renderH = sh, m_pu->displayW = w, m_pu->displayH = h;
+                    m_puValid = false;
+                }
+                if (!m_puOut || m_puOut->get_width() != w || m_puOut->get_height() != h)
+                {
+                    auto info = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
+                    info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+                    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    m_puOut = dev.create_image(info);
+                    cmd->image_barrier(*m_puOut, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                       VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                    m_puValid = false;
+                }
+                if (m_puValid && m_shared.pictureSerial == m_puSerial)
+                {
+                    m_final = m_puOut.get(); // the same 3D again: the last output
+                    m_finalRcas = m_puRcas;
+                    return true;
+                }
+                const float steps = pictureSteps(m_puSerial);
+                const bool reset = !m_puValid || steps == 0.0f;
+                m_puSerial = m_shared.pictureSerial;
+                const PassInput depthIn[1] = {{m_shared.depth.get(), Vulkan::StockSampler::NearestClamp}};
+                offscreenPass(*cmd, m_depthNorm, sw, sh, m_depthNormalize, depthIn, 1, nullptr, 0, false, VK_FORMAT_R32_SFLOAT);
+                cmd->barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                             VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+                dev.submit(cmd);
+
+                auto ref = [](const Vulkan::Image &image) {
+                    RtuImage r = {};
+                    r.image = reinterpret_cast<uint64_t>(image.get_image());
+                    r.view = reinterpret_cast<uint64_t>(image.get_view().get_view().view);
+                    r.format = static_cast<uint32_t>(image.get_format());
+                    r.width = image.get_width();
+                    r.height = image.get_height();
+                    return r;
+                };
+                auto pluginCmd = dev.request_command_buffer();
+                const float fw = static_cast<float>(sw), fh = static_cast<float>(sh);
+                const float k = std::max(steps, 1.0f);
+                RtuDispatch d = {};
+                d.command_buffer = pluginCmd->get_command_buffer();
+                d.color = ref(*m_final);
+                d.depth = ref(*m_depthNorm);
+                d.motion = ref(*m_shared.motion);
+                d.output = ref(*m_puOut);
+                d.jitter_x = m_jitter[0] * fw / 640.0f;
+                d.jitter_y = m_jitter[1] * fh / 224.0f;
+                d.mv_scale_x = -k * fw / 640.0f;
+                d.mv_scale_y = -k * fh / 224.0f;
+                d.render_width = sw, d.render_height = sh;
+                d.sharpness = m_post.sharpness;
+                d.frame_time_ms = 1000.0f / 59.94f;
+                d.camera_near = 1.0f;
+                d.camera_far = 100000.0f;
+                d.camera_fov_vertical = 1.03f; // Road Trip's cameras: about 74 degrees across at 4:3
+                d.reset = reset ? 1u : 0u;
+                const bool ok = m_plugins.dispatch(m_pu->context.get(), d);
+                pluginCmd->barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                   VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+                dev.submit(pluginCmd);
+                cmd = dev.request_command_buffer();
+                if (!ok)
+                {
+                    std::fprintf(stderr, "[upscaler] dispatch failed (kind %u); scaling without it\n", kind);
+                    m_pluginFailed |= kind;
+                    return false;
+                }
+                m_final = m_puOut.get();
+                // FSR 3 sharpens itself (the Sharpening option); for the others ours follows, but RCAS reads the
+                // picture 1:1 against its rectangle: only when the output is exactly that big (else the
+                // presentation's bilinear stretch finishes the job, unsharpened).
+                m_puRcas = kind != RTU_KIND_FSR3 && exactFit;
+                m_finalRcas = m_puRcas;
+                m_puValid = true;
+                return true;
+            }
 
             void temporalAntiAliasing(Vulkan::CommandBuffer &cmd, uint32_t sw, uint32_t sh)
             {
@@ -2132,6 +2392,7 @@ namespace ps2x::gs
 
         public:
             bool supportsPostProcess() const override { return true; }
+            uint32_t availableUpscalerPlugins() const override { return m_pluginKinds; }
             void setPostProcess(const PostProcess &post) override { m_post = post; }
             void setFrameGeneration(const FrameGeneration &fg) override
             {
@@ -3021,6 +3282,15 @@ namespace ps2x::gs
             bool m_asrFailed = false;
 #endif
             bool m_asrValid = false;
+            ps2x::UpscalerPlugins m_plugins;
+            uint32_t m_pluginKinds = 0;  // RTU_KIND_ bits that work on this machine
+            uint32_t m_pluginFailed = 0; // kinds that failed to create or dispatch: not tried again
+            std::unique_ptr<PluginScaler> m_pu, m_puOther;
+            std::vector<std::unique_ptr<PluginScaler>> m_puRetired;
+            Vulkan::ImageHandle m_puOut;
+            uint64_t m_puSerial = ~0ull;
+            bool m_puValid = false;
+            bool m_puRcas = false; // the last plugin output is sharpened by our RCAS
             PostProcess m_post;
             Vulkan::ImageHandle m_aaImage, m_upImage; // intermediate pictures
             Vulkan::Program *m_depthView = nullptr, *m_motionView = nullptr, *m_taa = nullptr;
