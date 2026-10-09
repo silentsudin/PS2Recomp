@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include <unordered_map>
 #include <unistd.h>
 
 namespace ps2x::gs::packcache
@@ -97,13 +98,24 @@ namespace ps2x::gs::packcache
 
         std::vector<Entry> packImages(const std::string &packDir)
         {
+            // One image per key, the last the walk meets: the same choice TextureTools::indexPack
+            // makes (m_pack[key] = path), so the file that is cached is the file that is drawn. Two
+            // PNGs of one key (a subfolder of originals, a pack made twice) shared one cache file,
+            // each encoding over the other's stamp: one was always "missing", and every start and
+            // every menu opening converted it again.
             std::vector<Entry> out;
+            std::unordered_map<uint64_t, size_t> at;
             std::error_code ec;
             for (const auto &e : fs::recursive_directory_iterator(packDir, ec))
             {
                 uint64_t key;
-                if (e.is_regular_file() && e.path().extension() == ".png" && parseKey(e.path().filename().string(), key))
+                if (!e.is_regular_file() || e.path().extension() != ".png" || !parseKey(e.path().filename().string(), key))
+                    continue;
+                const auto [it, added] = at.try_emplace(key, out.size());
+                if (added)
                     out.push_back({e.path().string(), key});
+                else
+                    out[it->second].png = e.path().string();
             }
             return out;
         }

@@ -150,9 +150,14 @@ public:
     // `phases` is the length of the jitter sequence: 8 suits the upscalers of the FSR 2 family and TAA;
     // FSR 3, DLSS, XeSS and MetalFX want about 8 x (display / render)^2 and crawl at the sequence's
     // period with fewer.
-    void setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY, uint32_t phases = 8);
+    // `idleAmplitude` scales the jitter outside the 3D gameplay (races, driving in town: wideDriving()),
+    // where logos and menus are made of flat, axis-aligned, aliased shapes: there the jitter buys no
+    // detail and the sharp upscalers (FSR 3, DLSS, XeSS, MetalFX) show it as shimmer around the edges.
+    void setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY, uint32_t phases = 8, float idleAmplitude = 1.0f);
     // Also notes it for the motion contexts (MotionTracker::noteCameraJitter).
-    bool cameraJitter(float &x, float &y) const;
+    // `gameplay`: the game's 3D gameplay is on (races, driving); false in logos and menus, where the
+    // idle amplitude of setTemporalJitter applies.
+    bool cameraJitter(float &x, float &y, bool gameplay = true) const;
     // The jitter of the frame whose depth/motion were last kept, and of the one before.
     void snapshotJitter(float &curX, float &curY, float &prevX, float &prevY) const;
     // The frame on display (DISPFB) is a 2D-backed screen (title, menus): show it 4:3 even when
@@ -288,6 +293,7 @@ private:
     std::atomic<float> m_jitterScaleX{0.5f}, m_jitterScaleY{0.25f};
     std::atomic<uint32_t> m_frameIndex{0};
     std::atomic<uint32_t> m_jitterPhases{8};
+    std::atomic<float> m_jitterIdleAmplitude{1.0f};
     float m_snapJitter[4] = {}; // cur x, y, prev x, y (under m_stateMutex)
     // The same per frame buffer the 3D drew into (FBP), and that of the buffer on display when
     // the presenter last latched a picture: the GS thread may have drawn the next frame's 3D by

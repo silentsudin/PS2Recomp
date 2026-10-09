@@ -1134,7 +1134,13 @@ namespace ps2x::gs
                 runtime.gsUnsynced().latchHostPresentationFrame(gpu, capture || !gpu);
                 // The jitter of the picture just latched (its 3D's, and the frame's before it).
                 if (m_temporalOn)
+                {
                     runtime.gsUnsynced().snapshotJitter(m_jitter[0], m_jitter[1], m_jitter[2], m_jitter[3]);
+                    static const bool log = [] { const char *e = std::getenv("RT_JITTER_LOG"); return e && *e == '1'; }();
+                    if (log) // what the upscaler is told for the picture just latched
+                        std::fprintf(stderr, "[jitter-latched] serial %llx: cur %.3f %.3f prev %.3f %.3f\n", (unsigned long long)m_shared.pictureSerial,
+                                     m_jitter[0], m_jitter[1], m_jitter[2], m_jitter[3]);
+                }
                 if (!capture && gpu)
                     return;
                 std::vector<uint8_t> pixels;
@@ -1400,8 +1406,15 @@ namespace ps2x::gs
                 // the scaler's own limit of 3), and crawl at the period of a shorter one. ASR, GSR 2 and
                 // TAA do well with 8.
                 uint32_t phases = 8;
+                float idleAmplitude = 1.0f;
                 if (pic && (pluginKindOf(m_post.scaling) != 0 || m_post.scaling == PostProcess::Scaling::MetalFxTemporal))
                 {
+                    // Outside races and driving (logos, menus) a tenth of the jitter: see GS::setTemporalJitter.
+                    // Measured on the Takara logo hold, pixels changing by 24 levels or more per frame at full
+                    // jitter / 0.25 / 0.1 / none: FSR 3 906 / 2 / - / 0, DLSS 2998 / 106 / 5 / 7, XeSS 1231 / 183 / 11 / 0.
+                    idleAmplitude = 0.1f;
+                    if (const char *e = std::getenv("RT_JITTER_IDLE"); e && *e) // A/B: the idle amplitude
+                        idleAmplitude = static_cast<float>(std::atof(e));
                     int ww = 0, wh = 0;
                     SDL_GetWindowSizeInPixels(m_window, &ww, &wh);
                     const float ratio = std::clamp(static_cast<float>(wh) / static_cast<float>(pic->get_height()), 1.0f, 3.0f);
@@ -1409,7 +1422,7 @@ namespace ps2x::gs
                 }
                 if (const char *e = std::getenv("RT_JITTER_PHASES"); e && *e) // A/B: a fixed length
                     phases = std::clamp(static_cast<uint32_t>(std::atoi(e)), 1u, 256u);
-                runtime.gsUnsynced().setTemporalJitter(on, sx, sy, phases);
+                runtime.gsUnsynced().setTemporalJitter(on, sx, sy, phases, idleAmplitude);
                 m_temporalOn = on;
                 if (!on)
                     m_taaValid = m_sgsr2Valid = m_asrValid = m_puValid = false;

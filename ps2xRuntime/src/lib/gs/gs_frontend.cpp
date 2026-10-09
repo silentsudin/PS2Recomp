@@ -2430,15 +2430,16 @@ void GS::accumulateMotionStats()
     }
 }
 
-void GS::setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY, uint32_t phases)
+void GS::setTemporalJitter(bool on, float fbPerPixelX, float fbPerPixelY, uint32_t phases, float idleAmplitude)
 {
+    m_jitterIdleAmplitude.store(idleAmplitude, std::memory_order_relaxed);
     m_jitterPhases.store(std::max(phases, 1u), std::memory_order_relaxed);
     m_jitterScaleX.store(fbPerPixelX, std::memory_order_relaxed);
     m_jitterScaleY.store(fbPerPixelY, std::memory_order_relaxed);
     m_jitterOn.store(on, std::memory_order_relaxed);
 }
 
-bool GS::cameraJitter(float &x, float &y) const
+bool GS::cameraJitter(float &x, float &y, bool gameplay) const
 {
     if (!m_jitterOn.load(std::memory_order_relaxed))
     {
@@ -2455,9 +2456,15 @@ bool GS::cameraJitter(float &x, float &y) const
         return r;
     };
     const uint32_t i = (m_frameIndex.load(std::memory_order_relaxed) % m_jitterPhases.load(std::memory_order_relaxed)) + 1u;
-    x = (halton(i, 2) - 0.5f) * m_jitterScaleX.load(std::memory_order_relaxed);
-    y = (halton(i, 3) - 0.5f) * m_jitterScaleY.load(std::memory_order_relaxed);
+    // RT_JITTER_SCALE: the jitter's amplitude as a fraction of the usual +-0.5 picture pixel (A/B).
+    static const float amplitude = [] { const char *e = std::getenv("RT_JITTER_SCALE"); return e && *e ? static_cast<float>(std::atof(e)) : 1.0f; }();
+    const float scene = gameplay ? 1.0f : m_jitterIdleAmplitude.load(std::memory_order_relaxed);
+    x = (halton(i, 2) - 0.5f) * m_jitterScaleX.load(std::memory_order_relaxed) * amplitude * scene;
+    y = (halton(i, 3) - 0.5f) * m_jitterScaleY.load(std::memory_order_relaxed) * amplitude * scene;
     ps2x::gs::MotionTracker::instance().noteCameraJitter(x, y);
+    static const bool log = [] { const char *e = std::getenv("RT_JITTER_LOG"); return e && *e == '1'; }();
+    if (log) // what the game hook applied to a camera, by the GS frame counter
+        std::fprintf(stderr, "[jitter-applied] frame %u: %.3f %.3f\n", m_frameIndex.load(std::memory_order_relaxed), x, y);
     return true;
 }
 
