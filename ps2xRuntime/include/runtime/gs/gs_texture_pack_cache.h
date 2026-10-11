@@ -44,6 +44,10 @@ namespace ps2x::gs::packcache
     // Whether packs are cached here (active() is a format).
     bool available();
 
+    // A folder the app can always write (its private data): a pack whose usual cache folder can't
+    // be written caches in <dir>/<pack folder name> instead (set before the first pack is used).
+    void setPrivateCacheRoot(const std::string &dir);
+
     // The cached copy of `png` (its key as in the pack's file names) in the active format, if it is
     // there and current.
     bool load(const std::string &packDir, const std::string &png, uint64_t key, Compressed &out);
@@ -51,6 +55,9 @@ namespace ps2x::gs::packcache
     struct Progress
     {
         std::atomic<uint32_t> done{0}, total{0}, failed{0};
+        // Why images failed (each also counts in `failed`): the PNG didn't load, the encoder
+        // refused it, the cache file couldn't be written, or not moved into place.
+        std::atomic<uint32_t> failedLoad{0}, failedEncode{0}, failedWrite{0}, failedRename{0};
         std::atomic<bool> cancel{false};
     };
     // The pack's images without a current cached copy in the active format.

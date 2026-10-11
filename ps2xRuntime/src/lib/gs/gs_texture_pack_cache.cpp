@@ -10,7 +10,9 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +20,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
@@ -74,16 +77,55 @@ namespace ps2x::gs::packcache
             return true;
         }
 
+        std::mutex g_dirMutex;
+        std::string g_privateRoot;                                // setPrivateCacheRoot
+        std::unordered_map<std::string, fs::path> g_resolvedDirs; // pack folder -> its cache folder
+
+        // Whether files can be created in `dir` (made if missing): a file is written and removed.
+        bool writable(const fs::path &dir)
+        {
+            std::error_code ec;
+            fs::create_directories(dir, ec);
+            const fs::path probe = dir / (".probe." + std::to_string(getpid()));
+            {
+                std::ofstream out(probe, std::ios::binary | std::ios::trunc);
+                if (!(out << 'x'))
+                    return false;
+            }
+            fs::remove(probe, ec);
+            return true;
+        }
+
         // <...>/textures/packs/<name> caches in <...>/textures/cache/<name>; a pack elsewhere
-        // (RT_TEXTURE_PACK) beside itself, in <name>.rtcache.
+        // (RT_TEXTURE_PACK) beside itself, in <name>.rtcache. Where that can't be written (a
+        // textures folder copied in by another user, e.g. a root file manager on Android: every
+        // image failed to save and the pack converted again at every start and menu opening, #17),
+        // in the private root's <name> instead. Decided once per pack and run.
         fs::path cacheDir(const std::string &packDir)
         {
+            std::lock_guard<std::mutex> lock(g_dirMutex);
+            if (auto it = g_resolvedDirs.find(packDir); it != g_resolvedDirs.end())
+                return it->second;
             fs::path p = fs::path(packDir).lexically_normal();
             if (p.filename().empty())
                 p = p.parent_path();
-            if (p.parent_path().filename() == "packs")
-                return p.parent_path().parent_path() / "cache" / p.filename();
-            return p.parent_path() / (p.filename().string() + ".rtcache");
+            const fs::path beside = p.parent_path().filename() == "packs" ? p.parent_path().parent_path() / "cache" / p.filename()
+                                                                          : p.parent_path() / (p.filename().string() + ".rtcache");
+            fs::path dir = beside;
+            if (!writable(beside) && !g_privateRoot.empty())
+            {
+                const fs::path fallback = fs::path(g_privateRoot) / p.filename();
+                if (writable(fallback))
+                {
+                    std::fprintf(stderr, "[textures] can't write %s: pack cache in %s\n", beside.string().c_str(), fallback.string().c_str());
+                    dir = fallback;
+                }
+                else
+                    std::fprintf(stderr, "[textures] can't write %s or %s: the pack loads from PNG\n", beside.string().c_str(),
+                                 fallback.string().c_str());
+            }
+            g_resolvedDirs.emplace(packDir, dir);
+            return dir;
         }
 
         // Each format has its own file, so switching formats never reads the other's.
@@ -92,6 +134,15 @@ namespace ps2x::gs::packcache
             char name[32];
             std::snprintf(name, sizeof(name), "%016llx.%s", static_cast<unsigned long long>(key), f == Format::Bc7 ? "bc7" : "astc");
             return cacheDir(packDir) / name;
+        }
+
+        // An image this format's encoder couldn't take (the PNG doesn't load, the encoder refuses
+        // it): its stamp, so it isn't tried again at every start while the PNG stays the same.
+        fs::path failMarker(const std::string &packDir, uint64_t key, Format f)
+        {
+            fs::path p = cacheFile(packDir, key, f);
+            p += ".fail";
+            return p;
         }
 
         bool sourceStamp(const std::string &png, uint64_t &size, int64_t &time)
@@ -111,15 +162,54 @@ namespace ps2x::gs::packcache
                    h.levels <= 16 && h.width && h.height;
         }
 
-        bool current(const std::string &packDir, const std::string &png, uint64_t key, Format f)
+        // Why an image has no current cached copy (missing() counts each reason).
+        enum class Stale : uint8_t
+        {
+            Current,
+            Failed,    // no copy, but the encoder failed on this very PNG before: not tried again
+            NoSource,  // the PNG's size/time can't be read
+            NoFile,    // no cache file
+            BadHeader, // not a cache file of this format and version
+            Size,      // made from a PNG of another size
+            Time,      // made from a PNG with another modification time
+        };
+
+        Stale staleness(const std::string &packDir, const std::string &png, uint64_t key, Format f, Header *stored = nullptr,
+                        uint64_t *nowSize = nullptr, int64_t *nowTime = nullptr)
         {
             uint64_t size;
             int64_t time;
             if (!sourceStamp(png, size, time))
-                return false;
+                return Stale::NoSource;
+            if (nowSize)
+                *nowSize = size;
+            if (nowTime)
+                *nowTime = time;
             std::ifstream in(cacheFile(packDir, key, f), std::ios::binary);
+            if (!in)
+            {
+                std::ifstream marker(failMarker(packDir, key, f), std::ios::binary);
+                uint64_t markedSize = 0;
+                int64_t markedTime = 0;
+                if (marker.read(reinterpret_cast<char *>(&markedSize), sizeof(markedSize)) &&
+                    marker.read(reinterpret_cast<char *>(&markedTime), sizeof(markedTime)) && markedSize == size && markedTime == time)
+                    return Stale::Failed;
+                return Stale::NoFile;
+            }
             Header h;
-            return in && readHeader(in, h, f) && h.srcSize == size && h.srcTime == time;
+            if (!readHeader(in, h, f))
+                return Stale::BadHeader;
+            if (stored)
+                *stored = h;
+            if (h.srcSize != size)
+                return Stale::Size;
+            return h.srcTime == time ? Stale::Current : Stale::Time;
+        }
+
+        bool current(const std::string &packDir, const std::string &png, uint64_t key, Format f)
+        {
+            const Stale why = staleness(packDir, png, key, f);
+            return why == Stale::Current || why == Stale::Failed;
         }
 
         struct Entry
@@ -264,17 +354,46 @@ namespace ps2x::gs::packcache
         }
 
         // The PNG, PS2 alpha (0x80 opaque, as the GS draws pack images), every mip level.
-        bool encode(LevelEncoder &enc, Format f, const std::string &packDir, const Entry &e)
+        enum class Fail : uint8_t
+        {
+            None,
+            Load,
+            Encode,
+            Write,
+            Rename,
+        };
+
+        // The first failure of each kind is logged with its cause (a pack that never finishes
+        // converting says why).
+        void noteFailure(Fail kind, const std::string &png, const std::string &why)
+        {
+            static std::atomic<bool> logged[5];
+            if (!logged[static_cast<size_t>(kind)].exchange(true))
+                std::fprintf(stderr, "[textures] pack image not prepared (%s): %s: %s\n",
+                             kind == Fail::Load ? "load" : kind == Fail::Encode ? "encode" : kind == Fail::Write ? "write" : "rename",
+                             png.c_str(), why.c_str());
+        }
+
+        Fail encode(LevelEncoder &enc, Format f, const std::string &packDir, const Entry &e)
         {
             if (!enc.ok())
-                return false;
+            {
+                noteFailure(Fail::Encode, e.png, "no encoder context");
+                return Fail::Encode;
+            }
             uint64_t srcSize;
             int64_t srcTime;
             if (!sourceStamp(e.png, srcSize, srcTime))
-                return false;
+            {
+                noteFailure(Fail::Load, e.png, "can't read its size and time");
+                return Fail::Load;
+            }
             Image img = LoadImage(e.png.c_str());
             if (!img.data)
-                return false;
+            {
+                noteFailure(Fail::Load, e.png, "not a PNG raylib can read");
+                return Fail::Load;
+            }
             ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
             uint32_t w = static_cast<uint32_t>(img.width), h = static_cast<uint32_t>(img.height);
             std::vector<uint8_t> rgba(static_cast<const uint8_t *>(img.data),
@@ -297,7 +416,10 @@ namespace ps2x::gs::packcache
             {
                 const size_t before = data.size();
                 if (!enc.level(rgba, w, h, data))
-                    return false;
+                {
+                    noteFailure(Fail::Encode, e.png, "level " + std::to_string(hdr.levels) + " (" + std::to_string(w) + "x" + std::to_string(h) + ")");
+                    return Fail::Encode;
+                }
                 sizes.push_back(static_cast<uint32_t>(data.size() - before));
                 ++hdr.levels;
                 if (w == 1u && h == 1u)
@@ -335,12 +457,34 @@ namespace ps2x::gs::packcache
                 out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
                 if (!out)
                 {
+                    const int err = errno;
                     fs::remove(part, ec);
-                    return false;
+                    noteFailure(Fail::Write, e.png, part.string() + ": " + std::strerror(err));
+                    return Fail::Write;
                 }
             }
             fs::rename(part, file, ec);
-            return !ec;
+            if (ec)
+            {
+                noteFailure(Fail::Rename, e.png, part.string() + " -> " + file.string() + ": " + ec.message());
+                fs::remove(part, ec);
+                return Fail::Rename;
+            }
+            return Fail::None;
+        }
+    }
+
+    namespace
+    {
+        void markFailed(const std::string &packDir, const Entry &e, Format f)
+        {
+            uint64_t size;
+            int64_t time;
+            if (!sourceStamp(e.png, size, time))
+                return;
+            std::ofstream out(failMarker(packDir, e.key, f), std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char *>(&size), sizeof(size));
+            out.write(reinterpret_cast<const char *>(&time), sizeof(time));
         }
     }
 
@@ -387,6 +531,13 @@ namespace ps2x::gs::packcache
             return choice;
         }();
         return f;
+    }
+
+    void setPrivateCacheRoot(const std::string &dir)
+    {
+        std::lock_guard<std::mutex> lock(g_dirMutex);
+        g_privateRoot = dir;
+        g_resolvedDirs.clear();
     }
 
     void setDeviceSamples(bool astc, bool bc7)
@@ -459,9 +610,36 @@ namespace ps2x::gs::packcache
         const Format f = active();
         if (f == Format::None)
             return 0;
-        size_t n = 0;
+        // Counted by reason, the first of each logged with what the cache file says against the
+        // PNG (an image converted on every start shows here why).
+        size_t n = 0, by[7] = {};
+        std::string example[7];
         for (const Entry &e : packImages(packDir))
-            n += current(packDir, e.png, e.key, f) ? 0u : 1u;
+        {
+            Header stored{};
+            uint64_t size = 0;
+            int64_t time = 0;
+            const Stale why = staleness(packDir, e.png, e.key, f, &stored, &size, &time);
+            if (why == Stale::Current || why == Stale::Failed)
+                continue;
+            ++n;
+            const size_t i = static_cast<size_t>(why);
+            if (by[i]++ == 0)
+                example[i] = cacheFile(packDir, e.key, f).string() + " (stored size " + std::to_string(stored.srcSize) + " time " +
+                             std::to_string(stored.srcTime) + ", PNG size " + std::to_string(size) + " time " + std::to_string(time) + ")";
+        }
+        if (n)
+        {
+            static const char *const names[7] = {"current", "failed before", "no PNG stamp", "no file", "bad header", "size differs", "time differs"};
+            std::fprintf(stderr, "[textures] pack %s: %zu image(s) without a current %s copy:", packDir.c_str(), n, formatName(f));
+            for (size_t i = 2; i < 7; ++i)
+                if (by[i])
+                    std::fprintf(stderr, " %s %zu", names[i], by[i]);
+            std::fprintf(stderr, "\n");
+            for (size_t i = 2; i < 7; ++i)
+                if (by[i])
+                    std::fprintf(stderr, "[textures]   %s, e.g. %s\n", names[i], example[i].c_str());
+        }
         return n;
     }
 
@@ -488,12 +666,31 @@ namespace ps2x::gs::packcache
                 const auto enc = makeEncoder(f);
                 for (size_t i; !progress.cancel && (i = next.fetch_add(1)) < todo.size();)
                 {
-                    if (!enc || !encode(*enc, f, packDir, todo[i]))
+                    const Fail fail = enc ? encode(*enc, f, packDir, todo[i]) : Fail::Encode;
+                    if (enc && (fail == Fail::Load || fail == Fail::Encode))
+                        markFailed(packDir, todo[i], f);
+                    else if (fail == Fail::None)
+                    {
+                        std::error_code ec;
+                        fs::remove(failMarker(packDir, todo[i].key, f), ec); // (one from an earlier version of the PNG)
+                    }
+                    if (fail != Fail::None)
+                    {
                         progress.failed.fetch_add(1);
+                        (fail == Fail::Load     ? progress.failedLoad
+                         : fail == Fail::Encode ? progress.failedEncode
+                         : fail == Fail::Write  ? progress.failedWrite
+                                                : progress.failedRename)
+                            .fetch_add(1);
+                    }
                     progress.done.fetch_add(1);
                 }
             });
         for (auto &w : workers)
             w.join();
+        std::fprintf(stderr, "[textures] pack prepare %s: %u of %u done%s, %u failed (load %u, encode %u, write %u, rename %u)\n",
+                     packDir.c_str(), progress.done.load(), progress.total.load(), progress.cancel ? " (stopped)" : "",
+                     progress.failed.load(), progress.failedLoad.load(), progress.failedEncode.load(), progress.failedWrite.load(),
+                     progress.failedRename.load());
     }
 }
