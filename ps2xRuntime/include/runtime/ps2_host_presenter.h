@@ -114,6 +114,32 @@ namespace ps2x
             (void)aspect;
             return false;
         }
+        // The map this host frame shows (one copy per frame, so its box and kMapTexture's image
+        // always belong together), and what the GS says about the game's map.
+        struct MapInfo
+        {
+            bool shown = false;      // a map is on hand (kMapTexture)
+            float uv[4] = {};        // the map itself in the layer (the town bezel left out)
+            float outerUv[4] = {};   // everything it drew (with the bezel)
+            float picture[4] = {};   // where that outer part was in the game's picture (0..1)
+            float aspect = 1.0f;     // the map's width over height on a 4:3 TV
+            uint32_t kind = 0;       // 1 the town's window (with its bezel), 2 another map (a course's)
+            uint64_t serial = 0;     // one per map the GS published
+            uint64_t framesSeen = 0; // game frames that drew a map, sent to the layer or not
+            bool latched = false;    // the frame the GS draws now sends its map to the layer
+        };
+        virtual bool mapInfo(MapInfo &info) const
+        {
+            (void)info;
+            return false;
+        }
+        // Where the game's picture is in the window (x, y, width, height as fractions of the
+        // window's drawable size, as last presented). False if unknown.
+        virtual bool pictureRect(float rect[4]) const
+        {
+            (void)rect;
+            return false;
+        }
         // An RGBA8 picture of the app's own for ImGui (both screens), sampled nearest (pixel art)
         // or linear; 0 if unsupported. Call on the UI thread.
         virtual uint64_t createUiTexture(const uint8_t *rgba, int width, int height, bool nearest = false)

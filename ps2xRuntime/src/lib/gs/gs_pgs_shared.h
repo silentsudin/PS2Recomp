@@ -36,15 +36,29 @@ namespace ps2x::gs
         // The UI mask (R8: 1 where the HUD / 2D screens drew), so post-processing spares the UI.
         Vulkan::ImageHandle ui;
         std::atomic<bool> wantUi{false};
-        // The game's map (course map, town minimap) drawn on its own (a second screen shows it):
-        // with wantMap set, a backend that can (the hardware GS) draws the map's batches into `map`
-        // instead of the frame (an opaque image the size of the frame buffer), and mapUv is the part
-        // the map covered in the last frame that drew it (u0, v0, u1, v1), mapAspect its width over
-        // height on a 4:3 TV. `map` is null when the last frames drew no map (guarded by `mutex`).
+        // The game's map (course map, town minimap, field maps) drawn on its own (a second screen, or
+        // the app's own map on the main screen, shows it). wantMap is read once per game frame, at
+        // the frame's first draw (`mapLatched` says what the frame being drawn does): with it set, a
+        // backend that can (the hardware GS) draws that frame's map batches into a layer of their
+        // own instead of the frame, and publishes it when the game moves on to its next frame: the
+        // layer (`map`, opaque, the frame buffer's width by 256 lines, its GS coordinates), the map
+        // itself in it (mapUv: u0, v0, u1, v1; the town bezel left out), everything the map drew
+        // (mapOuterUv: with the bezel) and where that was in the picture scanned out (mapPicture,
+        // 0..1 of it), its width over height on a 4:3 TV, its kind and a serial, all at once (under
+        // `mutex`; the presenter takes one copy per host frame). `map` is null while none is shown:
+        // cleared at once when wantMap turns off, and when frames come without a map.
+        // mapFramesSeen counts the game frames that drew a map, diverted or not (the game's own
+        // signal that a map is up: town, field, highway or race).
         std::atomic<bool> wantMap{false};
+        std::atomic<bool> mapLatched{false};
+        std::atomic<uint64_t> mapFramesSeen{0};
         Vulkan::ImageHandle map;
         float mapUv[4] = {};
+        float mapOuterUv[4] = {};
+        float mapPicture[4] = {};
         float mapAspect = 1.0f;
+        uint32_t mapKind = 0; // 1 the town's window (scissored, with its bezel), 2 another map (a course's)
+        uint64_t mapSerial = 0;
         // Re-rendered frame generation: shadow GS instances replay the frame with the 3D moved on by
         // (i + 1) / (wantShadows + 1) of a frame; their pictures, scanned out with the real one.
         std::atomic<uint32_t> wantShadows{0};

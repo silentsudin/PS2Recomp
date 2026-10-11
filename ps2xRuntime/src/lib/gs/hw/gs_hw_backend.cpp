@@ -106,7 +106,7 @@ namespace ps2x::gs
                                 &v[7], &v[8], &v[9], &v[10], &v[11], &v[12]) != 13)
                     return false;
                 k.depth = uint8_t(v[0] != 0), k.motion = uint8_t(v[1] != 0), k.ztest = uint8_t(v[2] != 0), k.zwrite = uint8_t(v[3] != 0);
-                k.zop = uint8_t(std::min(v[4], 7u)), k.blend = uint8_t(v[5] != 0);
+                k.zop = uint8_t(std::min(v[4], 7u)), k.blend = uint8_t(std::min(v[5], 2u));
                 k.src = uint8_t(std::min(v[6], unsigned(VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA)));
                 k.dst = uint8_t(std::min(v[7], unsigned(VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA)));
                 k.op = uint8_t(std::min(v[8], unsigned(VK_BLEND_OP_MAX)));
@@ -240,6 +240,9 @@ namespace ps2x::gs
             bool recolor = false;
             float recolorMap[20] = {};
             bool map = false; // the game's map (PgsShared::wantMap)
+            // The real frame drew this map batch into the map layer (its frame's latch): its
+            // shadows leave it out too.
+            mutable bool diverted = false;
             // Every triangle flat (one Z, no perspective): 2D, drawn as paraLLEl-GS supersamples
             // UI (attributes at the GS pixel's own sample, Snap::Attributes).
             bool flat = true;
@@ -796,13 +799,16 @@ namespace ps2x::gs
                     publish(false);
             }
 
-            // The game's map: every course-map and town-minimap draw has TEST_2 = 0x3380B (alpha test
-            // GEQUAL 0x80 with RGB_ONLY, Z test ALWAYS; a template at ELF 0x2A43B0, nothing else uses
-            // it), and in towns its bezel is three sprites of one palette bank ([map] in Road Trip's
+            // The game's map: every course-map, town-minimap and field-area map draw has TEST_2 =
+            // 0x3380B (alpha test GEQUAL 0x80 with RGB_ONLY, Z test ALWAYS; a template at ELF 0x2A43B0,
+            // nothing else uses it), untextured, blended Cs * As + Cd * (1 - As) with FIX 0x80 (a
+            // survey of towns, field areas, Q's Factory and races found no other kind), and in towns
+            // and field areas its bezel is three sprites of one palette bank ([map] in Road Trip's
             // config/game_state.toml).
             static bool isMap(const GSDrawState &s)
             {
-                if (s.prim.ctxt && (s.context.test & 0x7FFFFu) == 0x3380Bu)
+                if (s.prim.ctxt && (s.context.test & 0x7FFFFu) == 0x3380Bu && !s.prim.tme && s.prim.abe &&
+                    (s.context.alpha & 0xFF000000FFull) == 0x8000000044ull)
                     return true;
                 const GSTex0Reg &t = s.context.tex0;
                 return !s.prim.ctxt && s.prim.type == GS_PRIM_SPRITE && s.prim.tme && t.tbp0 == 7828u && t.psm == 0x14u &&
@@ -1268,6 +1274,12 @@ namespace ps2x::gs
                     m_shadowBatches.clear();
                     m_shadowBatchVerts.clear();
                     m_shadowWarm = 0;
+                    // The map: a frame starts afresh (its layer's half-drawn map is dropped).
+                    m_frameFbpValid = false;
+                    m_mapDrawn = m_mapSeen = m_mapBezel = false;
+                    resetBox(m_mapBox), resetBox(m_mapAll), resetBox(m_mapOuter);
+                    if (m_shared)
+                        m_shared->map.reset();
                     m_depthRequested = false;
                     // The render targets and Z buffers: the state's (restoreTargets), else empty.
                     m_main = TargetSet{};
@@ -1344,7 +1356,7 @@ namespace ps2x::gs
                     if (scanStart)
                         m_dev->register_time_interval("GPU", std::move(scanStart), cmd->write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT),
                                                       "gs present: scanout");
-                    noteMapPresent();
+                    noteMapPresent(*cmd);
                     // Drawing from here on (the next frame) snaps as this scanout shows (snapRules).
                     m_fieldAware = (request.smode2 & 3u) == 3u && !request.progressiveFields;
                     if (scan && m_shared && m_shared->wantUi.load(std::memory_order_relaxed))
@@ -2068,32 +2080,74 @@ namespace ps2x::gs
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_CLEAR_BIT,
                                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
-                    VkClearValue bg = {};
-                    bg.color.float32[0] = 0x0B / 255.0f; // the second screen's navy
-                    bg.color.float32[1] = 0x12 / 255.0f;
-                    bg.color.float32[2] = 0x40 / 255.0f;
-                    bg.color.float32[3] = 1.0f;
+                    VkClearValue bg = {}; // transparent: the map is laid over what shows it
                     cmd.clear_image(*m.color, bg);
                     cmd.image_barrier(*m.color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
                                       VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                                       VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
                     m_mapDrawn = true;
-                    m_mapBox[0] = m_mapBox[1] = 1e9f;
-                    m_mapBox[2] = m_mapBox[3] = -1e9f;
                 }
                 return m;
             }
 
-            // The part of the frame the map covers (inside its scissor: the town map's vertices reach
-            // far outside it). The town bezel is drawn into the layer but not counted: the second
-            // screen shows the map itself.
+            // GS thread (record): a game frame ends where drawing moves on to another of the frame
+            // buffers the game shows (one scanned out lately, or the one its map went to): the last
+            // frame's map is published then, and wantMap latched for the new frame. Not at Present:
+            // the GS thread runs up to a frame behind the EE, so a Present can come in the middle of
+            // a map. Render-to-texture targets (the loading blur, the post-pass) aren't frame
+            // buffers the game shows, so they don't end a frame.
+            void noteFrameDraw(uint32_t fbp, Vulkan::CommandBuffer &cmd, bool &passOpen)
+            {
+                constexpr uint32_t kNone = ~0u;
+                const bool known = m_shownFbp[0] != kNone || m_mapFbp != kNone;
+                const bool shown = !known || fbp == m_mapFbp || fbp == m_shownFbp[0] || fbp == m_shownFbp[1];
+                if (!shown || (m_frameFbpValid && fbp == m_frameFbp))
+                    return;
+                endPass(cmd, passOpen);
+                finishMapFrame(cmd);
+                m_frameFbp = fbp;
+                m_frameFbpValid = true;
+                m_presentsInFrame = 0;
+                latchMap();
+            }
+
+            // A new frame: what it does with its map (PgsShared::wantMap, read once here).
+            void latchMap()
+            {
+                const bool want = m_shared->wantMap.load(std::memory_order_relaxed);
+                if (m_mapLatch && !want)
+                {
+                    m_shared->map.reset(); // the map is back in the frame: gone from the layer at once
+                    m_mapFramesMissed = 0;
+                }
+                m_mapLatch = want;
+                m_shared->mapLatched.store(want, std::memory_order_relaxed);
+            }
+
+            // The end of a game frame: the frame's map (if it diverted one) goes out; frames that
+            // were to divert a map and drew none (a building, a dialogue, a loading screen) take
+            // the last one away after three.
+            void finishMapFrame(Vulkan::CommandBuffer &cmd)
+            {
+                if (m_mapSeen)
+                    m_shared->mapFramesSeen.fetch_add(1, std::memory_order_relaxed);
+                m_mapSeen = false;
+                if (m_mapDrawn)
+                {
+                    publishMap(cmd);
+                    m_mapFramesMissed = 0;
+                }
+                else if (m_mapLatch && ++m_mapFramesMissed >= 3)
+                    m_shared->map.reset();
+            }
+
+            // The part of the frame each map batch covers (inside its scissor: the town map's
+            // vertices reach far outside it). The map's own box is its flat-shaded draws' (the track
+            // and streets; the cars' markers are Gouraud, and one at the track's edge would move the
+            // box), or every draw's when it has none; the town bezel counts only in the outer box.
             void noteMapBox(const Batch &b, const std::vector<HwVertex> &vertices)
             {
-                // The map itself, not what moves on it: the track and streets are flat-shaded, the
-                // cars' markers Gouraud (a marker at the track's edge would move the box).
-                if (!b.state.prim.ctxt || b.state.prim.iip)
-                    return;
                 const GSScissorReg &sc = b.state.context.scissor;
                 float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
                 for (uint32_t i = b.firstVertex; i < b.firstVertex + b.vertexCount && i < vertices.size(); ++i)
@@ -2101,41 +2155,70 @@ namespace ps2x::gs
                     x0 = std::min(x0, vertices[i].x), x1 = std::max(x1, vertices[i].x);
                     y0 = std::min(y0, vertices[i].y), y1 = std::max(y1, vertices[i].y);
                 }
-                // Edges the scissor cut (the town map's window) are exact; the others get a margin.
-                m_mapClipped[0] |= x0 < sc.x0, m_mapClipped[1] |= y0 < sc.y0;
-                m_mapClipped[2] |= x1 > sc.x1 + 1, m_mapClipped[3] |= y1 > sc.y1 + 1;
+                const bool clipped[4] = {x0 < sc.x0, y0 < sc.y0, x1 > sc.x1 + 1, y1 > sc.y1 + 1};
                 x0 = std::max(x0, static_cast<float>(sc.x0)), y0 = std::max(y0, static_cast<float>(sc.y0));
                 x1 = std::min(x1, static_cast<float>(sc.x1 + 1)), y1 = std::min(y1, static_cast<float>(sc.y1 + 1));
                 if (x1 <= x0 || y1 <= y0)
                     return;
-                m_mapBox[0] = std::min(m_mapBox[0], x0), m_mapBox[1] = std::min(m_mapBox[1], y0);
-                m_mapBox[2] = std::max(m_mapBox[2], x1), m_mapBox[3] = std::max(m_mapBox[3], y1);
+                auto grow = [&](float *box) {
+                    box[0] = std::min(box[0], x0), box[1] = std::min(box[1], y0);
+                    box[2] = std::max(box[2], x1), box[3] = std::max(box[3], y1);
+                };
+                grow(m_mapOuter);
+                if (!b.state.prim.ctxt)
+                {
+                    m_mapBezel = true; // the town bezel (context 1 sprites)
+                    return;
+                }
+                grow(m_mapAll);
+                for (int i = 0; i < 4; ++i)
+                    m_mapAllClipped[i] = m_mapAllClipped[i] || clipped[i];
+                if (b.state.prim.iip)
+                    return;
+                grow(m_mapBox);
+                for (int i = 0; i < 4; ++i)
+                    m_mapClipped[i] = m_mapClipped[i] || clipped[i];
             }
 
-            // At the end of a map's run of batches: hands it to the second screen.
+            static void resetBox(float *box)
+            {
+                box[0] = box[1] = 1e9f;
+                box[2] = box[3] = -1e9f;
+            }
+
+            // A frame's map, published as one snapshot: the layer with its box, outer box, picture
+            // box, shape, kind and serial.
             void publishMap(Vulkan::CommandBuffer &cmd)
             {
-                if (!m_shared)
-                    return;
                 const Target &m = m_mapLayers[m_mapIndex];
-                if (m_mapDrawn && m.color && m_mapBox[2] > m_mapBox[0])
+                const bool flat = m_mapBox[2] > m_mapBox[0];
+                const float *box = flat ? m_mapBox : m_mapAll;
+                const bool *clipped = flat ? m_mapClipped : m_mapAllClipped;
+                if (m_mapDrawn && m.color && box[2] > box[0])
                 {
+                    // The town's window (scissored, with its bezel) or another map (a course's):
+                    // another kind of map gets a box of its own at once.
+                    const uint32_t kind = m_mapBezel || clipped[0] || clipped[1] || clipped[2] || clipped[3] ? 1u : 2u;
+                    if (kind != m_mapKind)
+                    {
+                        m_mapKind = kind;
+                        m_mapStable[0] = m_mapStable[2] = 0;
+                    }
                     // A fixed size while the same map is shown: the first frame's box with a margin
                     // where the scissor didn't cut it (a race map's outline wobbles a pixel or two as
                     // it is drawn; the town map fills its window exactly), grown only when the
                     // drawing leaves it, kept until the map has been gone for two seconds (another
-                    // course or town). A box that changed with the drawing made the second screen's
-                    // map change size.
+                    // course or town). A box that changed with the drawing made the map change size.
                     constexpr float kMargin = 4.0f; // GS pixels
-                    const bool inside = m_mapStable[2] > m_mapStable[0] && m_mapBox[0] >= m_mapStable[0] && m_mapBox[1] >= m_mapStable[1] &&
-                                        m_mapBox[2] <= m_mapStable[2] && m_mapBox[3] <= m_mapStable[3];
+                    const bool had = m_mapStable[2] > m_mapStable[0];
+                    const bool inside = had && box[0] >= m_mapStable[0] && box[1] >= m_mapStable[1] && box[2] <= m_mapStable[2] &&
+                                        box[3] <= m_mapStable[3];
                     if (!inside)
                     {
-                        const bool had = m_mapStable[2] > m_mapStable[0];
                         for (int i = 0; i < 2; ++i)
                         {
-                            const float lo = m_mapBox[i] - (m_mapClipped[i] ? 0.0f : kMargin);
-                            const float hi = m_mapBox[i + 2] + (m_mapClipped[i + 2] ? 0.0f : kMargin);
+                            const float lo = box[i] - (clipped[i] ? 0.0f : kMargin);
+                            const float hi = box[i + 2] + (clipped[i + 2] ? 0.0f : kMargin);
                             m_mapStable[i] = had ? std::min(m_mapStable[i], lo) : lo;
                             m_mapStable[i + 2] = had ? std::max(m_mapStable[i + 2], hi) : hi;
                         }
@@ -2143,39 +2226,80 @@ namespace ps2x::gs
                         m_mapStable[2] = std::min(m_mapStable[2], static_cast<float>(m.width));
                         m_mapStable[3] = std::min(m_mapStable[3], static_cast<float>(m.height));
                     }
-                    std::memcpy(m_mapBox, m_mapStable, sizeof(m_mapBox));
+                    // The outer box (the bezel, markers past the map's edge) likewise: grown only.
+                    if (!had)
+                        std::memcpy(m_mapOuterStable, m_mapStable, sizeof(m_mapOuterStable));
+                    if (m_mapOuter[2] > m_mapOuter[0])
+                        for (int i = 0; i < 2; ++i)
+                        {
+                            m_mapOuterStable[i] = std::min(m_mapOuterStable[i], std::max(m_mapOuter[i], 0.0f));
+                            m_mapOuterStable[i + 2] =
+                                std::min(std::max(m_mapOuterStable[i + 2], m_mapOuter[i + 2]), static_cast<float>(i ? m.height : m.width));
+                        }
+                    for (int i = 0; i < 2; ++i)
+                    {
+                        m_mapOuterStable[i] = std::min(m_mapOuterStable[i], m_mapStable[i]);
+                        m_mapOuterStable[i + 2] = std::max(m_mapOuterStable[i + 2], m_mapStable[i + 2]);
+                    }
                     // Sampled by the presenter from here on (back to an attachment when reused).
                     cmd.image_barrier(*m.color, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
                     m_shared->map = m.color;
-                    m_shared->mapUv[0] = m_mapBox[0] / m.width;
-                    m_shared->mapUv[1] = m_mapBox[1] / m.height;
-                    m_shared->mapUv[2] = m_mapBox[2] / m.width;
-                    m_shared->mapUv[3] = m_mapBox[3] / m.height;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        const float extent = static_cast<float>(i % 2 ? m.height : m.width);
+                        m_shared->mapUv[i] = m_mapStable[i] / extent;
+                        m_shared->mapOuterUv[i] = m_mapOuterStable[i] / extent;
+                    }
+                    // Where the outer box is in the picture the presenter shows (the scanned-out
+                    // part of the frame buffer, in GS pixels).
+                    const ScanGeom &g = m_scanGeom;
+                    const float sw = g.outW ? static_cast<float>(g.outW) / static_cast<float>(g.sx) : 640.0f;
+                    const float sh = g.outH ? static_cast<float>(g.outH + g.yOff) / static_cast<float>(g.sy) : 224.0f;
+                    for (int i = 0; i < 4; ++i)
+                        m_shared->mapPicture[i] =
+                            (m_mapOuterStable[i] - static_cast<float>(i % 2 ? g.dby : g.dbx)) / (i % 2 ? sh : sw);
                     // GS pixels on a 4:3 TV: a 640x224 field fills it, so a pixel is 4/3 * 224/640 as
                     // wide as it is tall... per field line.
                     const float pixelAspect = (4.0f / 3.0f) * 224.0f / 640.0f;
-                    m_shared->mapAspect = (m_mapBox[2] - m_mapBox[0]) * pixelAspect / (m_mapBox[3] - m_mapBox[1]);
+                    m_shared->mapAspect = (m_mapStable[2] - m_mapStable[0]) * pixelAspect / (m_mapStable[3] - m_mapStable[1]);
+                    m_shared->mapKind = m_mapKind;
+                    ++m_shared->mapSerial;
                     m_mapIndex ^= 1u;
                     m_mapPublished = true;
                 }
                 m_mapDrawn = false;
-                m_mapClipped[0] = m_mapClipped[1] = m_mapClipped[2] = m_mapClipped[3] = false;
+                m_mapBezel = false;
+                resetBox(m_mapBox), resetBox(m_mapAll), resetBox(m_mapOuter);
+                for (int i = 0; i < 4; ++i)
+                    m_mapClipped[i] = m_mapAllClipped[i] = false;
             }
 
-            // At Present: presents without a map (the map's run ends publish it, publishMap).
-            void noteMapPresent()
+            // At Present: the frame buffer shown (frames end on it, noteFrameDraw), and presents
+            // without a map. A game drawing into one frame buffer only would never end a frame
+            // there: its map goes out at the third Present instead.
+            void noteMapPresent(Vulkan::CommandBuffer &cmd)
             {
                 if (!m_shared)
                     return;
+                if (m_scanFbp != m_shownFbp[0])
+                {
+                    m_shownFbp[1] = m_shownFbp[0];
+                    m_shownFbp[0] = m_scanFbp;
+                }
+                if (m_mapDrawn && ++m_presentsInFrame >= 3)
+                {
+                    finishMapFrame(cmd);
+                    m_presentsInFrame = 0;
+                }
                 if (m_mapPublished || m_mapDrawn)
                     m_mapMissed = 0;
                 else
                 {
                     ++m_mapMissed;
                     if (m_mapMissed > 10)
-                        m_shared->map.reset(); // no map for a while: none to show
+                        m_shared->map.reset(); // no map for a while (the game stopped drawing frames): none to show
                     if (m_mapMissed > 120)
                         m_mapStable[0] = m_mapStable[2] = 0; // the next map (another course or town) gets its own box
                 }
@@ -2412,23 +2536,26 @@ namespace ps2x::gs
                     }
                     Target &frameTarget =
                         target(ctx.frame.fbp, ctx.frame.fbw, fpsm, static_cast<uint32_t>(ctx.scissor.y1) + 1u, cmd, passOpen);
-                    const bool toMap = b.map && m_shared && m_shared->wantMap.load(std::memory_order_relaxed);
-                    if (toMap && m_inShadow)
-                        continue; // (the real frame draws it into the map layer, not the frame)
-                    // A frame's map goes to the second screen when the game moves on to its other
-                    // frame buffer (the next frame), not at Present: the GS thread runs up to a frame
-                    // behind the EE, so a Present could come in the middle of a map (half a map
-                    // shown) or after two (drawn over each other): the map flashed. (Not at the end
-                    // of a run of map batches either: other drawing comes between the map's parts.)
-                    if (!m_inShadow)
+                    // The game's map: diverted into the map layer by its frame's latch (wantMap
+                    // read at the frame's first draw), so a frame's map never splits between the
+                    // layer and the frame; the shadows follow the real frame.
+                    bool toMap = false;
+                    if (m_inShadow)
                     {
-                        if (m_mapDrawn && ctx.frame.fbp != m_mapFbp)
+                        if (b.diverted)
+                            continue; // (the real frame drew it into the map layer, not the frame)
+                    }
+                    else if (m_shared)
+                    {
+                        noteFrameDraw(ctx.frame.fbp, cmd, passOpen);
+                        if (b.map)
                         {
-                            endPass(cmd, passOpen);
-                            publishMap(cmd);
+                            m_mapSeen = true;
+                            toMap = m_mapLatch;
+                            b.diverted = toMap;
+                            if (toMap)
+                                m_mapFbp = ctx.frame.fbp;
                         }
-                        if (toMap)
-                            m_mapFbp = ctx.frame.fbp;
                     }
                     Target &t = toMap ? mapLayer(frameTarget, cmd, passOpen) : frameTarget;
                     if (toMap)
@@ -2606,8 +2733,10 @@ namespace ps2x::gs
                         if (m != 0u && m != 0xFFu)
                             unsupported("partial FBMSK");
                     }
-                    if (fpsm == GS_PSM_CT24 || toMap)
-                        mask &= 0x7u; // (the map layer stays opaque)
+                    if (toMap)
+                        mask |= 0x8u; // the map layer keeps alpha (premultiplied, composed "over")
+                    else if (fpsm == GS_PSM_CT24)
+                        mask &= 0x7u;
 
                     // Scissor.
                     VkRect2D sc;
@@ -2757,6 +2886,20 @@ namespace ps2x::gs
                     // FB_ONLY: every pixel's colour and alpha, then the passing ones' Z.
                     // ZB_ONLY: every pixel's Z, then the passing ones' colour.
                     // RGB_ONLY: every pixel's colour, then the passing ones' alpha and Z.
+                    // The map layer (premultiplied, laid over the second screen's panel or the
+                    // picture): every pixel's colour and alpha, alpha composed "over" (blend 2). The
+                    // map's RGB_ONLY alpha test only kept alpha from its translucent pixels, and the
+                    // layer has no Z.
+                    if (toMap && key.blend)
+                        key.blend = 2;
+                    if (toMap && (!ate || afail == 3u))
+                    {
+                        key.mask = static_cast<uint8_t>(key.mask | 8u);
+                        key.spec[2] = 2u; // no alpha test
+                        p.mode[3] = 2u;
+                        drawBatch(key);
+                        continue;
+                    }
                     const bool failWrites = ate && afail != 0u && p.mode[1] != 1u;
                     const bool zw = key.zwrite != 0;
                     if (failWrites && (!zw || !key.ztest || key.zop == VK_COMPARE_OP_ALWAYS))
@@ -3236,7 +3379,10 @@ namespace ps2x::gs
             {
                 static FILE *log = [] {
                     const char *p = std::getenv("RT_HWGS_BATCH_LOG");
-                    return p && *p ? std::fopen(p, "w") : nullptr;
+                    FILE *f = p && *p ? std::fopen(p, "w") : nullptr;
+                    if (f)
+                        std::setvbuf(f, nullptr, _IOLBF, 1 << 16); // whole lines: a reader can follow it
+                    return f;
                 }();
                 static const std::string drop = [] {
                     const char *e = std::getenv("RT_HWGS_DROP");
@@ -3257,12 +3403,14 @@ namespace ps2x::gs
                     }
                     std::fprintf(log,
                                  "frame=%llu fbp=%u zbp=%u prim=%u tme=%u abe=%u fge=%u test=%05llx alpha=%llx zmsk=%u tbp=%u tw=%u th=%u "
-                                 "psm=%u tfx=%u tcc=%u tex1=%llx target=%d flat=%d verts=%u box=%.1f,%.1f,%.1f,%.1f z=%.7f..%.7f\n",
+                                 "psm=%u tfx=%u tcc=%u tex1=%llx target=%d flat=%d verts=%u box=%.1f,%.1f,%.1f,%.1f z=%.7f..%.7f ctxt=%u iip=%u "
+                                 "map=%d cbp=%u csa=%u scissor=%u,%u,%u,%u\n",
                                  static_cast<unsigned long long>(m_frame.load()), c.frame.fbp, c.zbuf.zbp, b.state.prim.type, b.state.prim.tme,
                                  b.state.prim.abe, b.state.prim.fge, test, alpha, c.zbuf.zmask, c.tex0.tbp0, 1u << c.tex0.tw,
                                  1u << c.tex0.th, c.tex0.psm, c.tex0.tfx, c.tex0.tcc,
                                  static_cast<unsigned long long>(c.tex1 & 0xFFFFFFFFFull), b.fromTarget ? 1 : 0, b.flat ? 1 : 0,
-                                 b.vertexCount, x0, y0, x1, y1, z0, z1);
+                                 b.vertexCount, x0, y0, x1, y1, z0, z1, b.state.prim.ctxt, b.state.prim.iip, b.map ? 1 : 0, c.tex0.cbp,
+                                 c.tex0.csa, c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1);
                 }
                 char t[32], a[32], tb[32];
                 std::snprintf(t, sizeof(t), ",t%llx,", test);
@@ -3288,9 +3436,11 @@ namespace ps2x::gs
                 cmd.set_depth_compare(static_cast<VkCompareOp>(k.zop));
                 if (k.blend)
                 {
+                    // blend 2 (the map layer): alpha composes as "over" (As + Ad * (1 - As)), so the
+                    // layer is a premultiplied picture of the map that can be laid over another.
                     cmd.set_blend_enable(true);
-                    cmd.set_blend_factors(static_cast<VkBlendFactor>(k.src), VK_BLEND_FACTOR_ONE,
-                                          static_cast<VkBlendFactor>(k.dst), VK_BLEND_FACTOR_ZERO);
+                    cmd.set_blend_factors(static_cast<VkBlendFactor>(k.src), VK_BLEND_FACTOR_ONE, static_cast<VkBlendFactor>(k.dst),
+                                          k.blend == 2 ? VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA : VK_BLEND_FACTOR_ZERO);
                     cmd.set_blend_op(static_cast<VkBlendOp>(k.op), VK_BLEND_OP_ADD);
                 }
                 else
@@ -3658,10 +3808,21 @@ namespace ps2x::gs
             uint32_t m_scanFbp = 0; // the frame buffer the last scanout showed
             Target m_mapLayers[2];
             uint32_t m_mapIndex = 0, m_mapMissed = 0;
-            bool m_mapDrawn = false;
-            uint32_t m_mapFbp = 0;       // the frame buffer the map being drawn belongs to
-            bool m_mapPublished = false; // a map went to the second screen since the last Present
-            float m_mapBox[4] = {};
+            bool m_mapDrawn = false;     // this frame drew map batches into the layer
+            bool m_mapSeen = false;      // this frame drew map batches (into the layer or the frame)
+            bool m_mapLatch = false;     // this frame diverts its map (wantMap at its first draw)
+            bool m_mapBezel = false;     // ... with the town bezel
+            uint32_t m_mapFbp = ~0u;     // the frame buffer the map was last drawn to (~0u: none yet)
+            uint32_t m_frameFbp = 0;     // the frame buffer of the frame being drawn
+            bool m_frameFbpValid = false;
+            uint32_t m_shownFbp[2] = {~0u, ~0u}; // the last two frame buffers scanned out
+            uint32_t m_presentsInFrame = 0, m_mapFramesMissed = 0, m_mapKind = 0;
+            bool m_mapPublished = false; // a map was published since the last Present
+            float m_mapBox[4] = {1e9f, 1e9f, -1e9f, -1e9f};   // this frame's map: flat-shaded draws
+            float m_mapAll[4] = {1e9f, 1e9f, -1e9f, -1e9f};   // ... every map draw but the bezel
+            float m_mapOuter[4] = {1e9f, 1e9f, -1e9f, -1e9f}; // ... and with the bezel
+            bool m_mapAllClipped[4] = {};
+            float m_mapOuterStable[4] = {};
             Vulkan::QueryPoolHandle m_passStart; // RT_GPU_TIMES=2: the open pass's start
             std::string m_passLabel;
             float m_mapStable[4] = {}; // the fixed box of the map on show

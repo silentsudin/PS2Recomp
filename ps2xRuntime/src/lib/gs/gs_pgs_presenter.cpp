@@ -1008,6 +1008,7 @@ namespace ps2x::gs
                 m_latchMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - latchStart).count();
                 m_pictureAspect = pictureAspect(runtime, *this);
                 m_frame2D = runtime.gsUnsynced().lastFrameWas2D();
+                takeMap();
                 m_uiFrame = false;
                 if (drawUi)
                     drawUi();
@@ -2465,6 +2466,7 @@ namespace ps2x::gs
 
             void drawUi(Vulkan::CommandBuffer &cmd, float fw, float fh)
             {
+                m_windowW = fw, m_windowH = fh;
                 if (m_uiFrame)
                     drawImGui(cmd, ImGui::GetDrawData(), fw, fh);
             }
@@ -2473,7 +2475,7 @@ namespace ps2x::gs
             const Vulkan::ImageView *uiTexture(ImTextureID id)
             {
                 if (id == static_cast<ImTextureID>(kMapTexture))
-                    return m_shared.map ? &m_shared.map->get_view() : nullptr;
+                    return m_mapFrame.image ? &m_mapFrame.image->get_view() : nullptr;
                 if (id == static_cast<ImTextureID>(kPictureTexture))
                 {
                     const Vulkan::Image *picture = m_shared.attached ? m_shared.scanout.get() : m_cpuFrame.get();
@@ -2503,6 +2505,7 @@ namespace ps2x::gs
                     ix += list->IdxBuffer.Size;
                 }
                 uint32_t vtxBase = 0, idxBase = 0;
+                bool blendPremultiplied = false;
                 for (const ImDrawList *list : dd->CmdLists)
                 {
                     for (const ImDrawCmd &c : list->CmdBuffer)
@@ -2520,6 +2523,14 @@ namespace ps2x::gs
                             continue;
                         cmd.set_scissor({{static_cast<int32_t>(x0), static_cast<int32_t>(y0)},
                                          {static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)}});
+                        // The map layer is premultiplied (the hardware GS composes its alpha "over").
+                        const bool premultiplied = c.GetTexID() == static_cast<ImTextureID>(kMapTexture);
+                        if (premultiplied != blendPremultiplied)
+                        {
+                            blendPremultiplied = premultiplied;
+                            cmd.set_blend_factors(premultiplied ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE,
+                                                  VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+                        }
                         cmd.set_texture(0, 0, *view,
                                         m_nearestTextures.count(static_cast<uint64_t>(c.GetTexID())) ? Vulkan::StockSampler::NearestClamp
                                                                                                     : Vulkan::StockSampler::LinearClamp);
@@ -2566,12 +2577,47 @@ namespace ps2x::gs
 
             bool mapRegion(float uv[4], float &aspect) const override
             {
-                std::lock_guard<std::mutex> lock(const_cast<std::mutex &>(m_shared.mutex));
-                if (!m_shared.map)
+                if (!m_mapFrame.image)
                     return false;
-                std::memcpy(uv, m_shared.mapUv, sizeof(m_shared.mapUv));
-                aspect = m_shared.mapAspect;
+                std::memcpy(uv, m_mapFrame.info.uv, sizeof(m_mapFrame.info.uv));
+                aspect = m_mapFrame.info.aspect;
                 return true;
+            }
+
+            bool mapInfo(MapInfo &info) const override
+            {
+                info = m_mapFrame.info;
+                info.framesSeen = m_shared.mapFramesSeen.load(std::memory_order_relaxed);
+                info.latched = m_shared.mapLatched.load(std::memory_order_relaxed);
+                return true;
+            }
+
+            bool pictureRect(float rect[4]) const override
+            {
+                if (m_windowW <= 0 || m_windowH <= 0)
+                    return false;
+                const VkRect2D r = pictureRect(m_windowW, m_windowH);
+                rect[0] = static_cast<float>(r.offset.x) / m_windowW;
+                rect[1] = static_cast<float>(r.offset.y) / m_windowH;
+                rect[2] = static_cast<float>(r.extent.width) / m_windowW;
+                rect[3] = static_cast<float>(r.extent.height) / m_windowH;
+                return true;
+            }
+
+            // Once per host frame, before the UI: the map the GS published last, box and image
+            // together (both screens draw this one; the GS may publish another meanwhile).
+            void takeMap()
+            {
+                std::lock_guard<std::mutex> lock(m_shared.mutex);
+                m_mapFrame.image = m_shared.map;
+                MapInfo &i = m_mapFrame.info;
+                i.shown = static_cast<bool>(m_shared.map);
+                std::memcpy(i.uv, m_shared.mapUv, sizeof(i.uv));
+                std::memcpy(i.outerUv, m_shared.mapOuterUv, sizeof(i.outerUv));
+                std::memcpy(i.picture, m_shared.mapPicture, sizeof(i.picture));
+                i.aspect = m_shared.mapAspect;
+                i.kind = m_shared.mapKind;
+                i.serial = m_shared.mapSerial;
             }
 
             uint64_t createUiTexture(const uint8_t *rgba, int width, int height, bool nearest) override
@@ -3401,6 +3447,12 @@ namespace ps2x::gs
             uint64_t m_nextTexture = 0;
             std::unordered_set<uint64_t> m_nearestTextures; // createUiTexture(..., nearest)
             float m_pictureAspect = 4.0f / 3.0f;
+            float m_windowW = 0, m_windowH = 0; // the main screen's drawable size, as last drawn
+            struct
+            {
+                Vulkan::ImageHandle image;
+                MapInfo info;
+            } m_mapFrame; // this host frame's map (takeMap)
             uint64_t m_lastTick = 0;
             bool m_latched = false;
             bool m_closeRequested = false;
