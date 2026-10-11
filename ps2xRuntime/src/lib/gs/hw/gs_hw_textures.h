@@ -54,6 +54,10 @@ namespace ps2x::gs
         };
         Bound lookup(uint64_t cacheKey, uint64_t stableKey);
 
+        // Asks the device which pack-cache formats it samples (packcache::setDeviceSamples), so the
+        // app knows before the game starts whether to convert a pack. The backend's init.
+        void useDevice(Vulkan::Device &device);
+
         // Collects TextureTools' results, creates pending images within the frame's budget and evicts
         // over the memory budget. Returns true when every texture must be submitted again and
         // looked up again (switching packs, evictions). GS thread, with the device lock held.
@@ -86,10 +90,10 @@ namespace ps2x::gs
         {
             uint32_t width = 0, height = 0;
             std::vector<uint8_t> rgba;
-            packcache::Compressed astc; // or this (ASTC 4x4, all levels)
+            packcache::Compressed compressed; // or this (the pack cache: ASTC 4x4 or BC7, all levels)
             bool queued = false;
         };
-        int m_astc = -1; // the device samples ASTC 4x4 (-1: not asked yet)
+        bool m_formatsAsked = false; // useDevice() ran
         static constexpr size_t kCreateBytesPerFrame = 24u << 20;
 
         TextureTools m_tools;

@@ -54,9 +54,9 @@ namespace ps2x::gs
             bool hit = false;    // the pack replaces it
             uint32_t width = 0, height = 0;
             std::vector<uint8_t> rgba; // empty if the image for contentKey was handed out before
-            // Or the image as cached ASTC 4x4 (gs_texture_pack_cache.h), for a consumer that takes
-            // it (setCompressedOk): its data empty when there is none.
-            packcache::Compressed astc;
+            // Or the image from the pack cache (ASTC 4x4 or BC7, gs_texture_pack_cache.h), for a
+            // consumer that takes it (setCompressedOk): its data empty when there is none.
+            packcache::Compressed compressed;
             // Another palette of a texture the pack replaces (same index pattern): its image,
             // recoloured by an affine map fitted between the two palettes. Rows r, g, b, a
             // (dot with the texel, 0..255, PS2 alpha) then the offset.
@@ -92,8 +92,8 @@ namespace ps2x::gs
         std::atomic<bool> m_compressedOk{false};
 
     public:
-        // The consumer creates ASTC 4x4 images: pack images come from the ASTC cache when it has
-        // them (no PNG decoding).
+        // The consumer creates images in the pack cache's format (packcache::active()): pack images
+        // come from the cache when it has them (no PNG decoding).
         void setCompressedOk(bool ok) { m_compressedOk = ok; }
 
     private:

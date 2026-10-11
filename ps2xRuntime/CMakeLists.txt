@@ -702,6 +702,27 @@ if(PS2X_ENABLE_PGS)
         target_link_libraries(ps2_runtime PRIVATE astcenc_lib)
         target_sources(ps2_runtime PRIVATE src/lib/gs/gs_texture_pack_cache.cpp)
         target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_ASTCENC=1)
+        # Rich Geldreich's bc7enc (MIT or public domain; bc7enc.cpp only, plain BC7, no RDO):
+        # packs are cached as BC7 where the GPU can't sample ASTC (Windows, Linux). Not on Android
+        # (ASTC there); on the Mac for RT_TEXTURE_CACHE_FORMAT=bc7.
+        if(NOT PS2X_IS_ANDROID)
+            FetchContent_Declare(
+                bc7enc
+                GIT_REPOSITORY "https://github.com/richgel999/bc7enc_rdo.git"
+                GIT_TAG b9438627eef73a1157e84201b6fa6eb2ffd6d9f0
+                UPDATE_DISCONNECTED TRUE
+            )
+            FetchContent_GetProperties(bc7enc)
+            if(NOT bc7enc_POPULATED)
+                FetchContent_Populate(bc7enc)
+            endif()
+            add_library(bc7enc_lib STATIC "${bc7enc_SOURCE_DIR}/bc7enc.cpp")
+            target_include_directories(bc7enc_lib SYSTEM PUBLIC "${bc7enc_SOURCE_DIR}")
+            set_target_properties(bc7enc_lib PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+            target_compile_options(bc7enc_lib PRIVATE -w -O3)
+            target_link_libraries(ps2_runtime PRIVATE bc7enc_lib)
+            target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_BC7ENC=1)
+        endif()
     endif()
     message(STATUS "paraLLEl-GS Vulkan GS backend: enabled")
 endif()

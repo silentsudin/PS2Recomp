@@ -49,6 +49,17 @@ namespace ps2x::gs
         return out;
     }
 
+    void HwTexturePacks::useDevice(Vulkan::Device &device)
+    {
+        // Which cache formats the device samples (packcache picks ASTC or BC7 by platform; with
+        // neither sampled, packs load from PNG and the app converts nothing).
+        m_formatsAsked = true;
+        const bool astc = device.image_format_is_supported(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT);
+        const bool bc7 = device.image_format_is_supported(VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT);
+        packcache::setDeviceSamples(astc, bc7);
+        m_tools.setCompressedOk(packcache::available());
+    }
+
     bool HwTexturePacks::service(Vulkan::Device &device)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -75,12 +86,8 @@ namespace ps2x::gs
                 resubmit = true;
             }
         }
-        if (m_astc < 0)
-        {
-            m_astc = device.image_format_is_supported(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT) ? 1 : 0;
-            static const bool off = [] { const char *e = std::getenv("RT_TEXTURE_ASTC"); return e && *e == '0'; }();
-            m_tools.setCompressedOk(m_astc == 1 && !off);
-        }
+        if (!m_formatsAsked)
+            useDevice(device);
         m_active = m_tools.active();
         if (!m_active)
             return resubmit;
@@ -104,13 +111,13 @@ namespace ps2x::gs
             m_byCache[r.cacheKey] = b;
             m_byStable[r.stableKey] = b;
             m_replacedContent[r.contentKey] = true;
-            if ((!r.rgba.empty() || !r.astc.data.empty()) && !m_images.count(r.contentKey))
+            if ((!r.rgba.empty() || !r.compressed.data.empty()) && !m_images.count(r.contentKey))
             {
                 Pending &p = m_pending[r.contentKey];
                 p.width = r.width;
                 p.height = r.height;
                 p.rgba = std::move(r.rgba);
-                p.astc = std::move(r.astc);
+                p.compressed = std::move(r.compressed);
                 if (!p.queued)
                 {
                     p.queued = true;
@@ -126,22 +133,23 @@ namespace ps2x::gs
             const uint64_t key = m_pendingOrder.front();
             m_pendingOrder.pop_front();
             auto it = m_pending.find(key);
-            if (it == m_pending.end() || (it->second.rgba.empty() && it->second.astc.data.empty()))
+            if (it == m_pending.end() || (it->second.rgba.empty() && it->second.compressed.data.empty()))
                 continue;
             Pending p = std::move(it->second);
             m_pending.erase(it);
             Image image;
             size_t bytes = 0;
-            if (!p.astc.data.empty())
+            if (!p.compressed.data.empty())
             {
                 // The cached levels as they are: nothing to decode or generate.
-                auto info = Vulkan::ImageCreateInfo::immutable_2d_image(p.width, p.height, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, false);
-                info.levels = p.astc.levels;
-                std::vector<Vulkan::ImageInitialData> init(p.astc.levels);
-                for (uint32_t l = 0; l < p.astc.levels; ++l)
-                    init[l] = {p.astc.data.data() + p.astc.offsets[l], 0, 0};
+                auto info = Vulkan::ImageCreateInfo::immutable_2d_image(
+                    p.width, p.height, p.compressed.format == packcache::Format::Bc7 ? VK_FORMAT_BC7_UNORM_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK, false);
+                info.levels = p.compressed.levels;
+                std::vector<Vulkan::ImageInitialData> init(p.compressed.levels);
+                for (uint32_t l = 0; l < p.compressed.levels; ++l)
+                    init[l] = {p.compressed.data.data() + p.compressed.offsets[l], 0, 0};
                 image.image = device.create_image(info, init.data());
-                bytes = p.astc.data.size();
+                bytes = p.compressed.data.size();
             }
             else
             {

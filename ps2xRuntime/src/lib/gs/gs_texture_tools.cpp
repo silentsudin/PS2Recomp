@@ -389,10 +389,10 @@ namespace ps2x::gs
                     std::lock_guard<std::mutex> lock(m_mutex);
                     packDir = m_packDir;
                 }
-                if (packcache::load(packDir, packPath, r.contentKey, r.astc))
+                if (packcache::load(packDir, packPath, r.contentKey, r.compressed))
                 {
-                    r.width = r.astc.width;
-                    r.height = r.astc.height;
+                    r.width = r.compressed.width;
+                    r.height = r.compressed.height;
                     handedOut = true; // (pixels on their way: no PNG)
                 }
             }

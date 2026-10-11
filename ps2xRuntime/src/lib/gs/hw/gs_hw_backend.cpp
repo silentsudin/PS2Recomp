@@ -372,6 +372,7 @@ namespace ps2x::gs
                     MotionTracker::instance().setEnabled(true);
                 }
                 m_dev = m_shared->device;
+                m_packs.useDevice(*m_dev);
                 if (const char *s = std::getenv("RT_GS_SCALE"))
                     m_scale = std::clamp<uint32_t>(static_cast<uint32_t>(std::atoi(s)), 1u, 6u);
 
