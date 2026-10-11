@@ -797,7 +797,9 @@ namespace ps2x::gs
                     ri.device_id = vk.get_gpu_props().deviceID;
                     ri.driver_version = vk.get_gpu_props().driverVersion;
                     ri.api_version = vk.get_gpu_props().apiVersion;
-                    static const std::string dataDir = [] {
+                    static const std::string dataDir = [this] {
+                        if (!m_options.dataDir.empty())
+                            return m_options.dataDir;
                         const char *e = std::getenv("RT_DATA_DIR");
                         return std::string(e ? e : ".");
                     }();

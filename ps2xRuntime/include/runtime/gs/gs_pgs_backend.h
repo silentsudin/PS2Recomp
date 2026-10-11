@@ -90,6 +90,9 @@ namespace ps2x::gs
     {
         std::string vulkanLibrary; // as PgsOptions
         bool vsync = true;         // FIFO; false = mailbox (or immediate)
+        // Writable folder for the upscaler plugins' logs and caches (NGX's application data path).
+        // Empty: $RT_DATA_DIR, else the working directory.
+        std::string dataDir;
     };
     // A presenter (ps2_host_presenter.h) with an SDL3 window and a Vulkan swapchain whose device the
     // GS backend shares (pass it in PgsOptions::presenter). nullptr (and `error`) if unavailable.
