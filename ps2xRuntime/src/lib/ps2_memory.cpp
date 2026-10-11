@@ -14,6 +14,11 @@
 #include <string>
 #include <vector>
 
+#include <time.h>
+#if defined(__APPLE__)
+extern "C" int thread_selfcounts(int type, void *buf, size_t nbytes); // libsystem_kernel
+#endif
+
 std::atomic<uint8_t *> g_ps2ScratchpadHostPtr{nullptr};
 namespace ps2x::gs
 {
@@ -45,6 +50,62 @@ namespace
     {
         static const bool waitGs = [] { const char *e = std::getenv("RT_VIF1_READ_WAITS_GS"); return e && *e == '1'; }();
         return !waitGs && ((addr >= 0x10003000u && addr < 0x10003100u) || (addr >= 0x10003C00u && addr < 0x10003E00u));
+    }
+
+    // RT_GIFVIF1_PROF=1: where the GIF/VIF1 worker's busy time ("VU1" in [perf]) goes, every 5 s
+    // (diagnostics): wall vs thread CPU time per job, hand-offs and their cost, and on Apple the
+    // cycles, instructions and clock per core it ran on. With the same instructions and cycles, a
+    // busier figure is a slower clock (the M3 Max's P cluster ran at ~2.65 GHz with the hardware GS,
+    // ~3.1 with paraLLEl-GS, whose heavier GS thread keeps it up), not more work.
+    struct WorkerProf
+    {
+        bool on = [] { const char *e = std::getenv("RT_GIFVIF1_PROF"); return e && *e == '1'; }();
+        uint64_t jobs = 0, wallNs = 0, cpuNs = 0, cycles = 0, instrs = 0;
+        uint64_t handoffs = 0, handoffNs = 0, lockNs = 0, notifyNs = 0, takeNs = 0, gsWaiting = 0;
+        uint64_t cpuWallNs[16] = {}, cpuCycles[16] = {}; // by the core a job started on (Apple)
+        std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+    };
+    WorkerProf &workerProf()
+    {
+        static WorkerProf p;
+        return p;
+    }
+    inline uint64_t threadCpuNs()
+    {
+#if defined(_WIN32)
+        return 0;
+#else
+        timespec ts{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+#endif
+    }
+    inline void threadCounts(uint64_t &cycles, uint64_t &instrs)
+    {
+        cycles = instrs = 0;
+#if defined(__APPLE__)
+        uint64_t c[2] = {};
+        if (thread_selfcounts(1, c, sizeof(c)) == 0)
+        {
+            instrs = c[0];
+            cycles = c[1];
+        }
+#endif
+    }
+    inline uint32_t currentCore()
+    {
+#if defined(__APPLE__)
+        size_t n = 0;
+        if (__builtin_available(macOS 11.0, iOS 14.2, *))
+            pthread_cpu_number_np(&n);
+        return static_cast<uint32_t>(n & 0xFu);
+#else
+        return 0;
+#endif
+    }
+    inline uint64_t nsSince(std::chrono::steady_clock::time_point t)
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count());
     }
 
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
@@ -2056,6 +2117,15 @@ void PS2Memory::gifVif1WorkerLoop()
             m_gifVif1Queue.pop_front();
         }
         const auto busyStart = std::chrono::steady_clock::now();
+        WorkerProf &prof = workerProf();
+        uint64_t profCpu = 0, profCycles = 0, profInstrs = 0;
+        uint32_t profCore = 0;
+        if (prof.on)
+        {
+            profCore = currentCore();
+            profCpu = threadCpuNs();
+            threadCounts(profCycles, profInstrs);
+        }
         const uint32_t size = static_cast<uint32_t>(job.data.size());
         if (job.gif)
         {
@@ -2070,9 +2140,42 @@ void PS2Memory::gifVif1WorkerLoop()
         if (m_gifArbiter)
             drainGif();
         handOffGsBatch();
-        m_gifVif1BusyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                      std::chrono::steady_clock::now() - busyStart).count()),
-                                  std::memory_order_relaxed);
+        const uint64_t jobNs = nsSince(busyStart);
+        m_gifVif1BusyNs.fetch_add(jobNs, std::memory_order_relaxed);
+        if (prof.on)
+        {
+            uint64_t c = 0, i = 0;
+            threadCounts(c, i);
+            ++prof.jobs;
+            prof.wallNs += jobNs;
+            prof.cpuNs += threadCpuNs() - profCpu;
+            prof.cycles += c - profCycles;
+            prof.instrs += i - profInstrs;
+            prof.cpuWallNs[profCore] += jobNs;
+            prof.cpuCycles[profCore] += c - profCycles;
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - prof.window).count();
+            if (secs >= 5.0)
+            {
+                const double perS = 1e-6 / secs; // ns -> ms/s
+                std::fprintf(stderr,
+                             "[gifvif1-prof] jobs/s %.0f wall %.1f ms/s cpu %.1f ms/s GHz %.2f Ginstr/s %.3f IPC %.2f | "
+                             "handoffs/s %.0f (GS waiting %.0f%%) handoff %.2f ms/s (lock %.2f notify %.2f take %.2f)\n",
+                             prof.jobs / secs, prof.wallNs * perS, prof.cpuNs * perS,
+                             prof.wallNs ? double(prof.cycles) / prof.wallNs : 0.0, prof.instrs / secs * 1e-9,
+                             prof.cycles ? double(prof.instrs) / prof.cycles : 0.0, prof.handoffs / secs,
+                             prof.handoffs ? 100.0 * prof.gsWaiting / prof.handoffs : 0.0, prof.handoffNs * perS,
+                             prof.lockNs * perS, prof.notifyNs * perS, prof.takeNs * perS);
+                std::string cores;
+                for (int k = 0; k < 16; ++k)
+                    if (prof.cpuWallNs[k] * 100u >= prof.wallNs && prof.wallNs)
+                        cores += " c" + std::to_string(k) + " " + std::to_string(prof.cpuWallNs[k] * 100u / prof.wallNs) + "% " +
+                                 std::to_string(double(prof.cpuCycles[k]) / double(prof.cpuWallNs[k])).substr(0, 4) + "GHz";
+                std::fprintf(stderr, "[gifvif1-prof] cores:%s\n", cores.c_str());
+                const auto window = std::chrono::steady_clock::now();
+                prof = WorkerProf{};
+                prof.window = window;
+            }
+        }
         bool wake;
         {
             std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
@@ -2183,25 +2286,59 @@ void PS2Memory::drainGif()
             const char *e = std::getenv("RT_GS_OVERLAP");
             return !(e && *e == '0');
         }();
-        if (overlap && m_gsPending.size() >= 24)
-            handOffGsBatch();
+        if (overlap && m_gsPending.size() >= m_gsHandOffAt)
+            handOffGsBatch(true);
         return;
     }
     m_gifArbiter->drain();
 }
 
-void PS2Memory::handOffGsBatch()
+void PS2Memory::handOffGsBatch(bool midJob)
 {
     if (m_gsPending.empty())
         return;
+    // The GS thread is signalled only when it sleeps (bionic makes a futex call on every signal,
+    // waiters or not: ~7 ms/s of the worker on the Thor), and hand-offs while VU1 runs adapt to
+    // it: one found asleep keeps up, so the next hand-off waits for twice as many packets (up to
+    // 384); one found busy gets half as many (down to 24), still early. Waking a GS thread that
+    // keeps up (the hardware GS) every 24 packets cost the worker 15-20 ms/s on the M3 Max, half
+    // of it in the wake. RT_GS_HANDOFF_ADAPT=0: every 24 packets, a signal each.
+    static const bool adapt = [] {
+        const char *e = std::getenv("RT_GS_HANDOFF_ADAPT");
+        return !(e && *e == '0');
+    }();
+    WorkerProf &prof = workerProf();
+    const bool profiling = prof.on && t_onGifVif1Worker;
+    const auto t0 = profiling ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    bool wake = true;
     {
         std::lock_guard<std::mutex> lock(m_gifVif1Mutex);
+        const bool gsAsleep = m_gsWaiting && m_gsQueue.empty();
+        wake = !adapt || m_gsWaiting;
+        if (profiling)
+        {
+            prof.lockNs += nsSince(t0);
+            prof.gsWaiting += gsAsleep ? 1u : 0u;
+        }
+        if (adapt && midJob)
+            m_gsHandOffAt = gsAsleep ? std::min<uint32_t>(m_gsHandOffAt * 2u, 384u)
+                                     : std::max<uint32_t>(m_gsHandOffAt / 2u, 24u);
         m_gsQueue.push_back(std::move(m_gsPending));
         m_gsSubmitted.fetch_add(1, std::memory_order_release);
     }
     m_gsPending.clear();
+    const auto t1 = profiling ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     m_gifArbiter->takeBatch(m_gsPending);
-    m_gsWorkCv.notify_one();
+    const auto t2 = profiling ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (wake)
+        m_gsWorkCv.notify_one();
+    if (profiling)
+    {
+        ++prof.handoffs;
+        prof.takeNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+        prof.notifyNs += nsSince(t2);
+        prof.handoffNs += nsSince(t0);
+    }
 }
 
 void PS2Memory::gsThreadLoop()
@@ -2211,8 +2348,10 @@ void PS2Memory::gsThreadLoop()
         std::vector<GifArbiterPacket> batch;
         {
             std::unique_lock<std::mutex> lock(m_gifVif1Mutex);
+            m_gsWaiting = true;
             m_gsWorkCv.wait(lock, [&]
                             { return m_gifVif1Stop || !m_gsQueue.empty(); });
+            m_gsWaiting = false;
             if (m_gsQueue.empty())
                 return;
             batch = std::move(m_gsQueue.front());

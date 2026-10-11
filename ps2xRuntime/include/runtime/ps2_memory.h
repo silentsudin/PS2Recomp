@@ -533,11 +533,13 @@ public:
     std::multiset<uint64_t> m_vifWaitTargets, m_gsWaitTargets;
     std::deque<std::vector<GifArbiterPacket>> m_gsQueue;
     std::vector<GifArbiterPacket> m_gsPending; // worker-owned, not yet handed over
+    bool m_gsWaiting = false;                  // GS thread asleep on an empty queue (under m_gifVif1Mutex)
+    uint32_t m_gsHandOffAt = 24;               // worker-owned: packets per hand-off while VU1 runs
     std::atomic<uint64_t> m_gsSubmitted{0};
     std::atomic<uint64_t> m_gsCompleted{0};
     void gsThreadLoop();
     void drainGif();
-    void handOffGsBatch();
+    void handOffGsBatch(bool midJob = false);
 
     struct CodeRegion
     {
