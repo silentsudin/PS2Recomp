@@ -2333,8 +2333,9 @@ namespace ps2x::gs
                 const VkRect2D rect = pictureRect(fw, fh);
                 if (const Vulkan::Image *original = m_uiOriginal)
                 {
-                    // spareUi's composite (and RCAS) straight into the picture's rectangle.
-                    m_uiOriginal = nullptr;
+                    // spareUi's composite (and RCAS) straight into the picture's rectangle. (Kept
+                    // until the next spareUi: a present dump draws the scene again and must show
+                    // the composite too; dumps of generated frames showed them without it.)
                     cmd.set_program(m_finalRcas ? m_rcasUi : m_uiComposite);
                     cmd.set_opaque_state();
                     cmd.set_depth_test(false, false);
@@ -3025,13 +3026,15 @@ namespace ps2x::gs
                                                    "post: flicker blending");
                 }
                 m_plTag = fresh ? 'R' : 'r';
+                // (Frame generation makes its own pictures: the chain below is for one present per
+                // guest frame. The present log once sat between the two and broke it: every generated
+                // present showed the real picture again unless RT_PRESENT_LOG=1, and every real one
+                // was post-processed twice.)
                 if (m_fg.factor > 1)
-                    generatedPicture(cmd, fw, fh, fresh);
-                if (presentLogOn())
                 {
-                    g_plTag = m_plTag, g_plTick = m_lastTick, g_plSub = m_subframe, g_plRender = plNow();
-                    g_plPic = m_shared.pictureSerial, g_plPres = m_shared.presentSerial;
-                    g_plSeq.fetch_add(1);
+                    generatedPicture(cmd, fw, fh, fresh);
+                    if (m_showUi && m_shared.ui)
+                        m_final = m_shared.ui.get(), m_finalRcas = false;
                 }
                 else if (fresh || !m_lastPicture)
                 {
@@ -3047,6 +3050,12 @@ namespace ps2x::gs
                     // history must see each guest frame once).
                     m_final = m_lastPicture;
                     m_finalRcas = m_lastRcas;
+                }
+                if (presentLogOn())
+                {
+                    g_plTag = m_plTag, g_plTick = m_lastTick, g_plSub = m_subframe, g_plRender = plNow();
+                    g_plPic = m_shared.pictureSerial, g_plPres = m_shared.presentSerial;
+                    g_plSeq.fetch_add(1);
                 }
                 spareUi(*cmd, fw, fh);
                 if (gpuTimes)

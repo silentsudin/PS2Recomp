@@ -709,8 +709,7 @@ namespace ps2x::gs
                     out += 3;
                 }
                 if (batch.vertexClass == 1u)
-                    for (size_t i = first; i < m_stage.size(); ++i)
-                        m_uiStage.push_back({m_stage[i].x, m_stage[i].y});
+                    stageUi(state, first);
                 if (m_stage.size() >= 1536u)
                     publish(false);
             }
@@ -790,13 +789,76 @@ namespace ps2x::gs
                 }
                 // The UI mask: the HUD's triangles, drawn into a mask at Present.
                 if (batch.vertexClass == 1u)
-                {
-                    const size_t n = type == GS_PRIM_SPRITE ? 6u : 3u;
-                    for (size_t i = m_stage.size() - n; i < m_stage.size(); ++i)
-                        m_uiStage.push_back({m_stage[i].x, m_stage[i].y});
-                }
+                    stageUi(state, m_stage.size() - (type == GS_PRIM_SPRITE ? 6u : 3u));
                 if (m_stage.size() >= 1536u)
                     publish(false);
+            }
+
+            // The UI mask's share of the staged triangles from `first` on (the HUD's, the classifier's
+            // UI class), cut to the draw's scissor as the frame draws them. The map's triangles reach
+            // far beyond its window (the sea, rivers and roads around the car, scissored to the
+            // minimap's box): whole, they marked big parts of the 3D as HUD, and shadow frames showed
+            // the real frame there (the presenter takes the HUD from it through the mask), so shapes
+            // of the map's water and roads stood still at 120 Hz while the rest moved on: the
+            // water and roads flashed. The map's triangles are kept apart (m_uiMap*): a frame whose
+            // latch drew its map into the map layer (the second screen, our overlay) leaves them out
+            // of the mask (drawUiMask). RT_HWGS_UI_SCISSOR=0: whole triangles, as before (A/B).
+            void stageUi(const GSDrawState &state, size_t first)
+            {
+                static const bool scissor = [] { const char *e = std::getenv("RT_HWGS_UI_SCISSOR"); return !(e && *e == '0'); }();
+                if (!scissor)
+                {
+                    for (size_t i = first; i < m_stage.size(); ++i)
+                        m_uiStage.push_back({m_stage[i].x, m_stage[i].y});
+                    return;
+                }
+                std::vector<std::array<float, 2>> &out = isMap(state) ? m_uiMapStage : m_uiStage;
+                const auto &sc = state.context.scissor;
+                const float x0 = static_cast<float>(sc.x0), x1 = static_cast<float>(sc.x1) + 1.0f;
+                const float y0 = static_cast<float>(sc.y0), y1 = static_cast<float>(sc.y1) + 1.0f;
+                for (size_t i = first; i + 3 <= m_stage.size(); i += 3)
+                {
+                    std::array<float, 2> poly[9], next[9];
+                    int n = 3;
+                    bool inside = true;
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        poly[k] = {m_stage[i + k].x, m_stage[i + k].y};
+                        inside = inside && poly[k][0] >= x0 && poly[k][0] <= x1 && poly[k][1] >= y0 && poly[k][1] <= y1;
+                    }
+                    if (!inside)
+                    {
+                        // Sutherland-Hodgman against the four edges (a triangle becomes at most 7 points).
+                        for (int edge = 0; edge < 4 && n > 0; ++edge)
+                        {
+                            const int axis = edge >> 1;
+                            const bool low = (edge & 1) == 0;
+                            const float bound = axis == 0 ? (low ? x0 : x1) : (low ? y0 : y1);
+                            auto in = [&](const std::array<float, 2> &p) { return low ? p[axis] >= bound : p[axis] <= bound; };
+                            int m = 0;
+                            for (int k = 0; k < n; ++k)
+                            {
+                                const auto &a = poly[k], &b = poly[(k + 1) % n];
+                                const bool ia = in(a), ib = in(b);
+                                if (ia)
+                                    next[m++] = a;
+                                if (ia != ib)
+                                {
+                                    const float t = (bound - a[axis]) / (b[axis] - a[axis]);
+                                    next[m++] = {a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])};
+                                }
+                            }
+                            n = m;
+                            std::copy(next, next + n, poly);
+                        }
+                    }
+                    for (int k = 1; k + 1 < n; ++k) // as a fan
+                    {
+                        out.push_back(poly[0]);
+                        out.push_back(poly[k]);
+                        out.push_back(poly[k + 1]);
+                    }
+                }
             }
 
             // The game's map: every course-map, town-minimap and field-area map draw has TEST_2 =
@@ -839,6 +901,8 @@ namespace ps2x::gs
                         m_vertices.insert(m_vertices.end(), m_stage.begin(), m_stage.end());
                         m_uiVerts.insert(m_uiVerts.end(), m_uiStage.begin(), m_uiStage.end());
                         m_uiStage.clear();
+                        m_uiMapVerts.insert(m_uiMapVerts.end(), m_uiMapStage.begin(), m_uiMapStage.end());
+                        m_uiMapStage.clear();
                         m_batches.back().vertexCount += static_cast<uint32_t>(m_stage.size());
                         m_stage.clear();
                     }
@@ -1265,6 +1329,8 @@ namespace ps2x::gs
                         m_stage.clear();
                         m_uiStage.clear();
                         m_uiVerts.clear();
+                        m_uiMapStage.clear();
+                        m_uiMapVerts.clear();
                         m_open = false;
                         for (auto &v : m_pageVersion) // every decoded texture is decoded again
                             ++v;
@@ -1311,6 +1377,8 @@ namespace ps2x::gs
                         vertices.swap(m_vertices);
                         m_uiDraw.swap(m_uiVerts);
                         m_uiVerts.clear();
+                        m_uiMapDraw.swap(m_uiMapVerts);
+                        m_uiMapVerts.clear();
                     }
                     if (m_rescale.exchange(false))
                     {
@@ -1368,6 +1436,7 @@ namespace ps2x::gs
                                                           "gs present: UI mask");
                     }
                     m_uiDraw.clear();
+                    m_uiMapDraw.clear();
                     if (scan)
                     {
                         outW = scan->get_width();
@@ -3249,6 +3318,9 @@ namespace ps2x::gs
                     info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                     mask = m_dev->create_image(info);
                 }
+                // The map's triangles are HUD only while the frame draws the map (its latch kept it there).
+                if (!m_mapLatch)
+                    m_uiDraw.insert(m_uiDraw.end(), m_uiMapDraw.begin(), m_uiMapDraw.end());
                 // Positions relative to the scanned-out part of the frame; white, no texture, no test.
                 std::vector<HwVertex> verts(m_uiDraw.size());
                 for (size_t i = 0; i < m_uiDraw.size(); ++i)
@@ -3783,6 +3855,7 @@ namespace ps2x::gs
             // The UI mask: the HUD's triangles (GS frame coordinates), staged by the GS thread,
             // handed over with the batches, drawn at Present; the scanout's geometry they map to.
             std::vector<std::array<float, 2>> m_uiStage, m_uiVerts, m_uiDraw;
+            std::vector<std::array<float, 2>> m_uiMapStage, m_uiMapVerts, m_uiMapDraw; // the map's share of them
             Vulkan::ImageHandle m_uiMask[3];
             struct ScanGeom
             {
